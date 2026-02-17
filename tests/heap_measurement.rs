@@ -88,6 +88,8 @@ use milli_http::connection::Connection;
 use milli_http::connection::HandshakePool;
 use milli_http::crypto::ed25519::{build_ed25519_cert_der, ed25519_public_key_from_seed};
 use milli_http::crypto::rustcrypto::Aes128GcmProvider;
+use milli_http::h2::H2Event;
+use milli_http::h2_tls::{H2TlsClient, H2TlsServer};
 use milli_http::h3::{H3Client, H3Event, H3Server};
 use milli_http::http1::Http1Event;
 use milli_http::https1::{Https1Client, Https1Server};
@@ -413,6 +415,54 @@ fn https1_exchange(client: &mut TestHttps1Client, server: &mut TestHttps1Server)
 }
 
 // ===========================================================================
+// H2 over TLS helpers
+// ===========================================================================
+
+type TestH2TlsClient = H2TlsClient<C, 8192, 8, 2048, 4096>;
+type TestH2TlsServer = H2TlsServer<C, 8192, 8, 2048, 4096>;
+
+fn make_h2tls_client() -> TestH2TlsClient {
+    let config = TlsConfig {
+        server_name: heapless::String::try_from("test.local").unwrap(),
+        alpn_protocols: &[b"h2"],
+        transport_params: TransportParams::default_params(),
+        pinned_certs: &[],
+    };
+    H2TlsClient::new(Aes128GcmProvider, config, [0xAA; 32], [0xBB; 32])
+}
+
+fn make_h2tls_server() -> TestH2TlsServer {
+    let config = ServerTlsConfig {
+        cert_der: get_test_cert(),
+        private_key_der: &TEST_SEED,
+        alpn_protocols: &[b"h2"],
+        transport_params: TransportParams::default_params(),
+    };
+    H2TlsServer::new(Aes128GcmProvider, config, [0xCC; 32], [0xDD; 32])
+}
+
+fn h2tls_exchange(client: &mut TestH2TlsClient, server: &mut TestH2TlsServer) {
+    for _ in 0..20 {
+        let mut any = false;
+        let mut buf = [0u8; 16384];
+        while let Some(data) = client.poll_output(&mut buf) {
+            let copy = data.to_vec();
+            server.feed_data(&copy).unwrap();
+            any = true;
+        }
+        let mut buf2 = [0u8; 16384];
+        while let Some(data) = server.poll_output(&mut buf2) {
+            let copy = data.to_vec();
+            client.feed_data(&copy).unwrap();
+            any = true;
+        }
+        if !any {
+            break;
+        }
+    }
+}
+
+// ===========================================================================
 // Tests — run sequentially with `cargo test --test heap_measurement -- --test-threads=1`
 // ===========================================================================
 
@@ -544,6 +594,74 @@ fn measure_https1_handshake_and_data() {
 }
 
 #[test]
+fn measure_h2_tls_handshake_and_data() {
+    println!();
+
+    // --- Measure H2/TLS handshake ---
+    let snap = HeapSnapshot::begin();
+
+    let mut client = make_h2tls_client();
+    let mut server = make_h2tls_server();
+    h2tls_exchange(&mut client, &mut server);
+
+    let snap = snap.finish();
+    let hs_peak = snap.peak_above_baseline();
+    let hs_current = snap.current_above_baseline();
+
+    assert!(client.is_established(), "H2/TLS handshake should complete");
+    assert!(server.is_established());
+
+    println!("--- H2/TLS pair (established) ---");
+    println!("  Peak heap during handshake: {:>8} bytes  ({:.1} KB)", hs_peak, hs_peak as f64 / 1024.0);
+    println!("  Current heap (post-shrink): {:>8} bytes  ({:.1} KB)", hs_current, hs_current as f64 / 1024.0);
+    println!("  Struct size (client+server): {:>7} bytes", size_of::<TestH2TlsClient>() + size_of::<TestH2TlsServer>());
+    println!();
+
+    // --- Measure data flow ---
+    while let Some(_) = client.poll_event() {}
+    while let Some(_) = server.poll_event() {}
+
+    let snap = HeapSnapshot::begin();
+
+    let _stream_id = client.send_request("GET", "/hello", "test.local", &[], true).unwrap();
+    h2tls_exchange(&mut client, &mut server);
+
+    // Server reads and responds
+    while let Some(ev) = server.poll_event() {
+        if let H2Event::Headers(sid) = ev {
+            server.recv_headers(sid, |_, _| {}).unwrap();
+            server.send_response(sid, 200, &[(b"content-length", b"14")], false).unwrap();
+            server.send_body(sid, b"Hello from H2!", true).unwrap();
+        }
+    }
+    h2tls_exchange(&mut client, &mut server);
+
+    // Client reads response
+    while let Some(ev) = client.poll_event() {
+        if let H2Event::Headers(sid) = ev {
+            client.recv_headers(sid, |_, _| {}).unwrap();
+        }
+        if let H2Event::Data(sid) = ev {
+            let mut buf = [0u8; 256];
+            let _ = client.recv_body(sid, &mut buf);
+        }
+    }
+
+    let snap = snap.finish();
+    let data_peak = snap.peak_above_baseline();
+    println!("--- H2/TLS request/response (additional) ---");
+    println!("  Peak heap:    {:>8} bytes  ({:.1} KB)", data_peak, data_peak as f64 / 1024.0);
+    println!();
+
+    drop(client);
+    drop(server);
+
+    println!("--- After dropping all H2/TLS state ---");
+    println!("  Remaining:    {:>8} bytes", ALLOC.current());
+    println!();
+}
+
+#[test]
 fn measure_tls_connection_only() {
     println!();
 
@@ -601,11 +719,11 @@ fn measure_tls_connection_only() {
 
 #[test]
 fn measure_target_config() {
-    // Simulate the target: 1 HTTPS/1.1 + 4 H3 connections (2 handshaking)
+    // Simulate the target: 1 HTTPS/1.1 + 2 H2/TLS + 4 H3 connections (2 handshaking)
     // We measure peak heap during the most memory-intensive phase.
     println!();
     println!("============================================================");
-    println!("  TARGET CONFIG: 1 HTTPS/1.1 + 4 H3 (peak measurement)");
+    println!("  TARGET CONFIG: 1 HTTPS/1.1 + 2 H2/TLS + 4 H3 (peak)");
     println!("============================================================");
     println!();
 
@@ -619,8 +737,22 @@ fn measure_target_config() {
     while let Some(_) = h1_client.poll_event() {}
     while let Some(_) = h1_server.poll_event() {}
 
+    // Create 2 established H2/TLS pairs
+    let mut h2c1 = make_h2tls_client();
+    let mut h2s1 = make_h2tls_server();
+    h2tls_exchange(&mut h2c1, &mut h2s1);
+    assert!(h2c1.is_established());
+    while let Some(_) = h2c1.poll_event() {}
+    while let Some(_) = h2s1.poll_event() {}
+
+    let mut h2c2 = make_h2tls_client();
+    let mut h2s2 = make_h2tls_server();
+    h2tls_exchange(&mut h2c2, &mut h2s2);
+    assert!(h2c2.is_established());
+    while let Some(_) = h2c2.poll_event() {}
+    while let Some(_) = h2s2.poll_event() {}
+
     // Create 2 established H3 pairs (using one shared pool)
-    // We create them sequentially, each pair reusing the pool
     let now = 1_000_000u64;
     let mut pool = make_pool();
 
@@ -658,13 +790,13 @@ fn measure_target_config() {
     let established_current = snap_established.current_above_baseline();
     let established_peak = snap_established.peak_above_baseline();
 
-    println!("--- Phase 1: 1 HTTPS/1.1 + 2 established H3 ---");
+    println!("--- Phase 1: 1 HTTPS/1.1 + 2 H2/TLS + 2 established H3 ---");
     println!("  Current heap: {:>8} bytes  ({:.1} KB)", established_current, established_current as f64 / 1024.0);
     println!("  Peak heap:    {:>8} bytes  ({:.1} KB)", established_peak, established_peak as f64 / 1024.0);
     println!();
 
     // Now add 2 more H3 connections in handshaking state
-    // This is the peak — 2 established + 2 handshaking + 1 HTTPS/1.1
+    // This is the peak — 2 established H3 + 2 handshaking H3 + 2 H2/TLS + 1 HTTPS/1.1
     let snap = HeapSnapshot::begin();
 
     let mut qc3 = make_quic_client(&mut pool);
@@ -722,12 +854,14 @@ fn measure_target_config() {
     println!("  Total peak:   {:>8} bytes  ({:.1} KB)", established_peak + handshaking_peak, (established_peak + handshaking_peak) as f64 / 1024.0);
 
     // Struct sizes (note: this test runs BOTH client and server per connection)
-    let struct_both = // full test: client+server pairs
+    let struct_both =
         size_of::<TestHttps1Client>() + size_of::<TestHttps1Server>()
+        + 2 * (size_of::<TestH2TlsClient>() + size_of::<TestH2TlsServer>())
         + 4 * (size_of::<H3Client<C>>() + size_of::<H3Server<C>>())
         + size_of::<HandshakePool<C, 4>>();
-    let struct_server_only = // real deployment: server side only
+    let struct_server_only =
         size_of::<TestHttps1Server>()
+        + 2 * size_of::<TestH2TlsServer>()
         + 4 * size_of::<H3Server<C>>()
         + size_of::<HandshakePool<C, 4>>();
 

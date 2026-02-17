@@ -1,5 +1,5 @@
 //! Memory budget analysis for an embedded server target:
-//!   1 HTTPS/1.1 connection + 4 active H3 connections + 2 H3 handshake slots
+//!   1 HTTPS/1.1 + 2 H2 over TLS + 4 active H3 + 2 H3 handshake slots
 //!   Goal: < 100 KB total SRAM (struct + peak heap)
 
 use core::mem::size_of;
@@ -9,17 +9,17 @@ use milli_http::crypto::rustcrypto::ChaCha20Provider;
 // -- Component types --
 use milli_http::connection::Connection;
 use milli_http::connection::handshake_pool::{HandshakeContext, HandshakePool};
-use milli_http::connection::keys::ConnectionKeys;
 use milli_http::h3::server::H3Server;
 use milli_http::h3::connection::H3Event;
 use milli_http::https1::Https1Server;
+use milli_http::h2::H2Event;
+use milli_http::h2_tls::H2TlsServer;
 use milli_http::http1::connection::Http1Connection;
 use milli_http::tcp_tls::connection::TlsConnection;
 use milli_http::tcp_tls::io::TlsIoBufs;
 use milli_http::tls::handshake::TlsEngine;
-use milli_http::buf::Buf;
-use milli_http::transport::stream::{StreamMap, StreamState};
-use milli_http::transport::recovery::{SentPacket, SentPacketTracker};
+use milli_http::transport::stream::StreamState;
+use milli_http::transport::recovery::SentPacket;
 use milli_http::Event;
 
 type C = ChaCha20Provider;
@@ -76,6 +76,24 @@ fn https1_estimate(tls_io_buf: usize, http1_hdr_buf: usize, http1_data_buf: usiz
     (struc, http1_heap + tls_io_heap)
 }
 
+/// Estimate struct + heap for an H2 over TLS connection.
+fn h2_tls_estimate(
+    h2_tls_struct: usize,
+    active_streams: usize,
+    hdrbuf: usize,
+    databuf: usize,
+    tls_buf_size: usize,
+) -> (usize, usize) {
+    // H2 stream heap: Vec<H2Stream> grows on demand
+    // H2Stream ≈ 48 bytes struct + Buf<HDRBUF> + Buf<DATABUF> heap per stream
+    let streams_heap = active_streams * (48 + hdrbuf + databuf);
+    // H2 events: VecDeque<H2Event>, typically small
+    let events_heap = 8 * size_of::<H2Event>();
+    // 4 shared TLS/H2 buffers (net_recv, net_send, app_recv, app_send)
+    let tls_io_heap = 4 * tls_buf_size;
+    (h2_tls_struct, streams_heap + events_heap + tls_io_heap)
+}
+
 #[test]
 fn print_memory_budget() {
     println!();
@@ -89,8 +107,9 @@ fn print_memory_budget() {
     println!("  TlsEngine<C>:               {:>6} bytes", size_of::<TlsEngine<C>>());
     println!("  Option<StreamState>:         {:>6} bytes", size_of::<Option<StreamState>>());
     println!("  Option<SentPacket>:          {:>6} bytes", size_of::<Option<SentPacket>>());
-    println!("  Event:                       {:>6} bytes", size_of::<Event>());
+    println!("  Event (QUIC):                {:>6} bytes", size_of::<Event>());
     println!("  H3Event:                     {:>6} bytes", size_of::<H3Event>());
+    println!("  H2Event:                     {:>6} bytes", size_of::<H2Event>());
     println!("  HandshakeContext<C>:         {:>6} bytes", size_of::<HandshakeContext<C, 2048>>());
     println!();
 
@@ -100,6 +119,8 @@ fn print_memory_budget() {
     println!("  Connection<C, 8, 32, 2>:     {:>6} bytes", size_of::<Connection<C, 8, 32, 2>>());
     println!("  H3Server<C> (defaults):      {:>6} bytes", size_of::<H3Server<C>>());
     println!("  H3Server<C, 8,32,2,512,8>:   {:>6} bytes", size_of::<H3Server<C, 8, 32, 2, 512, 8>>());
+    println!("  H2TlsServer<C> (defaults):   {:>6} bytes", size_of::<H2TlsServer<C>>());
+    println!("  H2TlsServer<C,8192,4,1024,2048>: {:>4} bytes", size_of::<H2TlsServer<C, 8192, 4, 1024, 2048>>());
     println!("  Https1Server<C> (defaults):  {:>6} bytes", size_of::<Https1Server<C>>());
     println!("  TlsConnection<C>:           {:>6} bytes", size_of::<TlsConnection<C>>());
     println!("  HandshakePool<C, 2>:         {:>6} bytes", size_of::<HandshakePool<C, 2, 2048>>());
@@ -125,12 +146,18 @@ fn print_memory_budget() {
     let https1_compact = h1s + h1h;
     println!("  HTTPS/1.1 (established):     {:>6} bytes  (struct {} + heap {})", https1_compact, h1s, h1h);
 
+    let h2_struct_compact = size_of::<H2TlsServer<C, 8192, 4, 1024, 2048>>();
+    let (h2s, h2h) = h2_tls_estimate(h2_struct_compact, 4, 1024, 2048, 8192);
+    let h2_total_compact = h2s + h2h;
+    println!("  H2/TLS (4 streams, 8K bufs): {:>6} bytes  (struct {} + heap {})", h2_total_compact, h2s, h2h);
+
     let pool_struct = size_of::<HandshakePool<C, 2, 2048>>();
-    let total_compact = 2 * h3_total_compact + 2 * (h3_total_compact + hs_compact) + https1_compact + pool_struct;
+    let total_compact = 2 * h3_total_compact + 2 * (h3_total_compact + hs_compact) + https1_compact + 2 * h2_total_compact + pool_struct;
     println!();
     println!("  2x established H3:           {:>6} bytes", 2 * h3_total_compact);
     println!("  2x handshaking H3:           {:>6} bytes", 2 * (h3_total_compact + hs_compact));
     println!("  1x HTTPS/1.1:                {:>6} bytes", https1_compact);
+    println!("  2x H2/TLS:                   {:>6} bytes", 2 * h2_total_compact);
     println!("  Pool struct:                 {:>6} bytes", pool_struct);
     println!("  TOTAL:                       {:>6} bytes  ({:.1} KB)", total_compact, total_compact as f64 / 1024.0);
     print_budget_status(total_compact);
@@ -156,11 +183,17 @@ fn print_memory_budget() {
     let https1_tight = h1s_t + h1h_t;
     println!("  HTTPS/1.1 (established):     {:>6} bytes  (struct {} + heap {})", https1_tight, h1s_t, h1h_t);
 
-    let total_tight = 2 * h3_total_tight + 2 * (h3_total_tight + hs_tight) + https1_tight + pool_struct;
+    let h2_struct_tight = size_of::<H2TlsServer<C, 4096, 2, 512, 1024>>();
+    let (h2s_t, h2h_t) = h2_tls_estimate(h2_struct_tight, 2, 512, 1024, 4096);
+    let h2_total_tight = h2s_t + h2h_t;
+    println!("  H2/TLS (2 streams, 4K bufs): {:>6} bytes  (struct {} + heap {})", h2_total_tight, h2s_t, h2h_t);
+
+    let total_tight = 2 * h3_total_tight + 2 * (h3_total_tight + hs_tight) + https1_tight + 2 * h2_total_tight + pool_struct;
     println!();
     println!("  2x established H3:           {:>6} bytes", 2 * h3_total_tight);
     println!("  2x handshaking H3:           {:>6} bytes", 2 * (h3_total_tight + hs_tight));
     println!("  1x HTTPS/1.1:                {:>6} bytes", https1_tight);
+    println!("  2x H2/TLS:                   {:>6} bytes", 2 * h2_total_tight);
     println!("  Pool struct:                 {:>6} bytes", pool_struct);
     println!("  TOTAL:                       {:>6} bytes  ({:.1} KB)", total_tight, total_tight as f64 / 1024.0);
     print_budget_status(total_tight);

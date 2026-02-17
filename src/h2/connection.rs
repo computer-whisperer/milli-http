@@ -142,7 +142,10 @@ pub struct H2Connection<
     state: H2ConnState,
     local_settings: H2Settings,
     peer_settings: H2Settings,
+    #[cfg(not(feature = "alloc"))]
     streams: heapless::Vec<H2Stream<HDRBUF, DATABUF>, MAX_STREAMS>,
+    #[cfg(feature = "alloc")]
+    streams: alloc::vec::Vec<H2Stream<HDRBUF, DATABUF>>,
     encoder: HpackEncoder,
     decoder: HpackDecoder,
     send_offset: usize,
@@ -150,7 +153,10 @@ pub struct H2Connection<
     conn_send_fc: FlowController,
     conn_recv_fc: FlowController,
     // Event queue
+    #[cfg(not(feature = "alloc"))]
     events: heapless::Deque<H2Event, 32>,
+    #[cfg(feature = "alloc")]
+    events: alloc::collections::VecDeque<H2Event>,
     // Connection state
     next_stream_id: u64,
     last_peer_stream_id: u64,
@@ -192,13 +198,19 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
             state: H2ConnState::WaitingPreface,
             local_settings: H2Settings::default(),
             peer_settings: H2Settings::default(),
+            #[cfg(not(feature = "alloc"))]
             streams: heapless::Vec::new(),
+            #[cfg(feature = "alloc")]
+            streams: alloc::vec::Vec::new(),
             encoder: HpackEncoder::new(),
             decoder: HpackDecoder::new(),
             send_offset: 0,
             conn_send_fc: FlowController::new(DEFAULT_CONNECTION_WINDOW_SIZE),
             conn_recv_fc: FlowController::new(DEFAULT_CONNECTION_WINDOW_SIZE),
+            #[cfg(not(feature = "alloc"))]
             events: heapless::Deque::new(),
+            #[cfg(feature = "alloc")]
+            events: alloc::collections::VecDeque::new(),
             next_stream_id,
             last_peer_stream_id: 0,
             continuation_stream_id: None,
@@ -1493,6 +1505,7 @@ mod tests {
 
     // ====== Item 5: Stream Limit ======
 
+    #[cfg(not(feature = "alloc"))]
     #[test]
     fn stream_vec_full_returns_error() {
         let mut client = H2Connection::<4>::new_client();
