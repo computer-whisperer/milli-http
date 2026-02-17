@@ -37,7 +37,7 @@ struct PendingUdpTx<A> {
 ///
 /// Drives TCP accept, TCP read/write, and UDP recv/send, forwarding
 /// everything through the pure-logic manager.
-pub struct ServerRunner<'a, C, L, U, R, A, const BUF: usize = 18432, const CRYPTO_BUF: usize = 4096>
+pub struct ServerRunner<'a, C, L, U, R, A, const BUF: usize = 18432, const CRYPTO_BUF: usize = 4096, const MAX_STREAMS: usize = 4, const SENT_PER_SPACE: usize = 16, const MAX_CIDS: usize = 2, const STREAM_BUF: usize = 256, const SEND_QUEUE: usize = 4>
 where
     C: CryptoProvider + Clone + 'static,
     C::Hkdf: Default,
@@ -46,7 +46,7 @@ where
     R: Rng,
     A: Address,
 {
-    pub manager: ServerManager<C, A, BUF>,
+    pub manager: ServerManager<C, A, BUF, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>,
     tcp_listener: &'a mut L,
     udp_socket: &'a mut U,
     rng: &'a mut R,
@@ -55,8 +55,8 @@ where
     pending_udp_tx: Option<PendingUdpTx<A>>,
 }
 
-impl<'a, C, L, U, R, A, const BUF: usize, const CRYPTO_BUF: usize>
-    ServerRunner<'a, C, L, U, R, A, BUF, CRYPTO_BUF>
+impl<'a, C, L, U, R, A, const BUF: usize, const CRYPTO_BUF: usize, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>
+    ServerRunner<'a, C, L, U, R, A, BUF, CRYPTO_BUF, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>
 where
     C: CryptoProvider + Clone + 'static,
     C::Hkdf: Default,
@@ -67,7 +67,7 @@ where
 {
     /// Create a new server runner.
     pub fn new(
-        manager: ServerManager<C, A, BUF>,
+        manager: ServerManager<C, A, BUF, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>,
         tcp_listener: &'a mut L,
         udp_socket: &'a mut U,
         rng: &'a mut R,
@@ -139,7 +139,12 @@ where
                     Poll::Ready(Ok(n)) => {
                         let _ = self.manager.tcp_feed(conn.id, &tcp_buf[..n], now);
                     }
-                    _ => break,
+                    Poll::Ready(Err(_)) => {
+                        conn.eof = true;
+                        self.manager.tcp_eof(conn.id);
+                        break;
+                    }
+                    Poll::Pending => break,
                 }
             }
         }
@@ -153,7 +158,12 @@ where
                     Poll::Ready(Ok(n)) => {
                         conn.write_offset += n;
                     }
-                    _ => break,
+                    Poll::Ready(Err(_)) => {
+                        conn.eof = true;
+                        self.manager.tcp_eof(conn.id);
+                        break;
+                    }
+                    Poll::Pending => break,
                 }
             }
             if conn.write_offset >= conn.pending_write.len() {
@@ -180,7 +190,12 @@ where
                             Poll::Ready(Ok(n)) => {
                                 written += n;
                             }
-                            _ => break,
+                            Poll::Ready(Err(_)) => {
+                                conn.eof = true;
+                                self.manager.tcp_eof(conn.id);
+                                break;
+                            }
+                            Poll::Pending => break,
                         }
                     }
                     if written < data_len {

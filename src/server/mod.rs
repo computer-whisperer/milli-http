@@ -85,9 +85,17 @@ struct TcpConn<C: CryptoProvider, const BUF: usize> {
 // QUIC/H3 connection state
 // ---------------------------------------------------------------------------
 
-struct QuicConn<C: CryptoProvider, A: Address> {
+struct QuicConn<
+    C: CryptoProvider,
+    A: Address,
+    const MAX_STREAMS: usize,
+    const SENT_PER_SPACE: usize,
+    const MAX_CIDS: usize,
+    const STREAM_BUF: usize,
+    const SEND_QUEUE: usize,
+> {
     id: ConnId,
-    server: H3Server<C>,
+    server: H3Server<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>,
     peer_addr: A,
     local_cids: Vec<ConnectionId>,
 }
@@ -127,24 +135,35 @@ impl Default for ServerConfig {
 /// Generic parameters:
 /// - `C`: Crypto provider
 /// - `A`: Address type for UDP peers
-/// - `BUF`: TLS buffer size (default 18432 = max TLS record)
+/// - `BUF`: TLS I/O buffer size (default 2048 for embedded; max TLS record is 18432)
+/// - `MAX_STREAMS`: Max concurrent QUIC streams per connection (default 4)
+/// - `SENT_PER_SPACE`: Max tracked sent packets per QUIC packet space (default 16)
+/// - `MAX_CIDS`: Max QUIC connection IDs per connection (default 2)
+/// - `STREAM_BUF`: Per-stream buffer size in bytes (default 256)
+/// - `SEND_QUEUE`: QUIC send queue depth (default 4)
 pub struct ServerManager<
     C: CryptoProvider,
     A: Address,
-    const BUF: usize = 18432,
+    const BUF: usize = 2048,
+    const MAX_STREAMS: usize = 4,
+    const SENT_PER_SPACE: usize = 16,
+    const MAX_CIDS: usize = 2,
+    const STREAM_BUF: usize = 256,
+    const SEND_QUEUE: usize = 4,
 > {
     tls_config: ServerTlsConfig,
     provider: C,
     config: ServerConfig,
 
     tcp_conns: Vec<TcpConn<C, BUF>>,
-    quic_conns: Vec<QuicConn<C, A>>,
+    quic_conns: Vec<QuicConn<C, A, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>>,
 
     events: VecDeque<ServerEvent>,
     next_id: u32,
 }
 
-impl<C, A, const BUF: usize> ServerManager<C, A, BUF>
+impl<C, A, const BUF: usize, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>
+    ServerManager<C, A, BUF, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>
 where
     C: CryptoProvider + Clone + 'static,
     C::Hkdf: Default,
@@ -224,9 +243,15 @@ where
         let needs_upgrade = matches!(&conn.state, TcpState::Handshaking(_));
 
         if needs_upgrade {
-            // Feed data through TlsParts
+            // Feed data through TlsParts. On error, close the connection
+            // immediately to avoid zombie handshake state.
             if let TcpState::Handshaking(parts) = &mut conn.state {
-                parts.feed_data(data)?;
+                if let Err(e) = parts.feed_data(data) {
+                    let conn_id = conn.id;
+                    conn.state = TcpState::Closed;
+                    self.push_server_event(ServerEvent::Closed(conn_id));
+                    return Err(e);
+                }
             }
 
             // Check if handshake completed (separate borrow scope)
@@ -240,13 +265,25 @@ where
                     _ => unreachable!(),
                 };
 
-                let is_h2 = parts.alpn() == Some(b"h2");
-                let protocol = if is_h2 { ConnProtocol::H2 } else { ConnProtocol::Http1 };
-                let mut http_conn: Box<dyn HttpServerConn> = if is_h2 {
-                    Box::new(crate::h2_tls::H2TlsServer::<C, BUF>::from_parts(parts))
-                } else {
-                    Box::new(crate::https1::Https1Server::<C, BUF>::from_parts(parts))
+                let alpn = parts.alpn();
+                let (protocol, http_conn): (ConnProtocol, Box<dyn HttpServerConn>) = match alpn {
+                    Some(b"h2") => (
+                        ConnProtocol::H2,
+                        Box::new(crate::h2_tls::H2TlsServer::<C, BUF>::from_parts(parts)),
+                    ),
+                    Some(b"http/1.1") | None => (
+                        ConnProtocol::Http1,
+                        Box::new(crate::https1::Https1Server::<C, BUF>::from_parts(parts)),
+                    ),
+                    Some(_) => {
+                        // Unknown ALPN — reject the connection.
+                        let conn_id = conn.id;
+                        conn.state = TcpState::Closed;
+                        self.push_server_event(ServerEvent::Closed(conn_id));
+                        return Err(Error::InvalidState);
+                    }
                 };
+                let mut http_conn = http_conn;
 
                 // Process any application data that was decrypted alongside the
                 // final handshake message (common with TLS 1.3 piggybacking).
@@ -318,7 +355,7 @@ where
             return Err(Error::StreamLimitExhausted);
         }
         let id = self.alloc_id();
-        let quic_conn = Connection::server(
+        let quic_conn = Connection::<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>::server(
             self.provider.clone(),
             self.tls_config.clone(),
             TransportParams::default_params(),
@@ -329,7 +366,7 @@ where
         // Cache local CIDs
         let local_cids: Vec<ConnectionId> = quic_conn.local_cids().to_vec();
 
-        let mut server = H3Server::new(quic_conn);
+        let mut server = H3Server::<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>::new(quic_conn);
         // Feed the initial datagram
         server.recv::<CRYPTO_BUF>(data, now, pool)?;
 
