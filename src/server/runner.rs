@@ -124,11 +124,14 @@ where
         }
 
         // 2. Read existing TCP streams + handle EOF (bounded per connection).
+        //    If we exhaust the read budget, self-wake to ensure we come back
+        //    (the last poll_read returned Ready, so no waker was registered).
         let mut tcp_buf = [0u8; 1500];
         for conn in &mut self.tcp_conns {
             if conn.eof {
                 continue;
             }
+            let mut reads_done = 0u32;
             for _ in 0..Self::MAX_READS_PER_CONN {
                 match conn.stream.poll_read(cx, &mut tcp_buf) {
                     Poll::Ready(Ok(0)) => {
@@ -137,7 +140,11 @@ where
                         break;
                     }
                     Poll::Ready(Ok(n)) => {
-                        let _ = self.manager.tcp_feed(conn.id, &tcp_buf[..n], now);
+                        reads_done += 1;
+                        if self.manager.tcp_feed(conn.id, &tcp_buf[..n], now).is_err() {
+                            conn.eof = true;
+                            break;
+                        }
                     }
                     Poll::Ready(Err(_)) => {
                         conn.eof = true;
@@ -146,6 +153,9 @@ where
                     }
                     Poll::Pending => break,
                 }
+            }
+            if reads_done as usize >= Self::MAX_READS_PER_CONN {
+                has_pending_output = true; // budget exhausted, may have more data
             }
         }
 
@@ -211,10 +221,13 @@ where
         }
 
         // 4. Read UDP datagrams (bounded).
+        //    If budget exhausted, self-wake to avoid missed waker.
         let mut udp_buf = [0u8; 1500];
+        let mut udp_reads_done = 0u32;
         for _ in 0..Self::MAX_UDP_READS {
             match self.udp_socket.poll_recv_from(cx, &mut udp_buf) {
                 Poll::Ready(Ok((n, addr))) => {
+                    udp_reads_done += 1;
                     let _ = self.manager.udp_feed::<CRYPTO_BUF>(
                         &udp_buf[..n],
                         addr,
@@ -225,6 +238,9 @@ where
                 }
                 _ => break,
             }
+        }
+        if udp_reads_done as usize >= Self::MAX_UDP_READS {
+            has_pending_output = true; // budget exhausted, may have more datagrams
         }
 
         // 5. Write pending UDP transmits.

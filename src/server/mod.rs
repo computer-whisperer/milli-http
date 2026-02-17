@@ -135,7 +135,7 @@ impl Default for ServerConfig {
 /// Generic parameters:
 /// - `C`: Crypto provider
 /// - `A`: Address type for UDP peers
-/// - `BUF`: TLS I/O buffer size (default 2048 for embedded; max TLS record is 18432)
+/// - `BUF`: TLS I/O buffer capacity cap (default 4096; handles handshakes and typical HTTP)
 /// - `MAX_STREAMS`: Max concurrent QUIC streams per connection (default 4)
 /// - `SENT_PER_SPACE`: Max tracked sent packets per QUIC packet space (default 16)
 /// - `MAX_CIDS`: Max QUIC connection IDs per connection (default 2)
@@ -144,7 +144,7 @@ impl Default for ServerConfig {
 pub struct ServerManager<
     C: CryptoProvider,
     A: Address,
-    const BUF: usize = 2048,
+    const BUF: usize = 4096,
     const MAX_STREAMS: usize = 4,
     const SENT_PER_SPACE: usize = 16,
     const MAX_CIDS: usize = 2,
@@ -576,11 +576,14 @@ where
     /// Handle timeouts on all connections.
     pub fn handle_timeouts(&mut self, now: u64) {
         // Check handshake timeouts on TCP connections.
+        // Collect timed-out IDs first (can't push events while iterating).
+        let mut timed_out = Vec::new();
         for conn in &mut self.tcp_conns {
             match &mut conn.state {
                 TcpState::Handshaking(_) => {
                     if now >= conn.accepted_at.saturating_add(self.config.handshake_timeout_us) {
                         conn.state = TcpState::Closed;
+                        timed_out.push(conn.id);
                     }
                 }
                 TcpState::Established(http) => {
@@ -589,6 +592,9 @@ where
                 TcpState::Closed => {}
             }
         }
+        for id in timed_out {
+            self.push_server_event(ServerEvent::Closed(id));
+        }
         for qconn in &mut self.quic_conns {
             qconn.server.handle_timeout(now);
         }
@@ -596,21 +602,31 @@ where
 
     /// Notify the manager that the TCP peer sent EOF (read returned 0).
     ///
-    /// This closes the connection since HTTP requires a bidirectional stream.
+    /// Drains any queued HTTP events before closing, so that a request
+    /// arriving alongside FIN is not lost.
     pub fn tcp_eof(&mut self, id: ConnId) {
         if let Some(tcp) = self.tcp_conns.iter_mut().find(|c| c.id == id) {
-            if !matches!(tcp.state, TcpState::Closed) {
-                tcp.state = TcpState::Closed;
-                self.push_server_event(ServerEvent::Closed(id));
+            if matches!(tcp.state, TcpState::Closed) {
+                return;
             }
+            // Drain queued HTTP events before closing.
+            if let TcpState::Established(http) = &mut tcp.state {
+                while let Some(ev) = http.poll_event() {
+                    self.events.push_back(ServerEvent::Http { conn: id, event: ev });
+                }
+            }
+            tcp.state = TcpState::Closed;
+            self.push_server_event(ServerEvent::Closed(id));
         }
     }
 
     /// Close a specific connection.
     pub fn close(&mut self, id: ConnId) -> Result<(), Error> {
         if let Some(tcp) = self.tcp_conns.iter_mut().find(|c| c.id == id) {
-            tcp.state = TcpState::Closed;
-            self.push_server_event(ServerEvent::Closed(id));
+            if !matches!(tcp.state, TcpState::Closed) {
+                tcp.state = TcpState::Closed;
+                self.push_server_event(ServerEvent::Closed(id));
+            }
             return Ok(());
         }
         if let Some(qconn) = self.quic_conns.iter_mut().find(|c| c.id == id) {

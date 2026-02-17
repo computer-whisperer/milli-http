@@ -1,6 +1,10 @@
-//! Memory budget analysis for an embedded server target:
-//!   1 HTTPS/1.1 + 2 H2 over TLS + 4 active H3 + 2 H3 handshake slots
-//!   Goal: < 100 KB total SRAM (struct + peak heap)
+//! Memory budget analysis for an embedded server target.
+//!
+//! Primary target: 1 HTTPS/1.1 + 4 active H3 + 2 H3 handshake slots
+//! Extended target: + 2 H2/TLS (measured separately, not in 100KB budget)
+//! Goal: < 100 KB total SRAM (struct + peak heap)
+
+#![cfg(feature = "server")]
 
 use core::mem::size_of;
 
@@ -16,10 +20,12 @@ use milli_http::h2::H2Event;
 use milli_http::h2_tls::H2TlsServer;
 use milli_http::http1::connection::Http1Connection;
 use milli_http::tcp_tls::connection::TlsConnection;
+use milli_http::tcp_tls::TlsParts;
 use milli_http::tcp_tls::io::TlsIoBufs;
 use milli_http::tls::handshake::TlsEngine;
 use milli_http::transport::stream::StreamState;
 use milli_http::transport::recovery::SentPacket;
+use milli_http::server::ServerManager;
 use milli_http::Event;
 
 type C = ChaCha20Provider;
@@ -126,11 +132,28 @@ fn print_memory_budget() {
     println!("  HandshakePool<C, 2>:         {:>6} bytes", size_of::<HandshakePool<C, 2, 2048>>());
     println!();
 
+    // ---- ServerManager + TlsParts sizes ----
+    println!("--- ServerManager overhead ---");
+    println!("  ServerManager<C,()> (defaults): {:>4} bytes", size_of::<ServerManager<C, ()>>());
+    println!("  TlsParts<C, 4096>:           {:>6} bytes", size_of::<TlsParts<C, 4096>>());
+    println!("  TlsParts<C, 2048>:           {:>6} bytes", size_of::<TlsParts<C, 2048>>());
+    // Note: With alloc, Buf<N> is Vec<u8> (24 bytes struct).
+    // The BUF param is a capacity cap, not upfront allocation.
+    // Peak heap per TlsParts = 4 * BUF (when all 4 bufs are at capacity).
+    println!("  -> Peak heap per TlsParts<4096>: {} bytes (4 x 4096)", 4 * 4096);
+    println!("  -> Peak heap per TlsParts<2048>: {} bytes (4 x 2048)", 4 * 2048);
+    println!();
+
     // ================================================================
-    // SCENARIO: Compact config (512-byte stream bufs, 2048 crypto)
+    // PRIMARY TARGET: 1 HTTPS/1.1 + 4 H3 + 2 H3 handshake slots
     // ================================================================
+
+    let pool_struct = size_of::<HandshakePool<C, 2, 2048>>();
+
+    // ---- Compact config ----
     println!("============================================================");
     println!("  COMPACT: 512B stream bufs, 4096B TLS I/O, 2048B crypto");
+    println!("  Target: 1 HTTPS/1.1 + 4 H3 (2 est + 2 HS)");
     println!("============================================================");
     println!();
 
@@ -146,28 +169,26 @@ fn print_memory_budget() {
     let https1_compact = h1s + h1h;
     println!("  HTTPS/1.1 (established):     {:>6} bytes  (struct {} + heap {})", https1_compact, h1s, h1h);
 
-    let h2_struct_compact = size_of::<H2TlsServer<C, 8192, 4, 1024, 2048>>();
-    let (h2s, h2h) = h2_tls_estimate(h2_struct_compact, 4, 1024, 2048, 8192);
-    let h2_total_compact = h2s + h2h;
-    println!("  H2/TLS (4 streams, 8K bufs): {:>6} bytes  (struct {} + heap {})", h2_total_compact, h2s, h2h);
+    // TCP handshake in progress: TlsParts<C, 4096> peak heap
+    let tcp_hs_compact = 4 * 4096; // 4 bufs at capacity during handshake
+    println!("  TCP handshake (TlsParts):    {:>6} bytes  (peak heap for 4096B bufs)", tcp_hs_compact);
 
-    let pool_struct = size_of::<HandshakePool<C, 2, 2048>>();
-    let total_compact = 2 * h3_total_compact + 2 * (h3_total_compact + hs_compact) + https1_compact + 2 * h2_total_compact + pool_struct;
+    let total_compact = 2 * h3_total_compact + 2 * (h3_total_compact + hs_compact)
+        + https1_compact + tcp_hs_compact + pool_struct;
     println!();
     println!("  2x established H3:           {:>6} bytes", 2 * h3_total_compact);
     println!("  2x handshaking H3:           {:>6} bytes", 2 * (h3_total_compact + hs_compact));
-    println!("  1x HTTPS/1.1:                {:>6} bytes", https1_compact);
-    println!("  2x H2/TLS:                   {:>6} bytes", 2 * h2_total_compact);
+    println!("  1x HTTPS/1.1 (established):  {:>6} bytes", https1_compact);
+    println!("  1x TCP handshake in progress:{:>6} bytes", tcp_hs_compact);
     println!("  Pool struct:                 {:>6} bytes", pool_struct);
     println!("  TOTAL:                       {:>6} bytes  ({:.1} KB)", total_compact, total_compact as f64 / 1024.0);
     print_budget_status(total_compact);
     println!();
 
-    // ================================================================
-    // SCENARIO: Tight config (256-byte stream bufs, 2048 TLS I/O, 1024 crypto)
-    // ================================================================
+    // ---- Tight config ----
     println!("============================================================");
     println!("  TIGHT: 256B stream bufs, 2048B TLS I/O, 1024B crypto");
+    println!("  Target: 1 HTTPS/1.1 + 4 H3 (2 est + 2 HS)");
     println!("============================================================");
     println!();
 
@@ -183,20 +204,38 @@ fn print_memory_budget() {
     let https1_tight = h1s_t + h1h_t;
     println!("  HTTPS/1.1 (established):     {:>6} bytes  (struct {} + heap {})", https1_tight, h1s_t, h1h_t);
 
-    let h2_struct_tight = size_of::<H2TlsServer<C, 4096, 2, 512, 1024>>();
-    let (h2s_t, h2h_t) = h2_tls_estimate(h2_struct_tight, 2, 512, 1024, 4096);
-    let h2_total_tight = h2s_t + h2h_t;
-    println!("  H2/TLS (2 streams, 4K bufs): {:>6} bytes  (struct {} + heap {})", h2_total_tight, h2s_t, h2h_t);
+    let tcp_hs_tight = 4 * 2048;
+    println!("  TCP handshake (TlsParts):    {:>6} bytes  (peak heap for 2048B bufs)", tcp_hs_tight);
 
-    let total_tight = 2 * h3_total_tight + 2 * (h3_total_tight + hs_tight) + https1_tight + 2 * h2_total_tight + pool_struct;
+    let total_tight = 2 * h3_total_tight + 2 * (h3_total_tight + hs_tight)
+        + https1_tight + tcp_hs_tight + pool_struct;
     println!();
     println!("  2x established H3:           {:>6} bytes", 2 * h3_total_tight);
     println!("  2x handshaking H3:           {:>6} bytes", 2 * (h3_total_tight + hs_tight));
-    println!("  1x HTTPS/1.1:                {:>6} bytes", https1_tight);
-    println!("  2x H2/TLS:                   {:>6} bytes", 2 * h2_total_tight);
+    println!("  1x HTTPS/1.1 (established):  {:>6} bytes", https1_tight);
+    println!("  1x TCP handshake in progress:{:>6} bytes", tcp_hs_tight);
     println!("  Pool struct:                 {:>6} bytes", pool_struct);
     println!("  TOTAL:                       {:>6} bytes  ({:.1} KB)", total_tight, total_tight as f64 / 1024.0);
     print_budget_status(total_tight);
+    println!();
+
+    // ================================================================
+    // H2/TLS ADDENDUM (not in 100KB budget)
+    // ================================================================
+    println!("============================================================");
+    println!("  H2/TLS ADDENDUM (not in 100KB budget)");
+    println!("============================================================");
+    println!();
+
+    let h2_struct_compact = size_of::<H2TlsServer<C, 8192, 4, 1024, 2048>>();
+    let (h2s, h2h) = h2_tls_estimate(h2_struct_compact, 4, 1024, 2048, 8192);
+    let h2_total_compact = h2s + h2h;
+    println!("  H2/TLS compact (4 streams):  {:>6} bytes  (struct {} + heap {})", h2_total_compact, h2s, h2h);
+
+    let h2_struct_tight = size_of::<H2TlsServer<C, 4096, 2, 512, 1024>>();
+    let (h2s_t, h2h_t) = h2_tls_estimate(h2_struct_tight, 2, 512, 1024, 4096);
+    let h2_total_tight = h2s_t + h2h_t;
+    println!("  H2/TLS tight (2 streams):    {:>6} bytes  (struct {} + heap {})", h2_total_tight, h2s_t, h2h_t);
     println!();
 
     println!("============================================================");
