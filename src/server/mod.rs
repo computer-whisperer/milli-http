@@ -605,19 +605,26 @@ where
     /// Drains any queued HTTP events before closing, so that a request
     /// arriving alongside FIN is not lost.
     pub fn tcp_eof(&mut self, id: ConnId) {
+        // Drain queued HTTP events before closing, collected into a temp vec
+        // to avoid borrow conflict with push_server_event.
+        let mut drained = Vec::new();
         if let Some(tcp) = self.tcp_conns.iter_mut().find(|c| c.id == id) {
             if matches!(tcp.state, TcpState::Closed) {
                 return;
             }
-            // Drain queued HTTP events before closing.
             if let TcpState::Established(http) = &mut tcp.state {
                 while let Some(ev) = http.poll_event() {
-                    self.events.push_back(ServerEvent::Http { conn: id, event: ev });
+                    drained.push(ServerEvent::Http { conn: id, event: ev });
                 }
             }
             tcp.state = TcpState::Closed;
-            self.push_server_event(ServerEvent::Closed(id));
+        } else {
+            return;
         }
+        for ev in drained {
+            self.push_server_event(ev);
+        }
+        self.push_server_event(ServerEvent::Closed(id));
     }
 
     /// Close a specific connection.
