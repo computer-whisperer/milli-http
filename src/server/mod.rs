@@ -145,7 +145,7 @@ pub struct ServerManager<
     C: CryptoProvider,
     A: Address,
     const BUF: usize = 4096,
-    const MAX_STREAMS: usize = 4,
+    const MAX_STREAMS: usize = 16,
     const SENT_PER_SPACE: usize = 16,
     const MAX_CIDS: usize = 2,
     const STREAM_BUF: usize = 256,
@@ -367,8 +367,12 @@ where
         let local_cids: Vec<ConnectionId> = quic_conn.local_cids().to_vec();
 
         let mut server = H3Server::<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>::new(quic_conn);
-        // Feed the initial datagram
-        server.recv::<CRYPTO_BUF>(data, now, pool)?;
+        // Feed the initial datagram. If this fails, release the handshake pool
+        // slot to avoid leaking it (Connection has no Drop impl).
+        if let Err(e) = server.recv::<CRYPTO_BUF>(data, now, pool) {
+            server.release_handshake_slot::<CRYPTO_BUF>(pool);
+            return Err(e);
+        }
 
         self.quic_conns.push(QuicConn {
             id,
@@ -653,6 +657,12 @@ where
         }
         true // not found = closed
     }
+
+    /// Number of active QUIC connections.
+    pub fn quic_conn_count(&self) -> usize { self.quic_conns.len() }
+
+    /// Number of active TCP connections.
+    pub fn tcp_conn_count(&self) -> usize { self.tcp_conns.len() }
 
     /// Query the protocol used by a connection.
     ///

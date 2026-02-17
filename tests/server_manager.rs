@@ -261,59 +261,38 @@ fn tcp_handshake_h2_negotiation() {
 // UDP/QUIC tests
 // -----------------------------------------------------------------------
 
-#[test]
-fn udp_quic_connection() {
-    let cert: &'static [u8] = test_cert_der().leak();
-    let server_config = ServerTlsConfig {
-        cert_der: cert,
-        private_key_der: Box::leak(Box::new(TEST_SEED)),
-        alpn_protocols: &[b"h3"],
-        transport_params: TransportParams::default_params(),
-    };
-    let mut manager: ServerManager<Aes128GcmProvider, u32, 18432> =
-        ServerManager::new(Aes128GcmProvider, server_config, ServerConfig::default());
-    let mut rng = TestRng(0x30);
-    let mut pool: HandshakePool<Aes128GcmProvider, 4> = HandshakePool::new();
-
-    // Create QUIC client (specify defaults for const generics)
-    let client_conn: milli_http::Connection<Aes128GcmProvider> = milli_http::Connection::client(
-        Aes128GcmProvider,
-        "test.local",
-        &[b"h3"],
-        TransportParams::default_params(),
-        &mut rng,
-        &mut pool,
-    ).unwrap();
-    let mut client: milli_http::h3::client::H3Client<Aes128GcmProvider> =
-        milli_http::h3::client::H3Client::new(client_conn);
-
-    let peer_addr: u32 = 42; // fake address
-    let now = 1_000_000u64;
-
-    // Exchange packets: client → manager → client
-    for _round in 0..20 {
+/// Helper: exchange UDP packets between an H3Client and ServerManager.
+fn exchange_udp(
+    client: &mut milli_http::h3::client::H3Client<Aes128GcmProvider>,
+    manager: &mut ServerManager<Aes128GcmProvider, u32>,
+    peer_addr: u32,
+    now: u64,
+    rng: &mut TestRng,
+    pool: &mut HandshakePool<Aes128GcmProvider, 4>,
+) {
+    for _ in 0..20 {
         let mut any_sent = false;
 
-        // Client → Manager (as UDP datagrams)
+        // Client → Manager
         loop {
             let mut buf = [0u8; 4096];
-            match client.poll_transmit(&mut buf, now, &mut pool) {
+            match client.poll_transmit(&mut buf, now, pool) {
                 Some(tx) => {
                     let data = tx.data.to_vec();
-                    let _ = manager.udp_feed::<4096>(&data, peer_addr, now, &mut rng, &mut pool);
+                    let _ = manager.udp_feed::<4096>(&data, peer_addr, now, rng, pool);
                     any_sent = true;
                 }
                 None => break,
             }
         }
 
-        // Manager → Client (as UDP datagrams)
+        // Manager → Client
         loop {
             let mut buf = [0u8; 4096];
-            match manager.udp_poll_transmit::<4096>(&mut buf, now, &mut pool) {
+            match manager.udp_poll_transmit::<4096>(&mut buf, now, pool) {
                 Some((_addr, len)) => {
                     let data = buf[..len].to_vec();
-                    let _ = client.recv::<4096>(&data, now, &mut pool);
+                    let _ = client.recv::<4096>(&data, now, pool);
                     any_sent = true;
                 }
                 None => break,
@@ -324,10 +303,139 @@ fn udp_quic_connection() {
             break;
         }
     }
+}
 
-    // At this point the QUIC handshake should have progressed
-    // Note: Full H3 connection establishment requires more exchange rounds
-    // since H3 needs control streams + SETTINGS after QUIC handshake
+fn make_h3_server_config(cert: &'static [u8]) -> ServerTlsConfig {
+    ServerTlsConfig {
+        cert_der: cert,
+        private_key_der: Box::leak(Box::new(TEST_SEED)),
+        alpn_protocols: &[b"h3"],
+        transport_params: TransportParams::default_params(),
+    }
+}
+
+#[test]
+fn udp_quic_handshake_and_h3_request() {
+    let cert: &'static [u8] = test_cert_der().leak();
+    let server_config = make_h3_server_config(cert);
+    let mut manager: ServerManager<Aes128GcmProvider, u32> =
+        ServerManager::new(Aes128GcmProvider, server_config, ServerConfig::default());
+    let mut rng = TestRng(0x30);
+    let mut pool: HandshakePool<Aes128GcmProvider, 4> = HandshakePool::new();
+
+    // Create H3 client
+    let client_conn: milli_http::Connection<Aes128GcmProvider> = milli_http::Connection::client(
+        Aes128GcmProvider,
+        "test.local",
+        &[b"h3"],
+        TransportParams::default_params(),
+        &mut rng,
+        &mut pool,
+    ).unwrap();
+    let mut client = milli_http::h3::client::H3Client::new(client_conn);
+
+    let peer_addr: u32 = 42;
+    let now = 1_000_000u64;
+
+    // Run QUIC handshake + H3 setup.
+    // H3 control stream setup is triggered by poll_event(), so we must
+    // interleave packet exchange with event polling on both sides.
+    let mut client_connected = false;
+    let mut conn_id = None;
+    for _ in 0..20 {
+        exchange_udp(&mut client, &mut manager, peer_addr, now, &mut rng, &mut pool);
+
+        // Poll manager events (triggers H3 setup when QUIC handshake completes)
+        while let Some(ev) = manager.poll_event() {
+            if let ServerEvent::Http { conn, event: HttpEvent::Connected } = ev {
+                conn_id = Some(conn);
+            }
+        }
+
+        // Poll client events
+        while let Some(ev) = client.poll_event() {
+            if ev == milli_http::h3::H3Event::Connected {
+                client_connected = true;
+            }
+        }
+
+        if client_connected && conn_id.is_some() {
+            break;
+        }
+    }
+    assert!(client_connected, "H3 client should be connected");
+    let conn_id = conn_id.expect("manager should emit Connected for QUIC connection");
+
+    // Client sends GET request
+    let stream_id = client
+        .send_request("GET", "/hello", "test.local", &[], false)
+        .unwrap();
+    client.send_body(stream_id, &[], true).unwrap();
+
+    // Exchange so manager receives request
+    exchange_udp(&mut client, &mut manager, peer_addr, now, &mut rng, &mut pool);
+
+    // Manager should have Headers event
+    let mut got_headers = false;
+    let mut header_stream = 0u64;
+    for _ in 0..10 {
+        while let Some(ev) = manager.poll_event() {
+            if let ServerEvent::Http { conn, event: HttpEvent::Headers(sid) } = ev {
+                if conn == conn_id {
+                    got_headers = true;
+                    header_stream = sid;
+                }
+            }
+        }
+        if got_headers { break; }
+        exchange_udp(&mut client, &mut manager, peer_addr, now, &mut rng, &mut pool);
+    }
+    assert!(got_headers, "manager should receive H3 request headers");
+
+    // Read request headers through manager
+    let mut method = Vec::new();
+    let mut path = Vec::new();
+    manager.recv_headers(conn_id, header_stream, &mut |name: &[u8], value: &[u8]| {
+        if name == b":method" { method.extend_from_slice(value); }
+        if name == b":path" { path.extend_from_slice(value); }
+    }).unwrap();
+    assert_eq!(method, b"GET");
+    assert_eq!(path, b"/hello");
+
+    // Send response through manager
+    manager.send_response(conn_id, header_stream, 200, &[(b"content-length", b"5")], false).unwrap();
+    manager.send_body(conn_id, header_stream, b"Hello", true).unwrap();
+
+    // Exchange so client receives response
+    exchange_udp(&mut client, &mut manager, peer_addr, now, &mut rng, &mut pool);
+
+    // Client reads response
+    let mut got_resp = false;
+    for _ in 0..10 {
+        while let Some(ev) = client.poll_event() {
+            if let milli_http::h3::H3Event::Headers(sid) = ev {
+                if sid == stream_id { got_resp = true; }
+            }
+        }
+        if got_resp { break; }
+        exchange_udp(&mut client, &mut manager, peer_addr, now, &mut rng, &mut pool);
+    }
+    assert!(got_resp, "client should receive response headers");
+
+    // Read status
+    let mut status = Vec::new();
+    client.recv_headers(stream_id, |name, value| {
+        if name == b":status" { status.extend_from_slice(value); }
+    }).unwrap();
+    assert_eq!(status, b"200");
+
+    // Read body
+    let mut body = [0u8; 64];
+    // May need another exchange for Data frame
+    exchange_udp(&mut client, &mut manager, peer_addr, now, &mut rng, &mut pool);
+    while let Some(_) = client.poll_event() {} // drain events
+    let (n, _fin) = client.recv_body(stream_id, &mut body).unwrap();
+    assert_eq!(&body[..n], b"Hello");
 }
 
 // -----------------------------------------------------------------------

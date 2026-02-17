@@ -151,6 +151,20 @@ where
     pub fn handle_timeout(&mut self, now: Instant) {
         self.inner.quic.handle_timeout(now);
     }
+
+    /// Force-release the handshake pool slot if one is held.
+    ///
+    /// Called by the connection manager when a new connection fails after
+    /// `Connection::server()` claimed a slot (e.g. malformed initial datagram).
+    /// Without this, the slot leaks since `Connection` has no `Drop` impl.
+    pub(crate) fn release_handshake_slot<const CRYPTO_BUF: usize>(
+        &mut self,
+        pool: &mut dyn HandshakePoolAccess<C, CRYPTO_BUF>,
+    ) {
+        if let Some(slot) = self.inner.quic.handshake_slot.take() {
+            pool.release(slot);
+        }
+    }
 }
 
 pub(crate) fn map_h3_event(ev: H3Event) -> crate::http::server_conn::HttpEvent {

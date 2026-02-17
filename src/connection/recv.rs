@@ -293,9 +293,17 @@ where
             }
         }
 
-        // Store remote SCID if we haven't yet (server learns client SCID from Initial)
-        if self.remote_cid.len == 0 && !hdr.scid.is_empty() {
-            self.remote_cid = ConnectionId::from_slice(hdr.scid);
+        // Update remote CID from the peer's SCID (RFC 9000 §7.2):
+        // - Server: learns client SCID from the first Initial.
+        // - Client: switches DCID from the random initial_dcid to the server's
+        //   actual SCID upon receiving the server's first Initial.
+        if !hdr.scid.is_empty() {
+            if self.remote_cid.len == 0
+                || (self.role == crate::tls::handshake::Role::Client
+                    && matches!(self.state, ConnectionState::Handshaking))
+            {
+                self.remote_cid = ConnectionId::from_slice(hdr.scid);
+            }
         }
 
         // Initial keys are concrete AES types, so use the type-specific accessor.
