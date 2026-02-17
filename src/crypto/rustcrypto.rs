@@ -222,6 +222,7 @@ impl HeaderProtection for ChaChaHeaderProtection {
 // ---- CryptoProvider bundles ----
 
 /// AES-128-GCM cipher suite provider.
+#[derive(Clone, Copy)]
 pub struct Aes128GcmProvider;
 
 impl CryptoProvider for Aes128GcmProvider {

@@ -272,6 +272,11 @@ impl RecvPnTracker {
                     // Drop the lowest (oldest) range.
                     self.ranges.remove(0);
                 }
+                #[cfg(feature = "alloc")]
+                if self.ranges.len() >= 32 {
+                    // Drop the lowest (oldest) range to match no-alloc cap.
+                    self.ranges.remove(0);
+                }
                 self.insert_range(pn, pn);
             }
         }
@@ -564,17 +569,45 @@ where
 
     /// Get the next timer deadline.
     pub fn next_timeout(&self) -> Option<Instant> {
-        self.loss_detector.next_timeout(&self.sent_tracker)
+        if matches!(self.state, ConnectionState::Closed) {
+            return None;
+        }
+        // Draining connections need a drain timer.
+        if matches!(self.state, ConnectionState::Draining) {
+            return self.idle_timeout.map(|idle| self.last_activity.saturating_add(idle));
+        }
+        let mut earliest = self.loss_detector.next_timeout(&self.sent_tracker);
+        // Also consider idle timeout for active connections.
+        if let Some(idle) = self.idle_timeout {
+            let idle_deadline = self.last_activity.saturating_add(idle);
+            earliest = Some(earliest.map_or(idle_deadline, |e| e.min(idle_deadline)));
+        }
+        earliest
     }
 
     /// Handle a timer expiration.
     pub fn handle_timeout(&mut self, now: Instant) {
+        // Draining connections transition to Closed after idle timeout.
+        // Per RFC 9000 §10.2.1, the drain period should be at least 3x PTO.
+        // We reuse the idle timeout which is a conservative upper bound.
+        if matches!(self.state, ConnectionState::Draining) {
+            if let Some(idle) = self.idle_timeout {
+                if now.saturating_sub(self.last_activity) >= idle {
+                    self.state = ConnectionState::Closed;
+                }
+            } else {
+                // No idle timeout configured — close immediately.
+                self.state = ConnectionState::Closed;
+            }
+            return;
+        }
+
         // Check idle timeout
         if let Some(idle) = self.idle_timeout
             && now.saturating_sub(self.last_activity) >= idle
         {
             self.state = ConnectionState::Closed;
-            let _ = self.events.push_back(Event::ConnectionClose {
+            self.push_event(Event::ConnectionClose {
                 error_code: 0,
                 reason: heapless::Vec::new(),
             });
@@ -626,6 +659,16 @@ where
 
         if send_len == 0 && !fin {
             return Ok(0);
+        }
+
+        // Check send queue capacity before modifying state.
+        #[cfg(not(feature = "alloc"))]
+        if sio.send_queue.is_full() {
+            return Err(Error::BufferTooSmall { needed: SEND_QUEUE + 1 });
+        }
+        #[cfg(feature = "alloc")]
+        if sio.send_queue.len() >= SEND_QUEUE {
+            return Err(Error::BufferTooSmall { needed: SEND_QUEUE + 1 });
         }
 
         // Record in stream map
@@ -726,6 +769,11 @@ where
         matches!(self.state, ConnectionState::Active)
     }
 
+    /// Get the local connection IDs.
+    pub fn local_cids(&self) -> &[ConnectionId] {
+        &self.local_cids
+    }
+
     /// Initiate a QUIC key update (RFC 9001 section 6).
     ///
     /// Derives next-generation application send/recv keys, rotates the
@@ -758,6 +806,20 @@ where
     // ------------------------------------------------------------------
     // Internal helpers
     // ------------------------------------------------------------------
+
+    /// Push an event to the events queue, enforcing a capacity limit for alloc.
+    pub(crate) fn push_event(&mut self, event: Event) {
+        #[cfg(not(feature = "alloc"))]
+        {
+            let _ = self.events.push_back(event);
+        }
+        #[cfg(feature = "alloc")]
+        {
+            if self.events.len() < 64 {
+                self.events.push_back(event);
+            }
+        }
+    }
 
     /// Store received stream data in a receive buffer, respecting the offset.
     ///
@@ -795,9 +857,9 @@ where
             }
         }
 
-        // With alloc, grow the Vec on demand if no empty slot was found.
+        // With alloc, grow the Vec on demand if no empty slot was found (capped at MAX_STREAMS).
         #[cfg(feature = "alloc")]
-        if target_idx.is_none() {
+        if target_idx.is_none() && sio.recv_bufs.len() < MAX_STREAMS {
             let new_idx = sio.recv_bufs.len();
             sio.recv_bufs.push(None);
             target_idx = Some(new_idx);

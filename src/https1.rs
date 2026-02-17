@@ -188,6 +188,44 @@ where
         self.http.recv_body(stream_id, buf)
     }
 
+    /// Configure timeouts.
+    pub fn set_timeouts(&mut self, config: crate::http::TimeoutConfig, now: u64) {
+        self.http.set_timeouts(config, now);
+    }
+
+    /// Return the earliest deadline at which `handle_timeout` should be called.
+    pub fn next_timeout(&self) -> Option<u64> {
+        self.http.next_timeout()
+    }
+
+    /// Check timeouts and emit events if they fire.
+    pub fn handle_timeout(&mut self, now: u64) {
+        self.http.handle_timeout(now);
+    }
+
+    /// Feed data with timestamp tracking.
+    pub fn feed_data_timed(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
+        {
+            let mut tls_io: TlsIo<'_, BUF> = TlsIo {
+                recv_buf: &mut self.net_recv,
+                send_buf: &mut self.net_send,
+                app_recv_buf: &mut self.app_recv,
+                app_send_buf: &mut self.app_send,
+            };
+            self.tls.feed_data(&mut tls_io, data)?;
+        }
+
+        if !self.app_recv.is_empty() {
+            let mut http_io: Http1Io<'_, BUF> = Http1Io {
+                recv_buf: &mut self.app_recv,
+                send_buf: &mut self.app_send,
+            };
+            self.http.feed_data_timed(&mut http_io, &[], now)?;
+        }
+
+        Ok(())
+    }
+
     /// Get negotiated ALPN protocol.
     pub fn alpn(&self) -> Option<&[u8]> {
         self.tls.alpn()
@@ -234,6 +272,19 @@ where
             net_send: Buf::new(),
             app_recv: Buf::new(),
             app_send: Buf::new(),
+        }
+    }
+
+    /// Create from pre-handshaked TLS parts (used by connection manager after ALPN).
+    #[cfg(feature = "tcp-tls")]
+    pub fn from_parts(parts: crate::tcp_tls::TlsParts<C, BUF>) -> Self {
+        Self {
+            tls: parts.tls,
+            http: Http1Connection::new_server(),
+            net_recv: parts.net_recv,
+            net_send: parts.net_send,
+            app_recv: parts.app_recv,
+            app_send: parts.app_send,
         }
     }
 
@@ -349,6 +400,44 @@ where
         self.http.send_data(&mut http_io, stream_id, data, end_stream)
     }
 
+    /// Configure timeouts.
+    pub fn set_timeouts(&mut self, config: crate::http::TimeoutConfig, now: u64) {
+        self.http.set_timeouts(config, now);
+    }
+
+    /// Return the earliest deadline at which `handle_timeout` should be called.
+    pub fn next_timeout(&self) -> Option<u64> {
+        self.http.next_timeout()
+    }
+
+    /// Check timeouts and emit events if they fire.
+    pub fn handle_timeout(&mut self, now: u64) {
+        self.http.handle_timeout(now);
+    }
+
+    /// Feed data with timestamp tracking.
+    pub fn feed_data_timed(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
+        {
+            let mut tls_io: TlsIo<'_, BUF> = TlsIo {
+                recv_buf: &mut self.net_recv,
+                send_buf: &mut self.net_send,
+                app_recv_buf: &mut self.app_recv,
+                app_send_buf: &mut self.app_send,
+            };
+            self.tls.feed_data(&mut tls_io, data)?;
+        }
+
+        if !self.app_recv.is_empty() {
+            let mut http_io: Http1Io<'_, BUF> = Http1Io {
+                recv_buf: &mut self.app_recv,
+                send_buf: &mut self.app_send,
+            };
+            self.http.feed_data_timed(&mut http_io, &[], now)?;
+        }
+
+        Ok(())
+    }
+
     /// Get negotiated ALPN protocol.
     pub fn alpn(&self) -> Option<&[u8]> {
         self.tls.alpn()
@@ -363,6 +452,147 @@ where
             app_send_buf: &mut self.app_send,
         };
         self.tls.close(&mut tls_io)
+    }
+}
+
+fn map_http1_event(ev: Http1Event) -> crate::http::server_conn::HttpEvent {
+    use crate::http::server_conn::HttpEvent;
+    match ev {
+        Http1Event::Connected => HttpEvent::Connected,
+        Http1Event::Headers(s) => HttpEvent::Headers(s),
+        Http1Event::Data(s) => HttpEvent::Data(s),
+        Http1Event::Finished(s) => HttpEvent::Finished(s),
+        Http1Event::Timeout => HttpEvent::Timeout,
+    }
+}
+
+impl<C: CryptoProvider, const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
+    crate::http::server_conn::HttpServerConn for Https1Server<C, BUF, HDRBUF, DATABUF>
+where
+    C::Hkdf: Default,
+{
+    fn poll_event(&mut self) -> Option<crate::http::server_conn::HttpEvent> {
+        self.poll_event().map(map_http1_event)
+    }
+
+    fn recv_headers(
+        &mut self,
+        stream_id: u64,
+        emit: &mut dyn FnMut(&[u8], &[u8]),
+    ) -> Result<(), Error> {
+        Https1Server::recv_headers(self, stream_id, emit)
+    }
+
+    fn recv_body(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
+        Https1Server::recv_body(self, stream_id, buf)
+    }
+
+    fn send_response(
+        &mut self,
+        stream_id: u64,
+        status: u16,
+        headers: &[(&[u8], &[u8])],
+        end_stream: bool,
+    ) -> Result<(), Error> {
+        Https1Server::send_response(self, stream_id, status, headers, end_stream)
+    }
+
+    fn send_body(
+        &mut self,
+        stream_id: u64,
+        data: &[u8],
+        end_stream: bool,
+    ) -> Result<usize, Error> {
+        Https1Server::send_body(self, stream_id, data, end_stream)
+    }
+
+    fn is_established(&self) -> bool {
+        Https1Server::is_established(self)
+    }
+
+    fn is_closed(&self) -> bool {
+        Https1Server::is_closed(self)
+    }
+
+    fn next_timeout(&self) -> Option<u64> {
+        Https1Server::next_timeout(self)
+    }
+
+    fn handle_timeout(&mut self, now: u64) {
+        Https1Server::handle_timeout(self, now);
+    }
+
+    fn tcp_feed_data(&mut self, data: &[u8]) -> Result<(), Error> {
+        Https1Server::feed_data(self, data)
+    }
+
+    fn tcp_poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+        Https1Server::poll_output(self, buf)
+    }
+}
+
+impl<C: CryptoProvider, const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
+    crate::http::server_conn::HttpServerConn for Https1Client<C, BUF, HDRBUF, DATABUF>
+where
+    C::Hkdf: Default,
+{
+    fn poll_event(&mut self) -> Option<crate::http::server_conn::HttpEvent> {
+        self.poll_event().map(map_http1_event)
+    }
+
+    fn recv_headers(
+        &mut self,
+        stream_id: u64,
+        emit: &mut dyn FnMut(&[u8], &[u8]),
+    ) -> Result<(), Error> {
+        Https1Client::recv_headers(self, stream_id, emit)
+    }
+
+    fn recv_body(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
+        Https1Client::recv_body(self, stream_id, buf)
+    }
+
+    fn send_response(
+        &mut self,
+        _stream_id: u64,
+        _status: u16,
+        _headers: &[(&[u8], &[u8])],
+        _end_stream: bool,
+    ) -> Result<(), Error> {
+        Err(Error::InvalidState) // clients don't send responses
+    }
+
+    fn send_body(
+        &mut self,
+        stream_id: u64,
+        data: &[u8],
+        end_stream: bool,
+    ) -> Result<usize, Error> {
+        Https1Client::send_body(self, stream_id, data, end_stream)
+    }
+
+    fn is_established(&self) -> bool {
+        Https1Client::is_established(self)
+    }
+
+    fn is_closed(&self) -> bool {
+        Https1Client::is_closed(self)
+    }
+
+    fn next_timeout(&self) -> Option<u64> {
+        Https1Client::next_timeout(self)
+    }
+
+    fn handle_timeout(&mut self, now: u64) {
+        Https1Client::handle_timeout(self, now);
+    }
+
+    fn tcp_feed_data(&mut self, data: &[u8]) -> Result<(), Error> {
+        Https1Client::feed_data(self, data)
+    }
+
+    fn tcp_poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+        Https1Client::poll_output(self, buf)
     }
 }
 

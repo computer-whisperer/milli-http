@@ -16,6 +16,9 @@ pub mod varint;
 #[cfg(feature = "http")]
 pub mod http;
 
+#[cfg(feature = "http")]
+pub use http::server_conn::{HttpEvent, HttpServerConn};
+
 #[cfg(any(feature = "h3", feature = "h2"))]
 pub mod hpack;
 
@@ -40,8 +43,11 @@ pub mod h3;
 #[cfg(feature = "discovery")]
 pub mod discovery;
 
+#[cfg(feature = "server")]
+pub mod server;
+
 pub mod transport;
-pub use transport::{Address, Clock, DatagramRecv, DatagramSend, Instant, Rng, ServerTransport};
+pub use transport::{Address, Clock, Instant, Rng, TcpAccept, TcpStream, UdpSocket};
 
 pub mod crypto;
 pub mod packet;

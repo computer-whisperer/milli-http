@@ -135,6 +135,7 @@ fn main() {
                     println!("[h3] GOAWAY (id={id})");
                     return;
                 }
+                _ => {}
             }
         }
 

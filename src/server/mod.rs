@@ -1,0 +1,609 @@
+//! Multi-protocol connection manager.
+//!
+//! Unifies TCP (HTTP/1.1, HTTP/2 over TLS) and UDP (HTTP/3 over QUIC)
+//! connections behind a single event loop. Requires `alloc`.
+
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
+
+use crate::connection::{Connection, ConnectionId, HandshakePoolAccess};
+use crate::crypto::CryptoProvider;
+use crate::error::Error;
+use crate::h3::server::H3Server;
+use crate::http::server_conn::{HttpEvent, HttpServerConn};
+use crate::packet::decode_dcid::decode_dcid;
+use crate::tcp_tls::TlsParts;
+use crate::tls::handshake::ServerTlsConfig;
+use crate::tls::transport_params::TransportParams;
+use crate::transport::{Address, Rng};
+
+pub mod runner;
+
+// ---------------------------------------------------------------------------
+// ConnId — opaque connection handle
+// ---------------------------------------------------------------------------
+
+/// Opaque connection handle returned by the manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnId(pub u32);
+
+/// Protocol used by a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnProtocol {
+    /// TLS handshake in progress, protocol not yet determined.
+    Handshaking,
+    /// HTTP/1.1 over TLS.
+    Http1,
+    /// HTTP/2 over TLS.
+    H2,
+    /// HTTP/3 over QUIC.
+    H3,
+}
+
+// ---------------------------------------------------------------------------
+// ServerEvent — unified event
+// ---------------------------------------------------------------------------
+
+/// Event from the connection manager.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerEvent {
+    /// HTTP event on a specific connection.
+    Http { conn: ConnId, event: HttpEvent },
+    /// A connection was accepted and TLS/QUIC handshake completed.
+    Connected(ConnId),
+    /// A connection was closed and removed.
+    Closed(ConnId),
+}
+
+// ---------------------------------------------------------------------------
+// TCP connection state
+// ---------------------------------------------------------------------------
+
+enum TcpState<C: CryptoProvider, const BUF: usize> {
+    /// TLS handshake in progress.
+    Handshaking(TlsParts<C, BUF>),
+    /// HTTP protocol established (H1 or H2, erased via dyn trait).
+    Established(Box<dyn HttpServerConn>),
+    /// Closed, pending removal.
+    Closed,
+}
+
+struct TcpConn<C: CryptoProvider, const BUF: usize> {
+    id: ConnId,
+    state: TcpState<C, BUF>,
+    /// Negotiated protocol (set after TLS handshake completes).
+    protocol: ConnProtocol,
+    /// Timestamp (microseconds) when the connection was accepted.
+    /// Used for handshake timeout enforcement.
+    accepted_at: u64,
+}
+
+// ---------------------------------------------------------------------------
+// QUIC/H3 connection state
+// ---------------------------------------------------------------------------
+
+struct QuicConn<C: CryptoProvider, A: Address> {
+    id: ConnId,
+    server: H3Server<C>,
+    peer_addr: A,
+    local_cids: Vec<ConnectionId>,
+}
+
+// ---------------------------------------------------------------------------
+// ServerManager
+// ---------------------------------------------------------------------------
+
+/// Configuration for connection limits and timeouts.
+pub struct ServerConfig {
+    /// Maximum number of TCP connections.
+    pub max_tcp_conns: usize,
+    /// Maximum number of QUIC connections.
+    pub max_quic_conns: usize,
+    /// Maximum number of queued events.
+    pub max_events: usize,
+    /// TLS handshake timeout in microseconds.
+    pub handshake_timeout_us: u64,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            max_tcp_conns: 4,
+            max_quic_conns: 8,
+            max_events: 32,
+            handshake_timeout_us: 10_000_000,
+        }
+    }
+}
+
+/// Multi-protocol connection manager.
+///
+/// Manages TCP (HTTP/1.1, HTTP/2 over TLS) and UDP (HTTP/3 over QUIC)
+/// connections, providing a unified event stream.
+///
+/// Generic parameters:
+/// - `C`: Crypto provider
+/// - `A`: Address type for UDP peers
+/// - `BUF`: TLS buffer size (default 18432 = max TLS record)
+pub struct ServerManager<
+    C: CryptoProvider,
+    A: Address,
+    const BUF: usize = 18432,
+> {
+    tls_config: ServerTlsConfig,
+    provider: C,
+    config: ServerConfig,
+
+    tcp_conns: Vec<TcpConn<C, BUF>>,
+    quic_conns: Vec<QuicConn<C, A>>,
+
+    events: VecDeque<ServerEvent>,
+    next_id: u32,
+}
+
+impl<C, A, const BUF: usize> ServerManager<C, A, BUF>
+where
+    C: CryptoProvider + Clone + 'static,
+    C::Hkdf: Default,
+    A: Address,
+{
+    /// Create a new server manager.
+    pub fn new(provider: C, tls_config: ServerTlsConfig, config: ServerConfig) -> Self {
+        Self {
+            tls_config,
+            provider,
+            config,
+            tcp_conns: Vec::new(),
+            quic_conns: Vec::new(),
+            events: VecDeque::new(),
+            next_id: 0,
+        }
+    }
+
+    fn alloc_id(&mut self) -> ConnId {
+        let id = ConnId(self.next_id);
+        self.next_id += 1;
+        id
+    }
+
+    // -----------------------------------------------------------------------
+    // TCP interface
+    // -----------------------------------------------------------------------
+
+
+    /// Push an event into the queue, dropping the oldest if at capacity.
+    fn push_server_event(&mut self, event: ServerEvent) {
+        if self.events.len() >= self.config.max_events {
+            let _ = self.events.pop_front();
+        }
+        self.events.push_back(event);
+    }
+
+    /// Accept a new TCP connection. Creates TLS handshake state.
+    ///
+    /// Returns the connection ID, or an error if at capacity.
+    /// The caller should then feed TCP data via `tcp_feed` and drain
+    /// output via `tcp_poll_output`.
+    pub fn accept_tcp(&mut self, rng: &mut impl Rng, now: u64) -> Result<ConnId, Error> {
+        if self.tcp_conns.len() >= self.config.max_tcp_conns {
+            return Err(Error::StreamLimitExhausted);
+        }
+        let id = self.alloc_id();
+
+        let mut secret = [0u8; 32];
+        let mut random = [0u8; 32];
+        rng.fill(&mut secret);
+        rng.fill(&mut random);
+
+        let parts = TlsParts::new_server(
+            self.provider.clone(),
+            self.tls_config.clone(),
+            secret,
+            random,
+        );
+
+        self.tcp_conns.push(TcpConn {
+            id,
+            state: TcpState::Handshaking(parts),
+            protocol: ConnProtocol::Handshaking,
+            accepted_at: now,
+        });
+
+        Ok(id)
+    }
+
+    /// Feed TCP data into a connection.
+    pub fn tcp_feed(&mut self, id: ConnId, data: &[u8], now: u64) -> Result<(), Error> {
+        let conn = self.tcp_conns.iter_mut().find(|c| c.id == id)
+            .ok_or(Error::InvalidState)?;
+
+        // Check if currently handshaking
+        let needs_upgrade = matches!(&conn.state, TcpState::Handshaking(_));
+
+        if needs_upgrade {
+            // Feed data through TlsParts
+            if let TcpState::Handshaking(parts) = &mut conn.state {
+                parts.feed_data(data)?;
+            }
+
+            // Check if handshake completed (separate borrow scope)
+            let handshake_done = matches!(&conn.state, TcpState::Handshaking(p) if p.is_active());
+
+            if handshake_done {
+                // Take ownership of parts
+                let old_state = core::mem::replace(&mut conn.state, TcpState::Closed);
+                let parts = match old_state {
+                    TcpState::Handshaking(p) => p,
+                    _ => unreachable!(),
+                };
+
+                let is_h2 = parts.alpn() == Some(b"h2");
+                let protocol = if is_h2 { ConnProtocol::H2 } else { ConnProtocol::Http1 };
+                let mut http_conn: Box<dyn HttpServerConn> = if is_h2 {
+                    Box::new(crate::h2_tls::H2TlsServer::<C, BUF>::from_parts(parts))
+                } else {
+                    Box::new(crate::https1::Https1Server::<C, BUF>::from_parts(parts))
+                };
+
+                // Process any application data that was decrypted alongside the
+                // final handshake message (common with TLS 1.3 piggybacking).
+                // Feeding an empty slice triggers processing of existing app_recv.
+                let _ = http_conn.tcp_feed_data(&[]);
+
+                conn.state = TcpState::Established(http_conn);
+                conn.protocol = protocol;
+                let conn_id = conn.id;
+                self.push_server_event(ServerEvent::Connected(conn_id));
+            }
+
+            Ok(())
+        } else {
+            match &mut conn.state {
+                TcpState::Established(http) => {
+                    let _ = now;
+                    http.tcp_feed_data(data)
+                }
+                _ => Err(Error::InvalidState),
+            }
+        }
+    }
+
+    /// Pull outgoing TCP data from a connection.
+    pub fn tcp_poll_output<'a>(&mut self, id: ConnId, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+        let conn = self.tcp_conns.iter_mut().find(|c| c.id == id)?;
+
+        match &mut conn.state {
+            TcpState::Handshaking(parts) => {
+                parts.poll_output(buf)
+            }
+            TcpState::Established(http) => {
+                http.tcp_poll_output(buf)
+            }
+            TcpState::Closed => None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // UDP interface
+    // -----------------------------------------------------------------------
+
+    /// Feed a UDP datagram. Routes by DCID to existing connections or creates new ones.
+    pub fn udp_feed<const CRYPTO_BUF: usize>(
+        &mut self,
+        data: &[u8],
+        from: A,
+        now: u64,
+        rng: &mut impl Rng,
+        pool: &mut dyn HandshakePoolAccess<C, CRYPTO_BUF>,
+    ) -> Result<(), Error> {
+        // Extract DCID to route
+        let dcid = decode_dcid(data, 8);
+
+        // Try to find existing connection by CID
+        if let Some(dcid) = dcid {
+            for qconn in &mut self.quic_conns {
+                let matched = qconn.local_cids.iter().any(|cid| cid.as_slice() == dcid);
+                if matched {
+                    qconn.server.recv::<CRYPTO_BUF>(data, now, pool)?;
+                    return Ok(());
+                }
+            }
+        }
+
+        // New connection: create QUIC server + H3
+        if self.quic_conns.len() >= self.config.max_quic_conns {
+            return Err(Error::StreamLimitExhausted);
+        }
+        let id = self.alloc_id();
+        let quic_conn = Connection::server(
+            self.provider.clone(),
+            self.tls_config.clone(),
+            TransportParams::default_params(),
+            rng,
+            pool,
+        )?;
+
+        // Cache local CIDs
+        let local_cids: Vec<ConnectionId> = quic_conn.local_cids().to_vec();
+
+        let mut server = H3Server::new(quic_conn);
+        // Feed the initial datagram
+        server.recv::<CRYPTO_BUF>(data, now, pool)?;
+
+        self.quic_conns.push(QuicConn {
+            id,
+            server,
+            peer_addr: from,
+            local_cids,
+        });
+
+        Ok(())
+    }
+
+    /// Pull the next outgoing UDP datagram.
+    ///
+    /// Call repeatedly until `None` to drain all pending transmits.
+    pub fn udp_poll_transmit<'a, const CRYPTO_BUF: usize>(
+        &'a mut self,
+        buf: &'a mut [u8],
+        now: u64,
+        pool: &mut dyn HandshakePoolAccess<C, CRYPTO_BUF>,
+    ) -> Option<(A, usize)> {
+        for qconn in &mut self.quic_conns {
+            if let Some(tx) = qconn.server.poll_transmit::<CRYPTO_BUF>(buf, now, pool) {
+                let addr = qconn.peer_addr.clone();
+                let len = tx.data.len();
+                return Some((addr, len));
+            }
+        }
+        None
+    }
+
+    // -----------------------------------------------------------------------
+    // Unified HTTP interface
+    // -----------------------------------------------------------------------
+
+    /// Poll for the next server event.
+    ///
+    /// Drains events from all connections (TCP and UDP) into the unified
+    /// event stream.
+    pub fn poll_event(&mut self) -> Option<ServerEvent> {
+        // Return any queued events first
+        if let Some(ev) = self.events.pop_front() {
+            return Some(ev);
+        }
+
+        // Poll TCP connections
+        for conn in &mut self.tcp_conns {
+            if let TcpState::Established(http) = &mut conn.state {
+                if let Some(ev) = http.poll_event() {
+                    return Some(ServerEvent::Http {
+                        conn: conn.id,
+                        event: ev,
+                    });
+                }
+                if http.is_closed() {
+                    let id = conn.id;
+                    conn.state = TcpState::Closed;
+                    return Some(ServerEvent::Closed(id));
+                }
+            }
+        }
+
+        // Poll QUIC connections
+        let mut quic_event = None;
+        for qconn in &mut self.quic_conns {
+            if let Some(ev) = qconn.server.poll_event() {
+                let http_ev = crate::h3::server::map_h3_event(ev);
+                quic_event = Some(ServerEvent::Http {
+                    conn: qconn.id,
+                    event: http_ev,
+                });
+                break;
+            }
+        }
+        if quic_event.is_some() {
+            return quic_event;
+        }
+
+        // Clean up closed TCP connections
+        self.tcp_conns.retain(|c| !matches!(c.state, TcpState::Closed));
+
+        // Clean up closed QUIC connections
+        let mut closed_ids = Vec::new();
+        self.quic_conns.retain(|c| {
+            if c.server.is_closed() {
+                closed_ids.push(c.id);
+                false
+            } else {
+                true
+            }
+        });
+        for id in closed_ids {
+            self.push_server_event(ServerEvent::Closed(id));
+        }
+
+        self.events.pop_front()
+    }
+
+    /// Read request headers for a connection/stream.
+    pub fn recv_headers(
+        &mut self,
+        conn: ConnId,
+        stream_id: u64,
+        emit: &mut dyn FnMut(&[u8], &[u8]),
+    ) -> Result<(), Error> {
+        if let Some(tcp) = self.tcp_conns.iter_mut().find(|c| c.id == conn) {
+            if let TcpState::Established(http) = &mut tcp.state {
+                return http.recv_headers(stream_id, emit);
+            }
+        }
+        if let Some(qconn) = self.quic_conns.iter_mut().find(|c| c.id == conn) {
+            return qconn.server.recv_headers(stream_id, emit);
+        }
+        Err(Error::InvalidState)
+    }
+
+    /// Read body data from a connection/stream.
+    pub fn recv_body(
+        &mut self,
+        conn: ConnId,
+        stream_id: u64,
+        buf: &mut [u8],
+    ) -> Result<(usize, bool), Error> {
+        if let Some(tcp) = self.tcp_conns.iter_mut().find(|c| c.id == conn) {
+            if let TcpState::Established(http) = &mut tcp.state {
+                return http.recv_body(stream_id, buf);
+            }
+        }
+        if let Some(qconn) = self.quic_conns.iter_mut().find(|c| c.id == conn) {
+            return qconn.server.recv_body(stream_id, buf);
+        }
+        Err(Error::InvalidState)
+    }
+
+    /// Send response headers on a connection/stream.
+    pub fn send_response(
+        &mut self,
+        conn: ConnId,
+        stream_id: u64,
+        status: u16,
+        headers: &[(&[u8], &[u8])],
+        end_stream: bool,
+    ) -> Result<(), Error> {
+        if let Some(tcp) = self.tcp_conns.iter_mut().find(|c| c.id == conn) {
+            if let TcpState::Established(http) = &mut tcp.state {
+                return http.send_response(stream_id, status, headers, end_stream);
+            }
+        }
+        if let Some(qconn) = self.quic_conns.iter_mut().find(|c| c.id == conn) {
+            return qconn.server.send_response(stream_id, status, headers, end_stream);
+        }
+        Err(Error::InvalidState)
+    }
+
+    /// Send body data on a connection/stream.
+    pub fn send_body(
+        &mut self,
+        conn: ConnId,
+        stream_id: u64,
+        data: &[u8],
+        end_stream: bool,
+    ) -> Result<usize, Error> {
+        if let Some(tcp) = self.tcp_conns.iter_mut().find(|c| c.id == conn) {
+            if let TcpState::Established(http) = &mut tcp.state {
+                return http.send_body(stream_id, data, end_stream);
+            }
+        }
+        if let Some(qconn) = self.quic_conns.iter_mut().find(|c| c.id == conn) {
+            return qconn.server.send_body(stream_id, data, end_stream);
+        }
+        Err(Error::InvalidState)
+    }
+
+    // -----------------------------------------------------------------------
+    // Lifecycle
+    // -----------------------------------------------------------------------
+
+    /// Return the earliest timeout deadline across all connections.
+    pub fn next_timeout(&self) -> Option<u64> {
+        let mut earliest: Option<u64> = None;
+
+        for conn in &self.tcp_conns {
+            match &conn.state {
+                TcpState::Handshaking(_) => {
+                    let deadline = conn.accepted_at.saturating_add(self.config.handshake_timeout_us);
+                    earliest = Some(earliest.map_or(deadline, |e: u64| e.min(deadline)));
+                }
+                TcpState::Established(http) => {
+                    if let Some(t) = http.next_timeout() {
+                        earliest = Some(earliest.map_or(t, |e: u64| e.min(t)));
+                    }
+                }
+                TcpState::Closed => {}
+            }
+        }
+
+        for qconn in &self.quic_conns {
+            if let Some(t) = qconn.server.next_timeout() {
+                earliest = Some(earliest.map_or(t, |e: u64| e.min(t)));
+            }
+        }
+
+        earliest
+    }
+
+    /// Handle timeouts on all connections.
+    pub fn handle_timeouts(&mut self, now: u64) {
+        // Check handshake timeouts on TCP connections.
+        for conn in &mut self.tcp_conns {
+            match &mut conn.state {
+                TcpState::Handshaking(_) => {
+                    if now >= conn.accepted_at.saturating_add(self.config.handshake_timeout_us) {
+                        conn.state = TcpState::Closed;
+                    }
+                }
+                TcpState::Established(http) => {
+                    http.handle_timeout(now);
+                }
+                TcpState::Closed => {}
+            }
+        }
+        for qconn in &mut self.quic_conns {
+            qconn.server.handle_timeout(now);
+        }
+    }
+
+    /// Notify the manager that the TCP peer sent EOF (read returned 0).
+    ///
+    /// This closes the connection since HTTP requires a bidirectional stream.
+    pub fn tcp_eof(&mut self, id: ConnId) {
+        if let Some(tcp) = self.tcp_conns.iter_mut().find(|c| c.id == id) {
+            if !matches!(tcp.state, TcpState::Closed) {
+                tcp.state = TcpState::Closed;
+                self.push_server_event(ServerEvent::Closed(id));
+            }
+        }
+    }
+
+    /// Close a specific connection.
+    pub fn close(&mut self, id: ConnId) -> Result<(), Error> {
+        if let Some(tcp) = self.tcp_conns.iter_mut().find(|c| c.id == id) {
+            tcp.state = TcpState::Closed;
+            self.push_server_event(ServerEvent::Closed(id));
+            return Ok(());
+        }
+        if let Some(qconn) = self.quic_conns.iter_mut().find(|c| c.id == id) {
+            qconn.server.close(0, b"");
+            return Ok(());
+        }
+        Err(Error::InvalidState)
+    }
+
+    /// Check if a connection is closed.
+    pub fn is_closed(&self, id: ConnId) -> bool {
+        if let Some(tcp) = self.tcp_conns.iter().find(|c| c.id == id) {
+            return matches!(tcp.state, TcpState::Closed);
+        }
+        if let Some(qconn) = self.quic_conns.iter().find(|c| c.id == id) {
+            return qconn.server.is_closed();
+        }
+        true // not found = closed
+    }
+
+    /// Query the protocol used by a connection.
+    ///
+    /// Returns `None` if the connection ID is not found.
+    pub fn conn_protocol(&self, id: ConnId) -> Option<ConnProtocol> {
+        if let Some(tcp) = self.tcp_conns.iter().find(|c| c.id == id) {
+            return Some(tcp.protocol);
+        }
+        if self.quic_conns.iter().any(|c| c.id == id) {
+            return Some(ConnProtocol::H3);
+        }
+        None
+    }
+}

@@ -296,6 +296,7 @@ fn run_h3(addr: &str) {
                     }
                 }
                 H3Event::GoAway(_) => { println!("[h3] GOAWAY"); return; }
+                _ => {}
             }
         }
 

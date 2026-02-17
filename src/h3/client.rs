@@ -121,6 +121,21 @@ where
         self.inner.recv_body(stream_id, buf)
     }
 
+    /// Whether the QUIC handshake is complete and the connection is established.
+    pub fn is_established(&self) -> bool {
+        self.inner.quic.is_established()
+    }
+
+    /// Whether the connection is closed.
+    pub fn is_closed(&self) -> bool {
+        self.inner.quic.is_closed()
+    }
+
+    /// Initiate connection close.
+    pub fn close(&mut self, error_code: u64, reason: &[u8]) {
+        self.inner.quic.close(error_code, reason);
+    }
+
     // ------------------------------------------------------------------
     // QUIC connection delegates
     // ------------------------------------------------------------------
@@ -150,5 +165,70 @@ where
     /// Handle a timer expiration.
     pub fn handle_timeout(&mut self, now: Instant) {
         self.inner.quic.handle_timeout(now);
+    }
+}
+
+impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>
+    crate::http::server_conn::HttpServerConn for H3Client<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>
+where
+    C::Hkdf: Default,
+{
+    fn poll_event(&mut self) -> Option<crate::http::server_conn::HttpEvent> {
+        H3Client::poll_event(self).map(super::server::map_h3_event)
+    }
+
+    fn recv_headers(
+        &mut self,
+        stream_id: u64,
+        emit: &mut dyn FnMut(&[u8], &[u8]),
+    ) -> Result<(), crate::error::Error> {
+        H3Client::recv_headers(self, stream_id, emit)
+    }
+
+    fn recv_body(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), crate::error::Error> {
+        H3Client::recv_body(self, stream_id, buf)
+    }
+
+    fn send_response(
+        &mut self,
+        _stream_id: u64,
+        _status: u16,
+        _headers: &[(&[u8], &[u8])],
+        _end_stream: bool,
+    ) -> Result<(), crate::error::Error> {
+        Err(crate::error::Error::InvalidState)
+    }
+
+    fn send_body(
+        &mut self,
+        stream_id: u64,
+        data: &[u8],
+        end_stream: bool,
+    ) -> Result<usize, crate::error::Error> {
+        H3Client::send_body(self, stream_id, data, end_stream)
+    }
+
+    fn is_established(&self) -> bool {
+        H3Client::is_established(self)
+    }
+
+    fn is_closed(&self) -> bool {
+        H3Client::is_closed(self)
+    }
+
+    fn next_timeout(&self) -> Option<u64> {
+        H3Client::next_timeout(self)
+    }
+
+    fn handle_timeout(&mut self, now: u64) {
+        H3Client::handle_timeout(self, now);
+    }
+
+    fn tcp_feed_data(&mut self, _data: &[u8]) -> Result<(), crate::error::Error> {
+        Ok(()) // H3 uses UDP, not TCP
+    }
+
+    fn tcp_poll_output<'a>(&mut self, _buf: &'a mut [u8]) -> Option<&'a [u8]> {
+        None // H3 uses UDP, not TCP
     }
 }

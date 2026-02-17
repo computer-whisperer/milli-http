@@ -3,6 +3,7 @@
 pub mod method;
 pub mod status;
 pub mod header;
+pub mod server_conn;
 
 pub use method::Method;
 pub use status::StatusCode;

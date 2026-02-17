@@ -86,6 +86,7 @@ pub struct TlsConfig {
 }
 
 /// Configuration for creating a server-side TLS engine.
+#[derive(Clone)]
 pub struct ServerTlsConfig {
     /// DER-encoded server certificate.
     ///
@@ -727,101 +728,97 @@ where
         });
 
         // --- Build Handshake-level messages (EE + Cert + CV + Finished) ---
+        // Encode each sub-message directly into hs_buf to minimize stack usage.
+        // Each message is encoded at hs_buf[hs_off..], then transcript-updated
+        // in-place, avoiding separate intermediate buffers.
         let mut hs_buf = [0u8; 2048];
         let mut hs_off = 0;
 
-        // EncryptedExtensions
-        let alpn_bytes = selected_alpn
-            .as_ref()
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
-        let mut ee_ext_buf = [0u8; 512];
-        let tp = if self.quic_mode { Some(&self.transport_params) } else { None };
-        let ee_ext_len = encode_encrypted_extensions_data(
-            alpn_bytes,
-            tp,
-            &mut ee_ext_buf,
-        )?;
-        let mut ee_msg_buf = [0u8; 1024];
-        let ee_len = encode_encrypted_extensions(&ee_ext_buf[..ee_ext_len], &mut ee_msg_buf)?;
-        self.transcript.update(&ee_msg_buf[..ee_len]);
-        hs_buf[hs_off..hs_off + ee_len].copy_from_slice(&ee_msg_buf[..ee_len]);
-        hs_off += ee_len;
-
-        // Certificate
-        let mut cert_msg_buf = [0u8; 2048];
-        let cert_len = encode_certificate(self.server_cert_der, &mut cert_msg_buf)?;
-        self.transcript.update(&cert_msg_buf[..cert_len]);
-        if hs_off + cert_len > hs_buf.len() {
-            return Err(Error::BufferTooSmall {
-                needed: hs_off + cert_len,
-            });
-        }
-        hs_buf[hs_off..hs_off + cert_len].copy_from_slice(&cert_msg_buf[..cert_len]);
-        hs_off += cert_len;
-
-        // CertificateVerify — sign with the key type matching the certificate.
-        // Auto-detect: if the cert contains a P-256 key, use ECDSA-P256;
-        // otherwise fall back to Ed25519.
-        // The signed content is: 64 spaces + "TLS 1.3, server CertificateVerify" + 0x00 + transcript_hash
-        let cv_transcript_hash = self.transcript.current_hash();
-        let mut cv_msg_buf = [0u8; 256];
-        let cv_len = if crate::crypto::ecdsa_p256::cert_has_p256_key(self.server_cert_der) {
-            // ECDSA-P256 signing
-            let signature = crate::crypto::ecdsa_p256::sign_certificate_verify(
-                self.server_private_key_der,
-                &cv_transcript_hash,
+        // EncryptedExtensions — needs a small temp for the extension payload
+        {
+            let alpn_bytes = selected_alpn
+                .as_ref()
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let mut ee_ext_buf = [0u8; 512];
+            let tp = if self.quic_mode { Some(&self.transport_params) } else { None };
+            let ee_ext_len = encode_encrypted_extensions_data(
+                alpn_bytes,
+                tp,
+                &mut ee_ext_buf,
             )?;
-            encode_certificate_verify(
-                crate::crypto::ecdsa_p256::ECDSA_SECP256R1_SHA256,
-                &signature,
-                &mut cv_msg_buf,
-            )?
-        } else {
-            // Ed25519 signing (original path)
-            let signing_key_bytes: [u8; 32] = self
-                .server_private_key_der
-                .try_into()
-                .map_err(|_| Error::Tls)?;
-            let signature = crate::crypto::ed25519::sign_certificate_verify(
-                &signing_key_bytes,
-                &cv_transcript_hash,
+            let ee_len = encode_encrypted_extensions(
+                &ee_ext_buf[..ee_ext_len],
+                &mut hs_buf[hs_off..],
             )?;
-            encode_certificate_verify(
-                crate::crypto::ed25519::ED25519_ALGORITHM,
-                &signature,
-                &mut cv_msg_buf,
-            )?
-        };
-        self.transcript.update(&cv_msg_buf[..cv_len]);
-        if hs_off + cv_len > hs_buf.len() {
-            return Err(Error::BufferTooSmall {
-                needed: hs_off + cv_len,
-            });
+            self.transcript.update(&hs_buf[hs_off..hs_off + ee_len]);
+            hs_off += ee_len;
         }
-        hs_buf[hs_off..hs_off + cv_len].copy_from_slice(&cv_msg_buf[..cv_len]);
-        hs_off += cv_len;
 
-        // Server Finished
-        let mut server_finished_key = [0u8; 32];
-        TlsKeySchedule::derive_finished_key(
-            &hkdf,
-            &self.server_handshake_secret,
-            &mut server_finished_key,
-        )?;
-        let transcript_before_fin = self.transcript.current_hash();
-        let server_verify =
-            compute_finished_verify_data(&hkdf, &server_finished_key, &transcript_before_fin)?;
-        let mut fin_msg_buf = [0u8; 36];
-        let fin_len = encode_finished(&server_verify, &mut fin_msg_buf)?;
-        self.transcript.update(&fin_msg_buf[..fin_len]);
-        if hs_off + fin_len > hs_buf.len() {
-            return Err(Error::BufferTooSmall {
-                needed: hs_off + fin_len,
-            });
+        // Certificate — encode directly into hs_buf
+        {
+            let remaining = hs_buf.len() - hs_off;
+            if remaining < 256 {
+                return Err(Error::BufferTooSmall { needed: hs_off + 256 });
+            }
+            let cert_len = encode_certificate(self.server_cert_der, &mut hs_buf[hs_off..])?;
+            self.transcript.update(&hs_buf[hs_off..hs_off + cert_len]);
+            hs_off += cert_len;
         }
-        hs_buf[hs_off..hs_off + fin_len].copy_from_slice(&fin_msg_buf[..fin_len]);
-        hs_off += fin_len;
+
+        // CertificateVerify — encode directly into hs_buf
+        {
+            let cv_transcript_hash = self.transcript.current_hash();
+            // Sign with the key type matching the certificate.
+            let mut cv_buf = [0u8; 256];
+            let cv_len = if crate::crypto::ecdsa_p256::cert_has_p256_key(self.server_cert_der) {
+                let signature = crate::crypto::ecdsa_p256::sign_certificate_verify(
+                    self.server_private_key_der,
+                    &cv_transcript_hash,
+                )?;
+                encode_certificate_verify(
+                    crate::crypto::ecdsa_p256::ECDSA_SECP256R1_SHA256,
+                    &signature,
+                    &mut cv_buf,
+                )?
+            } else {
+                let signing_key_bytes: [u8; 32] = self
+                    .server_private_key_der
+                    .try_into()
+                    .map_err(|_| Error::Tls)?;
+                let signature = crate::crypto::ed25519::sign_certificate_verify(
+                    &signing_key_bytes,
+                    &cv_transcript_hash,
+                )?;
+                encode_certificate_verify(
+                    crate::crypto::ed25519::ED25519_ALGORITHM,
+                    &signature,
+                    &mut cv_buf,
+                )?
+            };
+            if hs_off + cv_len > hs_buf.len() {
+                return Err(Error::BufferTooSmall { needed: hs_off + cv_len });
+            }
+            hs_buf[hs_off..hs_off + cv_len].copy_from_slice(&cv_buf[..cv_len]);
+            self.transcript.update(&hs_buf[hs_off..hs_off + cv_len]);
+            hs_off += cv_len;
+        }
+
+        // Server Finished — encode directly into hs_buf
+        {
+            let mut server_finished_key = [0u8; 32];
+            TlsKeySchedule::derive_finished_key(
+                &hkdf,
+                &self.server_handshake_secret,
+                &mut server_finished_key,
+            )?;
+            let transcript_before_fin = self.transcript.current_hash();
+            let server_verify =
+                compute_finished_verify_data(&hkdf, &server_finished_key, &transcript_before_fin)?;
+            let fin_len = encode_finished(&server_verify, &mut hs_buf[hs_off..])?;
+            self.transcript.update(&hs_buf[hs_off..hs_off + fin_len]);
+            hs_off += fin_len;
+        }
 
         // Buffer the ServerHello at Initial level
         self.pending_write.clear();

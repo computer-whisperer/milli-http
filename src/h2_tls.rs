@@ -178,6 +178,48 @@ where
         self.h2.recv_body(&mut h2_io, stream_id, buf)
     }
 
+    /// Configure timeouts.
+    pub fn set_timeouts(&mut self, config: crate::http::TimeoutConfig, now: u64) {
+        self.h2.set_timeouts(config, now);
+    }
+
+    /// Return the earliest deadline at which `handle_timeout` should be called.
+    pub fn next_timeout(&self) -> Option<u64> {
+        self.h2.next_timeout()
+    }
+
+    /// Check timeouts and emit events if they fire.
+    pub fn handle_timeout(&mut self, now: u64) {
+        let mut h2_io: H2Io<'_, BUF> = H2Io {
+            recv_buf: &mut self.app_recv,
+            send_buf: &mut self.app_send,
+        };
+        self.h2.handle_timeout(&mut h2_io, now);
+    }
+
+    /// Feed data with timestamp tracking.
+    pub fn feed_data_timed(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
+        {
+            let mut tls_io: TlsIo<'_, BUF> = TlsIo {
+                recv_buf: &mut self.net_recv,
+                send_buf: &mut self.net_send,
+                app_recv_buf: &mut self.app_recv,
+                app_send_buf: &mut self.app_send,
+            };
+            self.tls.feed_data(&mut tls_io, data)?;
+        }
+
+        if !self.app_recv.is_empty() {
+            let mut h2_io: H2Io<'_, BUF> = H2Io {
+                recv_buf: &mut self.app_recv,
+                send_buf: &mut self.app_send,
+            };
+            self.h2.feed_data_timed(&mut h2_io, &[], now)?;
+        }
+
+        Ok(())
+    }
+
     /// Get negotiated ALPN protocol.
     pub fn alpn(&self) -> Option<&[u8]> {
         self.tls.alpn()
@@ -225,6 +267,19 @@ where
             net_send: Buf::new(),
             app_recv: Buf::new(),
             app_send: Buf::new(),
+        }
+    }
+
+    /// Create from pre-handshaked TLS parts (used by connection manager after ALPN).
+    #[cfg(feature = "tcp-tls")]
+    pub fn from_parts(parts: crate::tcp_tls::TlsParts<C, BUF>) -> Self {
+        Self {
+            tls: parts.tls,
+            h2: H2Connection::new_server(),
+            net_recv: parts.net_recv,
+            net_send: parts.net_send,
+            app_recv: parts.app_recv,
+            app_send: parts.app_send,
         }
     }
 
@@ -346,6 +401,48 @@ where
         self.h2.send_data(&mut h2_io, stream_id, data, end_stream)
     }
 
+    /// Configure timeouts.
+    pub fn set_timeouts(&mut self, config: crate::http::TimeoutConfig, now: u64) {
+        self.h2.set_timeouts(config, now);
+    }
+
+    /// Return the earliest deadline at which `handle_timeout` should be called.
+    pub fn next_timeout(&self) -> Option<u64> {
+        self.h2.next_timeout()
+    }
+
+    /// Check timeouts and emit events if they fire.
+    pub fn handle_timeout(&mut self, now: u64) {
+        let mut h2_io: H2Io<'_, BUF> = H2Io {
+            recv_buf: &mut self.app_recv,
+            send_buf: &mut self.app_send,
+        };
+        self.h2.handle_timeout(&mut h2_io, now);
+    }
+
+    /// Feed data with timestamp tracking.
+    pub fn feed_data_timed(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
+        {
+            let mut tls_io: TlsIo<'_, BUF> = TlsIo {
+                recv_buf: &mut self.net_recv,
+                send_buf: &mut self.net_send,
+                app_recv_buf: &mut self.app_recv,
+                app_send_buf: &mut self.app_send,
+            };
+            self.tls.feed_data(&mut tls_io, data)?;
+        }
+
+        if !self.app_recv.is_empty() {
+            let mut h2_io: H2Io<'_, BUF> = H2Io {
+                recv_buf: &mut self.app_recv,
+                send_buf: &mut self.app_send,
+            };
+            self.h2.feed_data_timed(&mut h2_io, &[], now)?;
+        }
+
+        Ok(())
+    }
+
     /// Send GOAWAY.
     pub fn send_goaway(&mut self, error_code: u32) -> Result<(), Error> {
         let mut h2_io: H2Io<'_, BUF> = H2Io {
@@ -369,6 +466,154 @@ where
             app_send_buf: &mut self.app_send,
         };
         self.tls.close(&mut tls_io)
+    }
+}
+
+fn map_h2_event(ev: H2Event) -> crate::http::server_conn::HttpEvent {
+    use crate::http::server_conn::HttpEvent;
+    match ev {
+        H2Event::Connected => HttpEvent::Connected,
+        H2Event::Headers(s) => HttpEvent::Headers(s),
+        H2Event::Data(s) => HttpEvent::Data(s),
+        H2Event::Finished(s) => HttpEvent::Finished(s),
+        H2Event::StreamReset(s, code) => HttpEvent::StreamReset {
+            stream_id: s,
+            error_code: code as u64,
+        },
+        H2Event::GoAway(_, code) => HttpEvent::GoAway {
+            error_code: code as u64,
+        },
+        H2Event::Timeout => HttpEvent::Timeout,
+    }
+}
+
+impl<C: CryptoProvider, const BUF: usize, const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
+    crate::http::server_conn::HttpServerConn for H2TlsServer<C, BUF, MAX_STREAMS, HDRBUF, DATABUF>
+where
+    C::Hkdf: Default,
+{
+    fn poll_event(&mut self) -> Option<crate::http::server_conn::HttpEvent> {
+        H2TlsServer::poll_event(self).map(map_h2_event)
+    }
+
+    fn recv_headers(
+        &mut self,
+        stream_id: u64,
+        emit: &mut dyn FnMut(&[u8], &[u8]),
+    ) -> Result<(), Error> {
+        H2TlsServer::recv_headers(self, stream_id, emit)
+    }
+
+    fn recv_body(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
+        H2TlsServer::recv_body(self, stream_id, buf)
+    }
+
+    fn send_response(
+        &mut self,
+        stream_id: u64,
+        status: u16,
+        headers: &[(&[u8], &[u8])],
+        end_stream: bool,
+    ) -> Result<(), Error> {
+        H2TlsServer::send_response(self, stream_id, status, headers, end_stream)
+    }
+
+    fn send_body(
+        &mut self,
+        stream_id: u64,
+        data: &[u8],
+        end_stream: bool,
+    ) -> Result<usize, Error> {
+        H2TlsServer::send_body(self, stream_id, data, end_stream)
+    }
+
+    fn is_established(&self) -> bool {
+        H2TlsServer::is_established(self)
+    }
+
+    fn is_closed(&self) -> bool {
+        H2TlsServer::is_closed(self)
+    }
+
+    fn next_timeout(&self) -> Option<u64> {
+        H2TlsServer::next_timeout(self)
+    }
+
+    fn handle_timeout(&mut self, now: u64) {
+        H2TlsServer::handle_timeout(self, now);
+    }
+
+    fn tcp_feed_data(&mut self, data: &[u8]) -> Result<(), Error> {
+        H2TlsServer::feed_data(self, data)
+    }
+
+    fn tcp_poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+        H2TlsServer::poll_output(self, buf)
+    }
+}
+
+impl<C: CryptoProvider, const BUF: usize, const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
+    crate::http::server_conn::HttpServerConn for H2TlsClient<C, BUF, MAX_STREAMS, HDRBUF, DATABUF>
+where
+    C::Hkdf: Default,
+{
+    fn poll_event(&mut self) -> Option<crate::http::server_conn::HttpEvent> {
+        H2TlsClient::poll_event(self).map(map_h2_event)
+    }
+
+    fn recv_headers(
+        &mut self,
+        stream_id: u64,
+        emit: &mut dyn FnMut(&[u8], &[u8]),
+    ) -> Result<(), Error> {
+        H2TlsClient::recv_headers(self, stream_id, emit)
+    }
+
+    fn recv_body(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
+        H2TlsClient::recv_body(self, stream_id, buf)
+    }
+
+    fn send_response(
+        &mut self,
+        _stream_id: u64,
+        _status: u16,
+        _headers: &[(&[u8], &[u8])],
+        _end_stream: bool,
+    ) -> Result<(), Error> {
+        Err(Error::InvalidState) // clients don't send responses
+    }
+
+    fn send_body(
+        &mut self,
+        stream_id: u64,
+        data: &[u8],
+        end_stream: bool,
+    ) -> Result<usize, Error> {
+        H2TlsClient::send_body(self, stream_id, data, end_stream)
+    }
+
+    fn is_established(&self) -> bool {
+        H2TlsClient::is_established(self)
+    }
+
+    fn is_closed(&self) -> bool {
+        H2TlsClient::is_closed(self)
+    }
+
+    fn next_timeout(&self) -> Option<u64> {
+        H2TlsClient::next_timeout(self)
+    }
+
+    fn handle_timeout(&mut self, now: u64) {
+        H2TlsClient::handle_timeout(self, now);
+    }
+
+    fn tcp_feed_data(&mut self, data: &[u8]) -> Result<(), Error> {
+        H2TlsClient::feed_data(self, data)
+    }
+
+    fn tcp_poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+        H2TlsClient::poll_output(self, buf)
     }
 }
 

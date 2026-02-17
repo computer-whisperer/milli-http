@@ -266,6 +266,18 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         self.events.pop_front()
     }
 
+    /// Push an event into the queue, enforcing a capacity limit for the alloc
+    /// path. When the queue is full the oldest event is dropped so that new
+    /// events are never silently lost.
+    fn push_event(&mut self, event: H2Event) {
+        #[cfg(feature = "alloc")]
+        if self.events.len() >= 64 {
+            // Consumer is lagging — drop the oldest event to make room.
+            let _ = self.events.pop_front();
+        }
+        let _ = self.events.push_back(event);
+    }
+
     // ------------------------------------------------------------------
     // Application API
     // ------------------------------------------------------------------
@@ -586,9 +598,9 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                             stream.recv_end_stream();
                         }
                     }
-                    let _ = self.events.push_back(H2Event::Data(stream_id));
+                    self.push_event(H2Event::Data(stream_id));
                     if end_stream {
-                        let _ = self.events.push_back(H2Event::Finished(stream_id));
+                        self.push_event(H2Event::Finished(stream_id));
                     }
                 }
                 FRAME_HEADERS => {
@@ -636,10 +648,10 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                     if !end_headers {
                         self.continuation_stream_id = Some(stream_id);
                     } else {
-                        let _ = self.events.push_back(H2Event::Headers(stream_id));
+                        self.push_event(H2Event::Headers(stream_id));
                     }
                     if end_stream {
-                        let _ = self.events.push_back(H2Event::Finished(stream_id));
+                        self.push_event(H2Event::Finished(stream_id));
                     }
                 }
                 FRAME_SETTINGS => {
@@ -655,7 +667,7 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                         if self.peer_settings_received && self.state == H2ConnState::WaitingSettings {
                             self.state = H2ConnState::Active;
                             self.headers_phase_complete = true;
-                            let _ = self.events.push_back(H2Event::Connected);
+                            self.push_event(H2Event::Connected);
                         }
                     } else {
                         let old_initial = self.peer_settings.initial_window_size as i32;
@@ -668,7 +680,7 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                             H2ConnState::WaitingPreface | H2ConnState::WaitingSettings => {
                                 self.state = H2ConnState::Active;
                                 self.headers_phase_complete = true;
-                                let _ = self.events.push_back(H2Event::Connected);
+                                self.push_event(H2Event::Connected);
                             }
                             _ => {}
                         }
@@ -731,7 +743,7 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                         io.recv_buf[ps + 6], io.recv_buf[ps + 7],
                     ]);
                     self.state = H2ConnState::Closing;
-                    let _ = self.events.push_back(H2Event::GoAway(last_stream_id, error_code));
+                    self.push_event(H2Event::GoAway(last_stream_id, error_code));
                 }
                 FRAME_RST_STREAM => {
                     if stream_id == 0 {
@@ -747,7 +759,7 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                     if let Some(stream) = self.get_stream_mut(stream_id) {
                         stream.reset();
                     }
-                    let _ = self.events.push_back(H2Event::StreamReset(stream_id, error_code));
+                    self.push_event(H2Event::StreamReset(stream_id, error_code));
                 }
                 FRAME_PRIORITY => {}
                 FRAME_CONTINUATION => {
@@ -760,7 +772,7 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                         if end_headers {
                             stream.headers_received = true;
                             self.continuation_stream_id = None;
-                            let _ = self.events.push_back(H2Event::Headers(stream_id));
+                            self.push_event(H2Event::Headers(stream_id));
                         }
                     }
                 }
@@ -804,6 +816,10 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
 
     fn ensure_stream(&mut self, stream_id: u64) {
         if !self.streams.iter().any(|s| s.id == stream_id) {
+            #[cfg(feature = "alloc")]
+            if self.streams.len() >= MAX_STREAMS {
+                return; // At capacity
+            }
             let initial_send = self.peer_settings.initial_window_size as i32;
             let initial_recv = self.local_settings.initial_window_size as i32;
             let _ = self.streams.push(H2Stream::new(stream_id, initial_send, initial_recv));
@@ -869,7 +885,7 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                 if now >= self.connection_start.saturating_add(hdr_us) {
                     let _ = self.send_goaway(io, 0);
                     self.state = H2ConnState::Closed;
-                    let _ = self.events.push_back(H2Event::Timeout);
+                    self.push_event(H2Event::Timeout);
                     return;
                 }
             }
@@ -880,7 +896,7 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
             if now >= self.last_activity.saturating_add(idle_us) {
                 let _ = self.send_goaway(io, 0);
                 self.state = H2ConnState::Closed;
-                let _ = self.events.push_back(H2Event::Timeout);
+                self.push_event(H2Event::Timeout);
             }
         }
     }

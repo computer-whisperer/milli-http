@@ -59,6 +59,9 @@ impl<const N: usize> SentPacketTracker<N> {
         return Err(Error::BufferTooSmall { needed: N + 1 });
         #[cfg(feature = "alloc")]
         {
+            if self.entries.len() >= N {
+                return Err(Error::BufferTooSmall { needed: N + 1 });
+            }
             self.entries.push(Some(pkt));
             self.count += 1;
             Ok(())

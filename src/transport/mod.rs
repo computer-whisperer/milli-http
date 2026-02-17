@@ -4,33 +4,11 @@ pub mod loss;
 pub mod recovery;
 pub mod stream;
 
+use core::task::{Context, Poll};
+
 /// Timestamp in microseconds from an arbitrary epoch.
 /// Used for RTT measurement and loss detection timers.
 pub type Instant = u64;
-
-/// A UDP-like datagram transport for a single-peer connection (client side).
-///
-/// The caller is responsible for binding to a port and managing the
-/// remote address. This trait just sends and receives datagrams.
-pub trait DatagramSend {
-    type Error;
-
-    /// Send a datagram. The implementation handles addressing.
-    fn send(&mut self, buf: &[u8]) -> impl core::future::Future<Output = Result<(), Self::Error>>;
-}
-
-/// Receive datagrams from a single peer.
-pub trait DatagramRecv {
-    type Error;
-
-    /// Receive a datagram into `buf`. Returns bytes received.
-    /// Must not block indefinitely — should return when data is available
-    /// or when a timeout occurs.
-    fn recv(
-        &mut self,
-        buf: &mut [u8],
-    ) -> impl core::future::Future<Output = Result<usize, Self::Error>>;
-}
 
 /// Clock for loss detection timers and RTT measurement.
 pub trait Clock {
@@ -53,21 +31,49 @@ pub trait Address: Clone + PartialEq {}
 // Blanket impl: anything Clone + PartialEq is an Address.
 impl<T: Clone + PartialEq> Address for T {}
 
-/// Server-side datagram transport with addressing.
-pub trait ServerTransport {
+// ---------------------------------------------------------------------------
+// Poll-based socket traits
+// ---------------------------------------------------------------------------
+
+/// Poll-based TCP byte stream.
+///
+/// Implementors: Embassy `TcpSocket`, Tokio `AsyncFd`-wrapped sockets, smoltcp, etc.
+pub trait TcpStream {
+    type Error;
+
+    /// Attempt to read data. Registers waker if `Poll::Pending`.
+    fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, Self::Error>>;
+
+    /// Attempt to write data. Registers waker if `Poll::Pending`.
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>>;
+}
+
+/// Poll-based TCP listener.
+pub trait TcpAccept {
+    type Stream: TcpStream;
+    type Error;
+
+    /// Attempt to accept a new connection. Registers waker if `Poll::Pending`.
+    fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::Stream, Self::Error>>;
+}
+
+/// Poll-based UDP socket.
+pub trait UdpSocket {
     type Addr: Address;
     type Error;
 
-    /// Send a datagram to a specific address.
-    fn send_to(
+    /// Attempt to receive a datagram. Registers waker if `Poll::Pending`.
+    fn poll_recv_from(
         &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<(usize, Self::Addr), Self::Error>>;
+
+    /// Attempt to send a datagram. Registers waker if `Poll::Pending`.
+    fn poll_send_to(
+        &mut self,
+        cx: &mut Context<'_>,
         buf: &[u8],
         addr: &Self::Addr,
-    ) -> impl core::future::Future<Output = Result<(), Self::Error>>;
-
-    /// Receive a datagram, returning the source address.
-    fn recv_from(
-        &mut self,
-        buf: &mut [u8],
-    ) -> impl core::future::Future<Output = Result<(usize, Self::Addr), Self::Error>>;
+    ) -> Poll<Result<(), Self::Error>>;
 }

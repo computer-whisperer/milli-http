@@ -639,7 +639,7 @@ where
                     self.store_stream_data(sio, stream.stream_id, stream.offset, stream.data, stream.fin);
 
                     // Generate event
-                    let _ = self.events.push_back(Event::StreamReadable(stream.stream_id));
+                    self.push_event(Event::StreamReadable(stream.stream_id));
                 }
             }
 
@@ -661,7 +661,7 @@ where
             Frame::ResetStream(rst) => {
                 if self.streams.get(rst.stream_id).is_some() {
                     let _ = self.streams.handle_reset(rst.stream_id, rst.final_size);
-                    let _ = self.events.push_back(Event::StreamReset {
+                    self.push_event(Event::StreamReset {
                         stream_id: rst.stream_id,
                         error_code: rst.error_code,
                     });
@@ -671,7 +671,7 @@ where
             Frame::StopSending(ss) => {
                 if self.streams.get(ss.stream_id).is_some() {
                     let _ = self.streams.handle_stop_sending(ss.stream_id);
-                    let _ = self.events.push_back(Event::StopSending {
+                    self.push_event(Event::StopSending {
                         stream_id: ss.stream_id,
                         error_code: ss.error_code,
                     });
@@ -683,7 +683,7 @@ where
                 let mut reason = heapless::Vec::new();
                 let copy_len = cc.reason.len().min(64);
                 let _ = reason.extend_from_slice(&cc.reason[..copy_len]);
-                let _ = self.events.push_back(Event::ConnectionClose {
+                self.push_event(Event::ConnectionClose {
                     error_code: cc.error_code,
                     reason,
                 });
@@ -695,7 +695,7 @@ where
                     if matches!(self.state, ConnectionState::Handshaking) {
                         self.state = ConnectionState::Active;
                         self.address_validated = true;
-                        let _ = self.events.push_back(Event::Connected);
+                        self.push_event(Event::Connected);
                     }
                     // Drop handshake keys now that handshake is confirmed
                     self.keys.drop_handshake();
@@ -791,7 +791,7 @@ where
 
             // Copy the complete message to a stack buffer (to release the
             // borrow on crypto_reasm before calling into TLS).
-            let mut tmp = [0u8; 4096];
+            let mut tmp = [0u8; 2048];
             if msg_len > tmp.len() {
                 return Err(Error::Tls);
             }
@@ -845,7 +845,7 @@ where
                     {
                         self.state = ConnectionState::Active;
                         self.address_validated = true;
-                        let _ = self.events.push_back(Event::Connected);
+                        self.push_event(Event::Connected);
                         // Server drops handshake keys after confirming
                         self.keys.drop_handshake();
                         self.sent_tracker.drop_space(Level::Handshake);

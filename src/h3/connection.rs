@@ -33,6 +33,10 @@ pub enum H3Event {
     GoAway(u64),
     /// Stream finished (FIN received).
     Finished(u64),
+    /// Peer reset a stream.
+    StreamReset { stream_id: u64, error_code: u64 },
+    /// Connection was closed.
+    ConnectionClose { error_code: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -231,12 +235,17 @@ where
                         .find(|rs| rs.stream_id == stream_id)
                     {
                         rs.fin_received = true;
-                        let _ = self.h3_events.push_back(H3Event::Finished(stream_id));
+                        self.push_h3_event(H3Event::Finished(stream_id));
                     }
                 }
+                Event::StreamReset { stream_id, error_code } => {
+                    self.push_h3_event(H3Event::StreamReset { stream_id, error_code });
+                }
+                Event::ConnectionClose { error_code, .. } => {
+                    self.push_h3_event(H3Event::ConnectionClose { error_code });
+                }
                 _ => {
-                    // Other events (StreamWritable, StopSending, StreamReset, etc.)
-                    // are not directly surfaced to the H3 layer for now.
+                    // Other events (StreamWritable, StopSending, etc.)
                 }
             }
         }
@@ -353,10 +362,10 @@ where
             match frame {
                 H3Frame::Settings(settings) => {
                     self.peer_settings = Some(settings);
-                    let _ = self.h3_events.push_back(H3Event::Connected);
+                    self.push_h3_event(H3Event::Connected);
                 }
                 H3Frame::GoAway(id) => {
-                    let _ = self.h3_events.push_back(H3Event::GoAway(id));
+                    self.push_h3_event(H3Event::GoAway(id));
                 }
                 _ => {
                     // Ignore other frames on the control stream for now.
@@ -378,6 +387,10 @@ where
             .iter()
             .any(|rs| rs.stream_id == stream_id);
         if !exists {
+            #[cfg(feature = "alloc")]
+            if self.request_streams.len() >= 8 {
+                return Ok(()); // At capacity
+            }
             let _ = self.request_streams.push(RequestStreamState::new(stream_id));
         }
 
@@ -398,7 +411,7 @@ where
                 .find(|rs| rs.stream_id == stream_id)
             {
                 rs.fin_received = true;
-                let _ = self.h3_events.push_back(H3Event::Finished(stream_id));
+                self.push_h3_event(H3Event::Finished(stream_id));
             }
             return Ok(());
         }
@@ -429,7 +442,7 @@ where
                         let _ = rs.headers_data.extend_from_slice(hdr_data);
                         rs.headers_received = true;
                     }
-                    let _ = self.h3_events.push_back(H3Event::Headers(stream_id));
+                    self.push_h3_event(H3Event::Headers(stream_id));
                 }
                 H3Frame::Data(body_data) => {
                     if let Some(rs) = self
@@ -440,7 +453,7 @@ where
                         let _ = rs.data_buf.extend_from_slice(body_data);
                         rs.data_available = true;
                     }
-                    let _ = self.h3_events.push_back(H3Event::Data(stream_id));
+                    self.push_h3_event(H3Event::Data(stream_id));
                 }
                 _ => {
                     // Ignore other frame types on request streams.
@@ -456,7 +469,7 @@ where
                 .find(|rs| rs.stream_id == stream_id)
         {
             rs.fin_received = true;
-            let _ = self.h3_events.push_back(H3Event::Finished(stream_id));
+            self.push_h3_event(H3Event::Finished(stream_id));
         }
 
         Ok(())
@@ -469,6 +482,17 @@ where
     /// Poll for an H3 event.
     pub(crate) fn poll_event(&mut self) -> Option<H3Event> {
         self.h3_events.pop_front()
+    }
+
+    /// Push an H3 event, enforcing a capacity limit for the alloc path.
+    /// When the queue is full the oldest event is dropped so that new
+    /// events are never silently lost.
+    fn push_h3_event(&mut self, event: H3Event) {
+        #[cfg(feature = "alloc")]
+        if self.h3_events.len() >= 64 {
+            let _ = self.h3_events.pop_front();
+        }
+        let _ = self.h3_events.push_back(event);
     }
 
     /// Read decoded headers for a stream, calling `emit(name, value)` for each.

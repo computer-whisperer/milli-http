@@ -493,8 +493,11 @@ impl<const N: usize> StreamMap<N> {
         }
         #[cfg(feature = "alloc")]
         {
-            self.streams.push(None);
-            return Some(self.streams.len() - 1);
+            if self.streams.len() < N {
+                self.streams.push(None);
+                return Some(self.streams.len() - 1);
+            }
+            return None;
         }
         #[cfg(not(feature = "alloc"))]
         None

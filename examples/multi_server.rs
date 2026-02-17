@@ -189,6 +189,7 @@ fn main() {
                         h3_server = None;
                         break;
                     }
+                    _ => {}
                 }
             }
         }

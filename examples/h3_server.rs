@@ -338,6 +338,7 @@ fn main() {
                     println!("[h3] received GOAWAY (id={id})");
                     return;
                 }
+                _ => {}
             }
         }
     }
