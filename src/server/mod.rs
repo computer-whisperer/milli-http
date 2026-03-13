@@ -97,7 +97,16 @@ struct QuicConn<
     const H3_DATA_BUF: usize,
 > {
     id: ConnId,
-    server: H3Server<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, H3_HDR_BUF, H3_DATA_BUF>,
+    server: H3Server<
+        C,
+        MAX_STREAMS,
+        SENT_PER_SPACE,
+        MAX_CIDS,
+        STREAM_BUF,
+        SEND_QUEUE,
+        H3_HDR_BUF,
+        H3_DATA_BUF,
+    >,
     peer_addr: A,
     local_cids: Vec<ConnectionId>,
 }
@@ -160,14 +169,48 @@ pub struct ServerManager<
     config: ServerConfig,
 
     tcp_conns: Vec<TcpConn<C, BUF>>,
-    quic_conns: Vec<QuicConn<C, A, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, H3_HDR_BUF, H3_DATA_BUF>>,
+    quic_conns: Vec<
+        QuicConn<
+            C,
+            A,
+            MAX_STREAMS,
+            SENT_PER_SPACE,
+            MAX_CIDS,
+            STREAM_BUF,
+            SEND_QUEUE,
+            H3_HDR_BUF,
+            H3_DATA_BUF,
+        >,
+    >,
 
     events: VecDeque<ServerEvent>,
     next_id: u32,
 }
 
-impl<C, A, const BUF: usize, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize, const H3_HDR_BUF: usize, const H3_DATA_BUF: usize>
-    ServerManager<C, A, BUF, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, H3_HDR_BUF, H3_DATA_BUF>
+impl<
+    C,
+    A,
+    const BUF: usize,
+    const MAX_STREAMS: usize,
+    const SENT_PER_SPACE: usize,
+    const MAX_CIDS: usize,
+    const STREAM_BUF: usize,
+    const SEND_QUEUE: usize,
+    const H3_HDR_BUF: usize,
+    const H3_DATA_BUF: usize,
+>
+    ServerManager<
+        C,
+        A,
+        BUF,
+        MAX_STREAMS,
+        SENT_PER_SPACE,
+        MAX_CIDS,
+        STREAM_BUF,
+        SEND_QUEUE,
+        H3_HDR_BUF,
+        H3_DATA_BUF,
+    >
 where
     C: CryptoProvider + Clone + 'static,
     C::Hkdf: Default,
@@ -195,7 +238,6 @@ where
     // -----------------------------------------------------------------------
     // TCP interface
     // -----------------------------------------------------------------------
-
 
     /// Push an event into the queue, dropping the oldest if at capacity.
     fn push_server_event(&mut self, event: ServerEvent) {
@@ -240,7 +282,10 @@ where
 
     /// Feed TCP data into a connection.
     pub fn tcp_feed(&mut self, id: ConnId, data: &[u8], now: u64) -> Result<(), Error> {
-        let conn = self.tcp_conns.iter_mut().find(|c| c.id == id)
+        let conn = self
+            .tcp_conns
+            .iter_mut()
+            .find(|c| c.id == id)
             .ok_or(Error::InvalidState)?;
 
         // Check if currently handshaking
@@ -317,12 +362,8 @@ where
         let conn = self.tcp_conns.iter_mut().find(|c| c.id == id)?;
 
         match &mut conn.state {
-            TcpState::Handshaking(parts) => {
-                parts.poll_output(buf)
-            }
-            TcpState::Established(http) => {
-                http.tcp_poll_output(buf)
-            }
+            TcpState::Handshaking(parts) => parts.poll_output(buf),
+            TcpState::Established(http) => http.tcp_poll_output(buf),
             TcpState::Closed => None,
         }
     }
@@ -349,7 +390,9 @@ where
                 let matched = qconn.local_cids.iter().any(|cid| cid.as_slice() == dcid);
                 if matched {
                     let mut scratch = [0u8; 2048];
-                    qconn.server.recv::<CRYPTO_BUF>(data, &mut scratch, now, pool)?;
+                    qconn
+                        .server
+                        .recv::<CRYPTO_BUF>(data, &mut scratch, now, pool)?;
                     return Ok(());
                 }
             }
@@ -371,7 +414,16 @@ where
         // Cache local CIDs
         let local_cids: Vec<ConnectionId> = quic_conn.local_cids().to_vec();
 
-        let mut server = H3Server::<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, H3_HDR_BUF, H3_DATA_BUF>::new(quic_conn);
+        let mut server = H3Server::<
+            C,
+            MAX_STREAMS,
+            SENT_PER_SPACE,
+            MAX_CIDS,
+            STREAM_BUF,
+            SEND_QUEUE,
+            H3_HDR_BUF,
+            H3_DATA_BUF,
+        >::new(quic_conn);
         // Feed the initial datagram. If this fails, release the handshake pool
         // slot to avoid leaking it (Connection has no Drop impl).
         let mut scratch = [0u8; 2048];
@@ -458,7 +510,8 @@ where
         }
 
         // Clean up closed TCP connections
-        self.tcp_conns.retain(|c| !matches!(c.state, TcpState::Closed));
+        self.tcp_conns
+            .retain(|c| !matches!(c.state, TcpState::Closed));
 
         // Clean up closed QUIC connections
         let mut closed_ids = Vec::new();
@@ -528,7 +581,9 @@ where
             }
         }
         if let Some(qconn) = self.quic_conns.iter_mut().find(|c| c.id == conn) {
-            return qconn.server.send_response(stream_id, status, headers, end_stream);
+            return qconn
+                .server
+                .send_response(stream_id, status, headers, end_stream);
         }
         Err(Error::InvalidState)
     }
@@ -563,7 +618,9 @@ where
         for conn in &self.tcp_conns {
             match &conn.state {
                 TcpState::Handshaking(_) => {
-                    let deadline = conn.accepted_at.saturating_add(self.config.handshake_timeout_us);
+                    let deadline = conn
+                        .accepted_at
+                        .saturating_add(self.config.handshake_timeout_us);
                     earliest = Some(earliest.map_or(deadline, |e: u64| e.min(deadline)));
                 }
                 TcpState::Established(http) => {
@@ -592,7 +649,11 @@ where
         for conn in &mut self.tcp_conns {
             match &mut conn.state {
                 TcpState::Handshaking(_) => {
-                    if now >= conn.accepted_at.saturating_add(self.config.handshake_timeout_us) {
+                    if now
+                        >= conn
+                            .accepted_at
+                            .saturating_add(self.config.handshake_timeout_us)
+                    {
                         conn.state = TcpState::Closed;
                         timed_out.push(conn.id);
                     }
@@ -626,7 +687,10 @@ where
             if let TcpState::Established(http) = &mut tcp.state {
                 let mut scratch_buf = [0u8; 128]; // TCP-based — scratch unused
                 while let Some(ev) = http.poll_event(&mut scratch_buf) {
-                    drained.push(ServerEvent::Http { conn: id, event: ev });
+                    drained.push(ServerEvent::Http {
+                        conn: id,
+                        event: ev,
+                    });
                 }
             }
             tcp.state = TcpState::Closed;
@@ -667,10 +731,14 @@ where
     }
 
     /// Number of active QUIC connections.
-    pub fn quic_conn_count(&self) -> usize { self.quic_conns.len() }
+    pub fn quic_conn_count(&self) -> usize {
+        self.quic_conns.len()
+    }
 
     /// Number of active TCP connections.
-    pub fn tcp_conn_count(&self) -> usize { self.tcp_conns.len() }
+    pub fn tcp_conn_count(&self) -> usize {
+        self.tcp_conns.len()
+    }
 
     /// Query the protocol used by a connection.
     ///

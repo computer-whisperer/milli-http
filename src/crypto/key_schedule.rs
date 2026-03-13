@@ -9,8 +9,8 @@ use zeroize::Zeroize;
 
 /// QUIC v1 Initial salt (RFC 9001 section 5.2).
 pub const INITIAL_SALT_V1: [u8; 20] = [
-    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c,
-    0xad, 0xcc, 0xbb, 0x7f, 0x0a,
+    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
+    0xcc, 0xbb, 0x7f, 0x0a,
 ];
 
 /// HKDF-Expand-Label as defined in RFC 9001 section 5.1.
@@ -237,7 +237,14 @@ mod tests {
         hkdf.extract(&INITIAL_SALT_V1, &dcid, &mut initial_secret);
 
         let mut client_secret = [0u8; 32];
-        hkdf_expand_label(&hkdf, &initial_secret, b"client in", &[], &mut client_secret).unwrap();
+        hkdf_expand_label(
+            &hkdf,
+            &initial_secret,
+            b"client in",
+            &[],
+            &mut client_secret,
+        )
+        .unwrap();
 
         assert_eq!(
             client_secret,
@@ -320,7 +327,8 @@ mod tests {
     #[test]
     fn derive_next_application_secret_produces_different_secret() {
         let hkdf = HkdfSha256;
-        let current_secret = hex!("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea");
+        let current_secret =
+            hex!("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea");
 
         let mut new_secret = [0u8; 32];
         derive_next_application_secret(&hkdf, &current_secret, &mut new_secret).unwrap();

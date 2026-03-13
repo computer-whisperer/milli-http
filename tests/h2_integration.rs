@@ -101,10 +101,7 @@ fn drain_client_events(client: &mut TestH2Client) -> Vec<H2Event> {
 }
 
 /// Wait for a specific event type on the server, exchanging packets as needed.
-fn wait_for_server_headers(
-    client: &mut TestH2Client,
-    server: &mut TestH2Server,
-) -> u64 {
+fn wait_for_server_headers(client: &mut TestH2Client, server: &mut TestH2Server) -> u64 {
     for _ in 0..10 {
         while let Some(ev) = server.poll_event() {
             if let H2Event::Headers(sid) = ev {
@@ -248,13 +245,11 @@ fn h2_post_with_body() {
     let mut path = Vec::new();
     let mut ct = Vec::new();
     server
-        .recv_headers(req_stream, |name, value| {
-            match name {
-                b":method" => method.extend_from_slice(value),
-                b":path" => path.extend_from_slice(value),
-                b"content-type" => ct.extend_from_slice(value),
-                _ => {}
-            }
+        .recv_headers(req_stream, |name, value| match name {
+            b":method" => method.extend_from_slice(value),
+            b":path" => path.extend_from_slice(value),
+            b"content-type" => ct.extend_from_slice(value),
+            _ => {}
         })
         .unwrap();
     assert_eq!(method, b"POST");
@@ -269,7 +264,12 @@ fn h2_post_with_body() {
 
     // Server sends response.
     server
-        .send_response(req_stream, 200, &[(b"content-type", b"application/json")], false)
+        .send_response(
+            req_stream,
+            200,
+            &[(b"content-type", b"application/json")],
+            false,
+        )
         .unwrap();
     let resp_body = b"{\"status\":\"ok\"}";
     server.send_body(req_stream, resp_body, true).unwrap();
@@ -437,7 +437,9 @@ fn h2_large_response_body() {
     // Drain events.
     let events = drain_client_events(&mut client);
     assert!(
-        events.iter().any(|ev| matches!(ev, H2Event::Headers(sid) if *sid == stream_id)),
+        events
+            .iter()
+            .any(|ev| matches!(ev, H2Event::Headers(sid) if *sid == stream_id)),
         "client should receive response headers"
     );
 
@@ -514,14 +516,12 @@ fn h2_response_headers_correct() {
     let mut server_hdr = Vec::new();
     let mut x_custom = Vec::new();
     client
-        .recv_headers(stream_id, |name, value| {
-            match name {
-                b":status" => status.extend_from_slice(value),
-                b"content-type" => content_type.extend_from_slice(value),
-                b"server" => server_hdr.extend_from_slice(value),
-                b"x-custom" => x_custom.extend_from_slice(value),
-                _ => {}
-            }
+        .recv_headers(stream_id, |name, value| match name {
+            b":status" => status.extend_from_slice(value),
+            b"content-type" => content_type.extend_from_slice(value),
+            b"server" => server_hdr.extend_from_slice(value),
+            b"x-custom" => x_custom.extend_from_slice(value),
+            _ => {}
         })
         .unwrap();
 
@@ -649,17 +649,15 @@ fn h2_request_headers_round_trip() {
     let mut x_request_id = Vec::new();
 
     server
-        .recv_headers(req_stream, |name, value| {
-            match name {
-                b":method" => method.extend_from_slice(value),
-                b":scheme" => scheme.extend_from_slice(value),
-                b":authority" => authority.extend_from_slice(value),
-                b":path" => path.extend_from_slice(value),
-                b"accept" => accept.extend_from_slice(value),
-                b"user-agent" => user_agent.extend_from_slice(value),
-                b"x-request-id" => x_request_id.extend_from_slice(value),
-                _ => {}
-            }
+        .recv_headers(req_stream, |name, value| match name {
+            b":method" => method.extend_from_slice(value),
+            b":scheme" => scheme.extend_from_slice(value),
+            b":authority" => authority.extend_from_slice(value),
+            b":path" => path.extend_from_slice(value),
+            b"accept" => accept.extend_from_slice(value),
+            b"user-agent" => user_agent.extend_from_slice(value),
+            b"x-request-id" => x_request_id.extend_from_slice(value),
+            _ => {}
         })
         .unwrap();
 

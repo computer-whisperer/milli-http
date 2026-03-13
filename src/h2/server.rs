@@ -1,8 +1,8 @@
 //! HTTP/2 server wrapper.
 
-use crate::error::Error;
 use super::connection::{H2Connection, H2Event};
 use super::io::H2IoBufs;
+use crate::error::Error;
 
 /// HTTP/2 server — owns both the connection state and I/O buffers.
 pub struct H2Server<
@@ -51,11 +51,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     }
 
     /// Read request body.
-    pub fn recv_body(
-        &mut self,
-        stream_id: u64,
-        buf: &mut [u8],
-    ) -> Result<(usize, bool), Error> {
+    pub fn recv_body(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
         self.inner.recv_body(&mut self.io.as_io(), stream_id, buf)
     }
 
@@ -77,7 +73,8 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         for &(name, value) in headers {
             let _ = all_headers.push((name, value));
         }
-        self.inner.send_headers(&mut self.io.as_io(), stream_id, &all_headers, end_stream)
+        self.inner
+            .send_headers(&mut self.io.as_io(), stream_id, &all_headers, end_stream)
     }
 
     /// Send response body.
@@ -87,7 +84,8 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         data: &[u8],
         end_stream: bool,
     ) -> Result<usize, Error> {
-        self.inner.send_data(&mut self.io.as_io(), stream_id, data, end_stream)
+        self.inner
+            .send_data(&mut self.io.as_io(), stream_id, data, end_stream)
     }
 
     /// Send GOAWAY.
@@ -126,8 +124,8 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     }
 }
 
-impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
-    Default for H2Server<MAX_STREAMS, BUF, HDRBUF, DATABUF>
+impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATABUF: usize> Default
+    for H2Server<MAX_STREAMS, BUF, HDRBUF, DATABUF>
 {
     fn default() -> Self {
         Self::new()
@@ -147,11 +145,25 @@ mod tests {
     fn server_max_headers_succeeds() {
         let mut server = H2Server::<16, 16384>::new();
         let hdrs: [(&[u8], &[u8]); 19] = [
-            (b"h1", b"v"), (b"h2", b"v"), (b"h3", b"v"), (b"h4", b"v"),
-            (b"h5", b"v"), (b"h6", b"v"), (b"h7", b"v"), (b"h8", b"v"),
-            (b"h9", b"v"), (b"h10", b"v"), (b"h11", b"v"), (b"h12", b"v"),
-            (b"h13", b"v"), (b"h14", b"v"), (b"h15", b"v"), (b"h16", b"v"),
-            (b"h17", b"v"), (b"h18", b"v"), (b"h19", b"v"),
+            (b"h1", b"v"),
+            (b"h2", b"v"),
+            (b"h3", b"v"),
+            (b"h4", b"v"),
+            (b"h5", b"v"),
+            (b"h6", b"v"),
+            (b"h7", b"v"),
+            (b"h8", b"v"),
+            (b"h9", b"v"),
+            (b"h10", b"v"),
+            (b"h11", b"v"),
+            (b"h12", b"v"),
+            (b"h13", b"v"),
+            (b"h14", b"v"),
+            (b"h15", b"v"),
+            (b"h16", b"v"),
+            (b"h17", b"v"),
+            (b"h18", b"v"),
+            (b"h19", b"v"),
         ];
         let result = server.send_response(1, 200, &hdrs, true);
         assert_ne!(result, Err(crate::error::Error::TooManyHeaders));
@@ -161,11 +173,26 @@ mod tests {
     fn server_too_many_headers() {
         let mut server = H2Server::<16, 16384>::new();
         let hdrs: [(&[u8], &[u8]); 20] = [
-            (b"h1", b"v"), (b"h2", b"v"), (b"h3", b"v"), (b"h4", b"v"),
-            (b"h5", b"v"), (b"h6", b"v"), (b"h7", b"v"), (b"h8", b"v"),
-            (b"h9", b"v"), (b"h10", b"v"), (b"h11", b"v"), (b"h12", b"v"),
-            (b"h13", b"v"), (b"h14", b"v"), (b"h15", b"v"), (b"h16", b"v"),
-            (b"h17", b"v"), (b"h18", b"v"), (b"h19", b"v"), (b"h20", b"v"),
+            (b"h1", b"v"),
+            (b"h2", b"v"),
+            (b"h3", b"v"),
+            (b"h4", b"v"),
+            (b"h5", b"v"),
+            (b"h6", b"v"),
+            (b"h7", b"v"),
+            (b"h8", b"v"),
+            (b"h9", b"v"),
+            (b"h10", b"v"),
+            (b"h11", b"v"),
+            (b"h12", b"v"),
+            (b"h13", b"v"),
+            (b"h14", b"v"),
+            (b"h15", b"v"),
+            (b"h16", b"v"),
+            (b"h17", b"v"),
+            (b"h18", b"v"),
+            (b"h19", b"v"),
+            (b"h20", b"v"),
         ];
         let result = server.send_response(1, 200, &hdrs, true);
         assert_eq!(result, Err(crate::error::Error::TooManyHeaders));

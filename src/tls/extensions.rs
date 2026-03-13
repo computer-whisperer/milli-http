@@ -208,8 +208,7 @@ pub fn parse_server_hello_extensions(data: &[u8]) -> Result<ServerHelloExtension
                 if ext_data.len() < 2 {
                     return Err(Error::Tls);
                 }
-                result.selected_version =
-                    u16::from_be_bytes([ext_data[0], ext_data[1]]);
+                result.selected_version = u16::from_be_bytes([ext_data[0], ext_data[1]]);
             }
             EXT_KEY_SHARE => {
                 // ServerHello KeyShareEntry: group(2) + key_length(2) + key
@@ -343,7 +342,8 @@ pub fn parse_client_hello_extensions(data: &[u8]) -> Result<ClientHelloExtension
                 let mut soff = 2;
                 while soff + 4 <= 2 + shares_len {
                     let group = u16::from_be_bytes([ext_data[soff], ext_data[soff + 1]]);
-                    let key_len = u16::from_be_bytes([ext_data[soff + 2], ext_data[soff + 3]]) as usize;
+                    let key_len =
+                        u16::from_be_bytes([ext_data[soff + 2], ext_data[soff + 3]]) as usize;
                     soff += 4;
                     if soff + key_len > 2 + shares_len {
                         return Err(Error::Tls);
@@ -592,14 +592,9 @@ mod tests {
         let params = TransportParams::default_params();
         let public_key = [0x42u8; 32];
         let mut buf = [0u8; 1024];
-        let len = encode_client_hello_extensions(
-            "",
-            &public_key,
-            &[b"h3"],
-            Some(&params),
-            &mut buf,
-        )
-        .unwrap();
+        let len =
+            encode_client_hello_extensions("", &public_key, &[b"h3"], Some(&params), &mut buf)
+                .unwrap();
 
         // Walk through and verify no SNI
         let mut off = 0;

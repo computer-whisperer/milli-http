@@ -14,14 +14,13 @@
 
 use crate::buf::{Buf, BufExt};
 use crate::crypto::{Aead, CryptoProvider, Level};
-use zeroize::Zeroize;
 use crate::error::Error;
 use crate::tls::extensions::{
     encode_client_hello_extensions, encode_encrypted_extensions_data,
-    encode_server_hello_extensions, parse_client_hello_extensions,
-    parse_encrypted_extensions_data, parse_server_hello_extensions,
+    encode_server_hello_extensions, parse_client_hello_extensions, parse_encrypted_extensions_data,
+    parse_server_hello_extensions,
 };
-use crate::tls::key_schedule_tls::{compute_finished_verify_data, TlsKeySchedule};
+use crate::tls::key_schedule_tls::{TlsKeySchedule, compute_finished_verify_data};
 use crate::tls::messages::{
     self, CipherSuite, HandshakeType, encode_certificate, encode_certificate_verify,
     encode_client_hello, encode_encrypted_extensions, encode_finished, encode_server_hello,
@@ -31,6 +30,7 @@ use crate::tls::messages::{
 use crate::tls::transcript::TranscriptHash;
 use crate::tls::transport_params::TransportParams;
 use crate::tls::{DerivedKeys, TlsSession};
+use zeroize::Zeroize;
 
 /// Client or server role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,7 +287,11 @@ where
     }
 
     /// Create a new TCP server-side TLS engine (no QUIC transport parameters).
-    pub fn new_tcp_server(config: ServerTlsConfig, secret_bytes: [u8; 32], random: [u8; 32]) -> Self {
+    pub fn new_tcp_server(
+        config: ServerTlsConfig,
+        secret_bytes: [u8; 32],
+        random: [u8; 32],
+    ) -> Self {
         let mut engine = Self::new_server(config, secret_bytes, random);
         engine.quic_mode = false;
         engine
@@ -343,7 +347,8 @@ where
     /// are included in the server's EncryptedExtensions.
     pub fn set_transport_param_cids(&mut self, original_dcid: &[u8], initial_scid: &[u8]) {
         let odcid_len = original_dcid.len().min(20);
-        self.transport_params.original_dcid[..odcid_len].copy_from_slice(&original_dcid[..odcid_len]);
+        self.transport_params.original_dcid[..odcid_len]
+            .copy_from_slice(&original_dcid[..odcid_len]);
         self.transport_params.original_dcid_len = odcid_len as u8;
 
         let iscid_len = initial_scid.len().min(20);
@@ -359,7 +364,11 @@ where
     fn build_client_hello(&mut self, random: &[u8; 32]) -> Result<(), Error> {
         // Encode extensions
         let mut ext_buf = [0u8; 1024];
-        let tp = if self.quic_mode { Some(&self.transport_params) } else { None };
+        let tp = if self.quic_mode {
+            Some(&self.transport_params)
+        } else {
+            None
+        };
         let ext_len = encode_client_hello_extensions(
             self.server_name.as_str(),
             self.public_key.as_bytes(),
@@ -374,7 +383,11 @@ where
         ];
 
         // QUIC doesn't use the legacy session ID; TCP needs one for middlebox compat
-        let session_id: &[u8] = if self.quic_mode { &[] } else { &self.legacy_session_id };
+        let session_id: &[u8] = if self.quic_mode {
+            &[]
+        } else {
+            &self.legacy_session_id
+        };
 
         let mut msg_buf = [0u8; 2048];
         let msg_len = encode_client_hello(
@@ -390,7 +403,8 @@ where
 
         // Buffer for write_handshake
         self.pending_write.clear();
-        self.pending_write.buf_extend_from_slice(&msg_buf[..msg_len])?;
+        self.pending_write
+            .buf_extend_from_slice(&msg_buf[..msg_len])?;
         self.pending_level = Level::Initial;
 
         self.state = HandshakeState::WaitServerHello;
@@ -622,7 +636,8 @@ where
         self.transcript.update(&fin_buf[..fin_len]);
 
         self.pending_write.clear();
-        self.pending_write.buf_extend_from_slice(&fin_buf[..fin_len])?;
+        self.pending_write
+            .buf_extend_from_slice(&fin_buf[..fin_len])?;
         self.pending_level = Level::Handshake;
 
         self.state = HandshakeState::SendFinished;
@@ -761,21 +776,16 @@ where
 
         // EncryptedExtensions — needs a small temp for the extension payload
         {
-            let alpn_bytes = selected_alpn
-                .as_ref()
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
+            let alpn_bytes = selected_alpn.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
             let mut ee_ext_buf = [0u8; 512];
-            let tp = if self.quic_mode { Some(&self.transport_params) } else { None };
-            let ee_ext_len = encode_encrypted_extensions_data(
-                alpn_bytes,
-                tp,
-                &mut ee_ext_buf,
-            )?;
-            let ee_len = encode_encrypted_extensions(
-                &ee_ext_buf[..ee_ext_len],
-                &mut hs_buf[hs_off..],
-            )?;
+            let tp = if self.quic_mode {
+                Some(&self.transport_params)
+            } else {
+                None
+            };
+            let ee_ext_len = encode_encrypted_extensions_data(alpn_bytes, tp, &mut ee_ext_buf)?;
+            let ee_len =
+                encode_encrypted_extensions(&ee_ext_buf[..ee_ext_len], &mut hs_buf[hs_off..])?;
             self.transcript.update(&hs_buf[hs_off..hs_off + ee_len]);
             hs_off += ee_len;
         }
@@ -784,7 +794,9 @@ where
         {
             let remaining = hs_buf.len() - hs_off;
             if remaining < 256 {
-                return Err(Error::BufferTooSmall { needed: hs_off + 256 });
+                return Err(Error::BufferTooSmall {
+                    needed: hs_off + 256,
+                });
             }
             let cert_len = encode_certificate(self.server_cert_der, &mut hs_buf[hs_off..])?;
             self.transcript.update(&hs_buf[hs_off..hs_off + cert_len]);
@@ -822,7 +834,9 @@ where
                 )?
             };
             if hs_off + cv_len > hs_buf.len() {
-                return Err(Error::BufferTooSmall { needed: hs_off + cv_len });
+                return Err(Error::BufferTooSmall {
+                    needed: hs_off + cv_len,
+                });
             }
             hs_buf[hs_off..hs_off + cv_len].copy_from_slice(&cv_buf[..cv_len]);
             self.transcript.update(&hs_buf[hs_off..hs_off + cv_len]);
@@ -848,7 +862,8 @@ where
 
         // Buffer the ServerHello at Initial level
         self.pending_write.clear();
-        self.pending_write.buf_extend_from_slice(&sh_buf[..sh_len])?;
+        self.pending_write
+            .buf_extend_from_slice(&sh_buf[..sh_len])?;
         self.pending_level = Level::Initial;
 
         // Buffer the Handshake-level flight
@@ -863,14 +878,17 @@ where
                     | hs_buf[doff + 3] as usize;
                 std::eprintln!(
                     "[debug] HS flight msg: type={} len={} (offset {})",
-                    msg_type, msg_len, doff
+                    msg_type,
+                    msg_len,
+                    doff
                 );
                 doff += 4 + msg_len;
             }
             std::eprintln!("[debug] HS flight total: {} bytes", hs_off);
         }
         self.pending_write_hs.clear();
-        self.pending_write_hs.buf_extend_from_slice(&hs_buf[..hs_off])?;
+        self.pending_write_hs
+            .buf_extend_from_slice(&hs_buf[..hs_off])?;
 
         self.state = HandshakeState::SendServerFlightInitial;
         Ok(())
@@ -1278,8 +1296,11 @@ mod tests {
         // Now feed an EncryptedExtensions (wrong state — should be ServerHello)
         let fake_ee = [
             HandshakeType::EncryptedExtensions as u8,
-            0, 0, 2, // length = 2
-            0, 0, // empty extensions list
+            0,
+            0,
+            2, // length = 2
+            0,
+            0, // empty extensions list
         ];
         let result = engine.read_handshake(Level::Initial, &fake_ee);
         assert!(result.is_err());
@@ -1301,7 +1322,8 @@ mod tests {
         };
 
         let client_secret_bytes = [0x42u8; 32];
-        let mut engine = TlsEngine::<Aes128GcmProvider>::new_client(config, client_secret_bytes, [0u8; 32]);
+        let mut engine =
+            TlsEngine::<Aes128GcmProvider>::new_client(config, client_secret_bytes, [0u8; 32]);
 
         // Step 1: Write ClientHello
         let mut buf = [0u8; 2048];
@@ -1365,11 +1387,8 @@ mod tests {
         // The transcript hash before CertificateVerify is what gets signed
         let cv_transcript_hash = server_transcript.current_hash();
         let mut cv_buf = [0u8; 256];
-        let cv_len = build_test_certificate_verify(
-            &TEST_ED25519_SEED,
-            &cv_transcript_hash,
-            &mut cv_buf,
-        );
+        let cv_len =
+            build_test_certificate_verify(&TEST_ED25519_SEED, &cv_transcript_hash, &mut cv_buf);
         engine
             .read_handshake(Level::Handshake, &cv_buf[..cv_len])
             .unwrap();
@@ -1378,9 +1397,8 @@ mod tests {
 
         // Step 6: Feed server Finished
         // Compute the shared secret as the server would
-        let client_pk = x25519_dalek::PublicKey::from(
-            &x25519_dalek::StaticSecret::from(client_secret_bytes),
-        );
+        let client_pk =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(client_secret_bytes));
         let shared = server_secret.diffie_hellman(&client_pk);
 
         // Re-derive the key schedule from scratch (same as client)
@@ -1399,7 +1417,12 @@ mod tests {
         let mut s_client_hs = [0u8; 32];
         let mut s_server_hs = [0u8; 32];
         server_ks
-            .derive_handshake_traffic_secrets(&hkdf, &ch_sh_hash, &mut s_client_hs, &mut s_server_hs)
+            .derive_handshake_traffic_secrets(
+                &hkdf,
+                &ch_sh_hash,
+                &mut s_client_hs,
+                &mut s_server_hs,
+            )
             .unwrap();
 
         // Compute server Finished
@@ -1623,11 +1646,9 @@ mod tests {
         transcript_hash: &[u8; 32],
         out: &mut [u8],
     ) -> usize {
-        let signature = crate::crypto::ed25519::sign_certificate_verify(
-            signing_key_seed,
-            transcript_hash,
-        )
-        .unwrap();
+        let signature =
+            crate::crypto::ed25519::sign_certificate_verify(signing_key_seed, transcript_hash)
+                .unwrap();
 
         let mut body = [0u8; 128];
 
@@ -1708,8 +1729,11 @@ mod tests {
         assert_eq!(ch_level, Level::Initial);
 
         // Server reads ClientHello
-        let mut server =
-            TlsEngine::<Aes128GcmProvider>::new_server(make_server_config(), [0xAA; 32], [0xBB; 32]);
+        let mut server = TlsEngine::<Aes128GcmProvider>::new_server(
+            make_server_config(),
+            [0xAA; 32],
+            [0xBB; 32],
+        );
 
         server
             .read_handshake(Level::Initial, &ch_buf[..ch_len])
@@ -1759,8 +1783,11 @@ mod tests {
 
         let mut client =
             TlsEngine::<Aes128GcmProvider>::new_client(make_client_config(), [0x42; 32], [0; 32]);
-        let mut server =
-            TlsEngine::<Aes128GcmProvider>::new_server(make_server_config(), [0xAA; 32], [0xBB; 32]);
+        let mut server = TlsEngine::<Aes128GcmProvider>::new_server(
+            make_server_config(),
+            [0xAA; 32],
+            [0xBB; 32],
+        );
 
         // Step 1: Client writes ClientHello
         let mut ch_buf = [0u8; 2048];
@@ -1891,8 +1918,11 @@ mod tests {
 
         let mut client =
             TlsEngine::<Aes128GcmProvider>::new_client(make_client_config(), [0x42; 32], [0; 32]);
-        let mut server =
-            TlsEngine::<Aes128GcmProvider>::new_server(make_p256_server_config(), [0xAA; 32], [0xBB; 32]);
+        let mut server = TlsEngine::<Aes128GcmProvider>::new_server(
+            make_p256_server_config(),
+            [0xAA; 32],
+            [0xBB; 32],
+        );
 
         // Step 1: Client writes ClientHello
         let mut ch_buf = [0u8; 2048];
@@ -2133,8 +2163,11 @@ mod tests {
 
         let mut client =
             TlsEngine::<Aes128GcmProvider>::new_client(make_client_config(), [0x42; 32], [0; 32]);
-        let mut server =
-            TlsEngine::<Aes128GcmProvider>::new_server(make_server_config(), [0xAA; 32], [0xBB; 32]);
+        let mut server = TlsEngine::<Aes128GcmProvider>::new_server(
+            make_server_config(),
+            [0xAA; 32],
+            [0xBB; 32],
+        );
 
         let mut ch_buf = [0u8; 2048];
         let (ch_len, _) = client.write_handshake(&mut ch_buf).unwrap();
@@ -2154,8 +2187,11 @@ mod tests {
     fn server_rejects_no_common_cipher_suite() {
         use crate::crypto::rustcrypto::Aes128GcmProvider;
 
-        let mut server =
-            TlsEngine::<Aes128GcmProvider>::new_server(make_server_config(), [0xAA; 32], [0xBB; 32]);
+        let mut server = TlsEngine::<Aes128GcmProvider>::new_server(
+            make_server_config(),
+            [0xAA; 32],
+            [0xBB; 32],
+        );
 
         // Build a ClientHello with only unsupported cipher suites
         let random = [0u8; 32];

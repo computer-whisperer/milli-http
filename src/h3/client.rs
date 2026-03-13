@@ -3,10 +3,10 @@
 //! Wraps a QUIC [`Connection`] as an HTTP/3 client capable of sending requests
 //! and receiving responses.
 
+use crate::Instant;
 use crate::connection::{Connection, HandshakePoolAccess, Transmit};
 use crate::crypto::CryptoProvider;
 use crate::error::Error;
-use crate::Instant;
 
 use super::connection::{H3Connection, H3Event};
 
@@ -25,11 +25,38 @@ pub struct H3Client<
     const H3_HDR_BUF: usize = 512,
     const H3_DATA_BUF: usize = 1024,
 > {
-    inner: H3Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, H3_HDR_BUF, H3_DATA_BUF>,
+    inner: H3Connection<
+        C,
+        MAX_STREAMS,
+        SENT_PER_SPACE,
+        MAX_CIDS,
+        STREAM_BUF,
+        SEND_QUEUE,
+        H3_HDR_BUF,
+        H3_DATA_BUF,
+    >,
 }
 
-impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize, const H3_HDR_BUF: usize, const H3_DATA_BUF: usize>
-    H3Client<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, H3_HDR_BUF, H3_DATA_BUF>
+impl<
+    C: CryptoProvider,
+    const MAX_STREAMS: usize,
+    const SENT_PER_SPACE: usize,
+    const MAX_CIDS: usize,
+    const STREAM_BUF: usize,
+    const SEND_QUEUE: usize,
+    const H3_HDR_BUF: usize,
+    const H3_DATA_BUF: usize,
+>
+    H3Client<
+        C,
+        MAX_STREAMS,
+        SENT_PER_SPACE,
+        MAX_CIDS,
+        STREAM_BUF,
+        SEND_QUEUE,
+        H3_HDR_BUF,
+        H3_DATA_BUF,
+    >
 where
     C::Hkdf: Default,
 {
@@ -73,7 +100,8 @@ where
             let _ = all_headers.push((name, value));
         }
 
-        self.inner.send_headers(stream_id, &all_headers, end_stream)?;
+        self.inner
+            .send_headers(stream_id, &all_headers, end_stream)?;
 
         // Track this as a request stream.
         let _ = self
@@ -117,11 +145,7 @@ where
     }
 
     /// Read response body data from a stream.
-    pub fn recv_body(
-        &mut self,
-        stream_id: u64,
-        buf: &mut [u8],
-    ) -> Result<(usize, bool), Error> {
+    pub fn recv_body(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
         self.inner.recv_body(stream_id, buf)
     }
 
@@ -150,7 +174,13 @@ where
     /// decryption, avoiding internal stack allocations. It must be at
     /// least as large as the biggest packet in the datagram (typically
     /// MTU-sized, e.g. 1500 bytes).
-    pub fn recv<const CRYPTO_BUF: usize>(&mut self, datagram: &[u8], scratch: &mut [u8], now: Instant, pool: &mut dyn HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<(), Error> {
+    pub fn recv<const CRYPTO_BUF: usize>(
+        &mut self,
+        datagram: &[u8],
+        scratch: &mut [u8],
+        now: Instant,
+        pool: &mut dyn HandshakePoolAccess<C, CRYPTO_BUF>,
+    ) -> Result<(), Error> {
         let mut sio = self.inner.sio_bufs.as_io();
         self.inner.quic.recv(&mut sio, datagram, scratch, now, pool)
     }
@@ -177,8 +207,26 @@ where
     }
 }
 
-impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize, const H3_HDR_BUF: usize, const H3_DATA_BUF: usize>
-    crate::http::server_conn::HttpServerConn for H3Client<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, H3_HDR_BUF, H3_DATA_BUF>
+impl<
+    C: CryptoProvider,
+    const MAX_STREAMS: usize,
+    const SENT_PER_SPACE: usize,
+    const MAX_CIDS: usize,
+    const STREAM_BUF: usize,
+    const SEND_QUEUE: usize,
+    const H3_HDR_BUF: usize,
+    const H3_DATA_BUF: usize,
+> crate::http::server_conn::HttpServerConn
+    for H3Client<
+        C,
+        MAX_STREAMS,
+        SENT_PER_SPACE,
+        MAX_CIDS,
+        STREAM_BUF,
+        SEND_QUEUE,
+        H3_HDR_BUF,
+        H3_DATA_BUF,
+    >
 where
     C::Hkdf: Default,
 {
@@ -194,7 +242,11 @@ where
         H3Client::recv_headers(self, stream_id, emit)
     }
 
-    fn recv_body(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), crate::error::Error> {
+    fn recv_body(
+        &mut self,
+        stream_id: u64,
+        buf: &mut [u8],
+    ) -> Result<(usize, bool), crate::error::Error> {
         H3Client::recv_body(self, stream_id, buf)
     }
 

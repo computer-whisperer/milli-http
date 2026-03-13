@@ -619,7 +619,10 @@ mod tests {
         let mut map = StreamMap::<2>::new();
         assert!(map.open_bidi(true).is_ok());
         assert!(map.open_bidi(true).is_ok());
-        assert_eq!(map.open_bidi(true).unwrap_err(), Error::StreamLimitExhausted);
+        assert_eq!(
+            map.open_bidi(true).unwrap_err(),
+            Error::StreamLimitExhausted
+        );
     }
 
     // -- Send state transitions --
@@ -631,7 +634,10 @@ mod tests {
 
         // Ready -> Send (by sending data)
         map.mark_send(id, 100, false).unwrap();
-        assert_eq!(map.get(id).unwrap().send.as_ref().unwrap().state, SendStreamState::Send);
+        assert_eq!(
+            map.get(id).unwrap().send.as_ref().unwrap().state,
+            SendStreamState::Send
+        );
         assert_eq!(map.get(id).unwrap().send.as_ref().unwrap().offset, 100);
 
         // Send -> DataSent (by sending FIN)
@@ -679,7 +685,10 @@ mod tests {
             map.get(1).unwrap().recv.as_ref().unwrap().state,
             RecvStreamState::DataRecvd
         );
-        assert_eq!(map.get(1).unwrap().recv.as_ref().unwrap().fin_offset, Some(150));
+        assert_eq!(
+            map.get(1).unwrap().recv.as_ref().unwrap().fin_offset,
+            Some(150)
+        );
     }
 
     // -- Reset handling --
@@ -977,7 +986,10 @@ mod tests {
         assert!(map.open_bidi(true).is_ok()); // slot 0
         assert!(map.open_bidi(true).is_ok()); // slot 1
         // Third should fail: no more slots
-        assert_eq!(map.open_bidi(true).unwrap_err(), Error::StreamLimitExhausted);
+        assert_eq!(
+            map.open_bidi(true).unwrap_err(),
+            Error::StreamLimitExhausted
+        );
         // Uni should also fail
         assert_eq!(map.open_uni(true).unwrap_err(), Error::StreamLimitExhausted);
     }
@@ -1005,7 +1017,10 @@ mod tests {
             assert!(map.open_bidi(true).is_ok());
         }
         // One more should fail
-        assert_eq!(map.open_bidi(true).unwrap_err(), Error::StreamLimitExhausted);
+        assert_eq!(
+            map.open_bidi(true).unwrap_err(),
+            Error::StreamLimitExhausted
+        );
 
         // After GC of terminal streams, should be able to open more
         let id0 = 0u64; // first stream opened
@@ -1020,7 +1035,7 @@ mod tests {
     fn mixed_bidi_uni_capacity() {
         let mut map = StreamMap::<3>::new();
         assert!(map.open_bidi(true).is_ok()); // slot 0
-        assert!(map.open_uni(true).is_ok());  // slot 1
+        assert!(map.open_uni(true).is_ok()); // slot 1
         assert!(map.open_bidi(true).is_ok()); // slot 2
         // All slots taken
         assert!(map.open_bidi(true).is_err());

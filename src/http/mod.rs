@@ -1,13 +1,13 @@
 //! Shared HTTP types used across HTTP/1.1, HTTP/2, and HTTP/3.
 
-pub mod method;
-pub mod status;
 pub mod header;
+pub mod method;
 pub mod server_conn;
+pub mod status;
 
+pub use header::Header;
 pub use method::Method;
 pub use status::StatusCode;
-pub use header::Header;
 
 /// Timeout configuration for HTTP connections.
 #[derive(Debug, Clone, Copy)]

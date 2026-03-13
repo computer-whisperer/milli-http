@@ -41,7 +41,9 @@ pub const MAX_RECORD_PAYLOAD: usize = 16384 + 256; // plaintext + expansion
 /// Encode a TLS record header.
 pub fn encode_record_header(ct: ContentType, length: u16, buf: &mut [u8]) -> Result<usize, Error> {
     if buf.len() < RECORD_HEADER_LEN {
-        return Err(Error::BufferTooSmall { needed: RECORD_HEADER_LEN });
+        return Err(Error::BufferTooSmall {
+            needed: RECORD_HEADER_LEN,
+        });
     }
     buf[0] = ct as u8;
     buf[1] = 0x03;
@@ -54,7 +56,9 @@ pub fn encode_record_header(ct: ContentType, length: u16, buf: &mut [u8]) -> Res
 /// Decode a TLS record header from exactly 5 bytes.
 pub fn decode_record_header(data: &[u8]) -> Result<RecordHeader, Error> {
     if data.len() < RECORD_HEADER_LEN {
-        return Err(Error::BufferTooSmall { needed: RECORD_HEADER_LEN });
+        return Err(Error::BufferTooSmall {
+            needed: RECORD_HEADER_LEN,
+        });
     }
     let content_type = ContentType::from_byte(data[0]).ok_or(Error::Tls)?;
     let legacy_version = ((data[1] as u16) << 8) | (data[2] as u16);
@@ -95,7 +99,9 @@ pub fn seal_record<A: crate::crypto::Aead>(
     // Write inner content type after plaintext
     let inner_len = payload_len + 1; // plaintext + inner CT byte
     if buf.len() < inner_len + A::TAG_LEN {
-        return Err(Error::BufferTooSmall { needed: inner_len + A::TAG_LEN });
+        return Err(Error::BufferTooSmall {
+            needed: inner_len + A::TAG_LEN,
+        });
     }
     buf[payload_len] = inner_content_type as u8;
 
@@ -103,7 +109,8 @@ pub fn seal_record<A: crate::crypto::Aead>(
     let outer_len = (inner_len + A::TAG_LEN) as u16;
     let aad = [
         ContentType::ApplicationData as u8,
-        0x03, 0x03, // TLS 1.2
+        0x03,
+        0x03, // TLS 1.2
         (outer_len >> 8) as u8,
         (outer_len & 0xff) as u8,
     ];

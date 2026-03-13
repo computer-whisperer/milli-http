@@ -212,9 +212,7 @@ pub fn parse_server_hello(data: &[u8]) -> Result<ServerHello<'_>, Error> {
     off += 2;
 
     // Random
-    let random: &[u8; 32] = data[off..off + 32]
-        .try_into()
-        .map_err(|_| Error::Tls)?;
+    let random: &[u8; 32] = data[off..off + 32].try_into().map_err(|_| Error::Tls)?;
     off += 32;
 
     // Session ID
@@ -295,7 +293,8 @@ pub fn parse_certificate(data: &[u8]) -> Result<CertificatePayload<'_>, Error> {
     if off + 3 > data.len() {
         return Err(Error::Tls);
     }
-    let list_len = ((data[off] as usize) << 16) | ((data[off + 1] as usize) << 8) | (data[off + 2] as usize);
+    let list_len =
+        ((data[off] as usize) << 16) | ((data[off + 1] as usize) << 8) | (data[off + 2] as usize);
     off += 3;
     if off + list_len > data.len() {
         return Err(Error::Tls);
@@ -306,7 +305,9 @@ pub fn parse_certificate(data: &[u8]) -> Result<CertificatePayload<'_>, Error> {
 }
 
 /// Iterate over certificate entries in a CertificatePayload.
-pub fn iter_certificate_entries(mut data: &[u8]) -> impl Iterator<Item = Result<CertificateEntry<'_>, Error>> + '_ {
+pub fn iter_certificate_entries(
+    mut data: &[u8],
+) -> impl Iterator<Item = Result<CertificateEntry<'_>, Error>> + '_ {
     core::iter::from_fn(move || {
         if data.is_empty() {
             return None;
@@ -391,9 +392,7 @@ pub fn parse_client_hello(data: &[u8]) -> Result<ClientHello<'_>, Error> {
     off += 2;
 
     // Random
-    let random: &[u8; 32] = data[off..off + 32]
-        .try_into()
-        .map_err(|_| Error::Tls)?;
+    let random: &[u8; 32] = data[off..off + 32].try_into().map_err(|_| Error::Tls)?;
     off += 32;
 
     // Session ID
@@ -452,7 +451,8 @@ pub fn parse_client_hello(data: &[u8]) -> Result<ClientHello<'_>, Error> {
 /// Iterate over cipher suites in a ClientHello cipher_suites field.
 /// The field is raw bytes: pairs of (u8, u8) representing u16 cipher suite IDs.
 pub fn iter_cipher_suites(data: &[u8]) -> impl Iterator<Item = u16> + '_ {
-    data.chunks_exact(2).map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+    data.chunks_exact(2)
+        .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
 }
 
 /// Encode a ServerHello message.
@@ -527,10 +527,7 @@ pub fn encode_server_hello(
 ///
 /// `extensions_buf` is the already-encoded extensions data.
 /// The body is simply: extensions_length(2) + extensions_data.
-pub fn encode_encrypted_extensions(
-    extensions_buf: &[u8],
-    out: &mut [u8],
-) -> Result<usize, Error> {
+pub fn encode_encrypted_extensions(extensions_buf: &[u8], out: &mut [u8]) -> Result<usize, Error> {
     let body_len = 2 + extensions_buf.len();
     let total = 4 + body_len;
 
@@ -562,10 +559,7 @@ pub fn encode_encrypted_extensions(
 ///     - cert_data length (3 bytes)
 ///     - cert_data (DER bytes)
 ///     - extensions length (2 bytes) = 0
-pub fn encode_certificate(
-    cert_der: &[u8],
-    out: &mut [u8],
-) -> Result<usize, Error> {
+pub fn encode_certificate(cert_der: &[u8], out: &mut [u8]) -> Result<usize, Error> {
     // Entry: 3 (cert_data_len) + cert_der.len() + 2 (ext_len)
     let entry_len = 3 + cert_der.len() + 2;
     // Body: 1 (context_len) + 3 (list_len) + entry_len
@@ -702,7 +696,8 @@ mod tests {
         let extensions = [0xAA, 0xBB, 0xCC, 0xDD];
 
         let mut buf = [0u8; 512];
-        let len = encode_client_hello(&random, &session_id, &suites, &extensions, &mut buf).unwrap();
+        let len =
+            encode_client_hello(&random, &session_id, &suites, &extensions, &mut buf).unwrap();
 
         // Verify the handshake header
         assert_eq!(buf[0], HandshakeType::ClientHello as u8);
@@ -1049,7 +1044,8 @@ mod tests {
         let extensions = [0xAA];
 
         let mut buf = [0u8; 512];
-        let len = encode_client_hello(&random, &session_id, &suites, &extensions, &mut buf).unwrap();
+        let len =
+            encode_client_hello(&random, &session_id, &suites, &extensions, &mut buf).unwrap();
 
         let ch = parse_client_hello(&buf[4..len]).unwrap();
         assert_eq!(ch.session_id, &session_id);
@@ -1061,12 +1057,20 @@ mod tests {
         // Build a ServerHello with unsupported cipher suite 0x1302
         let mut data = [0u8; 256];
         let mut off = 0;
-        data[off] = 0x03; data[off+1] = 0x03; off += 2;
+        data[off] = 0x03;
+        data[off + 1] = 0x03;
+        off += 2;
         off += 32; // random (zeros)
-        data[off] = 0; off += 1; // session_id len
-        data[off] = 0x13; data[off+1] = 0x02; off += 2; // unsupported suite
-        data[off] = 0; off += 1; // compression
-        data[off] = 0; data[off+1] = 0; off += 2; // extensions len
+        data[off] = 0;
+        off += 1; // session_id len
+        data[off] = 0x13;
+        data[off + 1] = 0x02;
+        off += 2; // unsupported suite
+        data[off] = 0;
+        off += 1; // compression
+        data[off] = 0;
+        data[off + 1] = 0;
+        off += 2; // extensions len
 
         assert!(parse_server_hello(&data[..off]).is_err());
     }

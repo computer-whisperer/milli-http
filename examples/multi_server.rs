@@ -22,22 +22,24 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, UdpSocket};
 
 // -- HTTP/2 --
-use milli_http::h2::server::H2Server;
 use milli_http::h2::H2Event;
+use milli_http::h2::server::H2Server;
 
 // -- HTTP/3 --
+use milli_http::Rng;
 use milli_http::connection::{Connection, HandshakePool};
 use milli_http::crypto::ed25519::{build_ed25519_cert_der, ed25519_public_key_from_seed};
 use milli_http::crypto::rustcrypto::Aes128GcmProvider;
-use milli_http::h3::server::H3Server;
 use milli_http::h3::H3Event;
+use milli_http::h3::server::H3Server;
 use milli_http::tls::handshake::ServerTlsConfig;
 use milli_http::tls::transport_params::TransportParams;
-use milli_http::Rng;
 
 struct StdRng(rand::rngs::ThreadRng);
 impl StdRng {
-    fn new() -> Self { Self(rand::rng()) }
+    fn new() -> Self {
+        Self(rand::rng())
+    }
 }
 impl Rng for StdRng {
     fn fill(&mut self, buf: &mut [u8]) {
@@ -138,7 +140,11 @@ fn main() {
                     };
                     let mut rng = StdRng::new();
                     let conn = Connection::<AesP>::server(
-                        Aes128GcmProvider, tls_config, tp, &mut rng, &mut pool,
+                        Aes128GcmProvider,
+                        tls_config,
+                        tp,
+                        &mut rng,
+                        &mut pool,
                     )
                     .expect("create H3 server");
                     h3_server = Some(H3Server::new(conn));
@@ -164,14 +170,21 @@ fn main() {
                             let n = core::str::from_utf8(name).unwrap_or("<bin>");
                             let v = core::str::from_utf8(value).unwrap_or("<bin>");
                             println!("[h3] {n}: {v}");
-                        }).ok();
+                        })
+                        .ok();
 
                         let cl = BODY.len().to_string();
-                        h3.send_response(sid, 200, &[
-                            (b"content-type", b"text/html"),
-                            (b"content-length", cl.as_bytes()),
-                            (b"server", b"milli-http/0.1"),
-                        ], false).ok();
+                        h3.send_response(
+                            sid,
+                            200,
+                            &[
+                                (b"content-type", b"text/html"),
+                                (b"content-length", cl.as_bytes()),
+                                (b"server", b"milli-http/0.1"),
+                            ],
+                            false,
+                        )
+                        .ok();
                         h3.send_body(sid, BODY, true).ok();
                         println!("[h3] sent response on stream {sid}");
                     }
@@ -216,10 +229,18 @@ fn main() {
             // Read.
             let mut tcp_buf = [0u8; 65535];
             match stream.read(&mut tcp_buf) {
-                Ok(0) => { closed.push(i); continue; }
-                Ok(n) => { let _ = h2.feed_data(&tcp_buf[..n]); }
+                Ok(0) => {
+                    closed.push(i);
+                    continue;
+                }
+                Ok(n) => {
+                    let _ = h2.feed_data(&tcp_buf[..n]);
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => { closed.push(i); continue; }
+                Err(_) => {
+                    closed.push(i);
+                    continue;
+                }
             }
 
             // Write.
@@ -240,14 +261,21 @@ fn main() {
                             let n = core::str::from_utf8(name).unwrap_or("<bin>");
                             let v = core::str::from_utf8(value).unwrap_or("<bin>");
                             println!("[h2] {n}: {v}");
-                        }).ok();
+                        })
+                        .ok();
 
                         let cl = BODY.len().to_string();
-                        h2.send_response(sid, 200, &[
-                            (b"content-type", b"text/html"),
-                            (b"content-length", cl.as_bytes()),
-                            (b"server", b"milli-http/0.1"),
-                        ], false).ok();
+                        h2.send_response(
+                            sid,
+                            200,
+                            &[
+                                (b"content-type", b"text/html"),
+                                (b"content-length", cl.as_bytes()),
+                                (b"server", b"milli-http/0.1"),
+                            ],
+                            false,
+                        )
+                        .ok();
                         h2.send_body(sid, BODY, true).ok();
                         println!("[h2] sent response on stream {sid}");
                     }
@@ -261,7 +289,10 @@ fn main() {
                         }
                     }
                     H2Event::Finished(sid) => println!("[h2] stream {sid} finished"),
-                    H2Event::GoAway(_, _) => { closed.push(i); break; }
+                    H2Event::GoAway(_, _) => {
+                        closed.push(i);
+                        break;
+                    }
                     H2Event::StreamReset(sid, code) => {
                         println!("[h2] stream {sid} reset ({code})");
                     }

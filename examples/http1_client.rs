@@ -8,22 +8,23 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-use milli_http::http1::client::Http1Client;
 use milli_http::http1::Http1Event;
+use milli_http::http1::client::Http1Client;
 
 fn main() {
     println!("milli-http HTTP/1.1 client");
     println!("=========================");
 
-    let mut stream = TcpStream::connect("127.0.0.1:8080")
-        .expect("failed to connect to 127.0.0.1:8080");
+    let mut stream =
+        TcpStream::connect("127.0.0.1:8080").expect("failed to connect to 127.0.0.1:8080");
     println!("[conn] connected to 127.0.0.1:8080");
 
     stream.set_nonblocking(true).expect("set_nonblocking");
 
     let mut http1 = Http1Client::<8192, 2048, 4096>::new();
 
-    let stream_id = http1.send_request("GET", "/", "127.0.0.1:8080", &[], true)
+    let stream_id = http1
+        .send_request("GET", "/", "127.0.0.1:8080", &[], true)
         .expect("send_request failed");
     println!("[http1] sent GET / (stream {stream_id})");
 
@@ -37,10 +38,18 @@ fn main() {
         // Read from TCP.
         let mut recv_buf = [0u8; 8192];
         match stream.read(&mut recv_buf) {
-            Ok(0) => { println!("[conn] server disconnected"); break; }
-            Ok(n) => { http1.feed_data(&recv_buf[..n]).ok(); }
+            Ok(0) => {
+                println!("[conn] server disconnected");
+                break;
+            }
+            Ok(n) => {
+                http1.feed_data(&recv_buf[..n]).ok();
+            }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => { eprintln!("[conn] read error: {e}"); return; }
+            Err(e) => {
+                eprintln!("[conn] read error: {e}");
+                return;
+            }
         }
 
         // Process events.
@@ -51,11 +60,13 @@ fn main() {
                 }
                 Http1Event::Headers(sid) => {
                     println!("[http1] response headers:");
-                    http1.recv_headers(sid, |name, value| {
-                        let n = core::str::from_utf8(name).unwrap_or("<bin>");
-                        let v = core::str::from_utf8(value).unwrap_or("<bin>");
-                        println!("[http1]   {n}: {v}");
-                    }).ok();
+                    http1
+                        .recv_headers(sid, |name, value| {
+                            let n = core::str::from_utf8(name).unwrap_or("<bin>");
+                            let v = core::str::from_utf8(value).unwrap_or("<bin>");
+                            println!("[http1]   {n}: {v}");
+                        })
+                        .ok();
                 }
                 Http1Event::Data(sid) => {
                     let mut body = [0u8; 8192];

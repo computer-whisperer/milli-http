@@ -12,19 +12,19 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 
 use milli_http::crypto::rustcrypto::Aes128GcmProvider;
-use milli_http::h2::client::H2Client;
 use milli_http::h2::H2Event;
+use milli_http::h2::client::H2Client;
 use milli_http::tcp_tls::client::TlsClient;
 use milli_http::tcp_tls::connection::TlsEvent;
-use milli_http::tls::handshake::TlsConfig;
 use milli_http::tls::TransportParams;
+use milli_http::tls::handshake::TlsConfig;
 
 fn main() {
     println!("milli-http HTTP/2 (TLS) client");
     println!("==============================");
 
-    let mut stream = TcpStream::connect("127.0.0.1:9444")
-        .expect("failed to connect to 127.0.0.1:9444");
+    let mut stream =
+        TcpStream::connect("127.0.0.1:9444").expect("failed to connect to 127.0.0.1:9444");
     println!("[conn] connected to 127.0.0.1:9444");
 
     stream.set_nonblocking(true).expect("set_nonblocking");
@@ -127,7 +127,8 @@ fn main() {
                         let n = core::str::from_utf8(name).unwrap_or("<bin>");
                         let v = core::str::from_utf8(value).unwrap_or("<bin>");
                         println!("[h2]   {n}: {v}");
-                    }).ok();
+                    })
+                    .ok();
                 }
                 H2Event::Data(stream_id) => {
                     let mut body = [0u8; 8192];

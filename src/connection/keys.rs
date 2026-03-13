@@ -27,10 +27,8 @@ use crate::crypto::rustcrypto::{Aes128GcmAead, AesHeaderProtection};
 /// `size_of::<DirectionalKeys>()`. After the handshake, four of the seven key
 /// slots in `ConnectionKeys` are `None`, saving ~1.5 KB per connection.
 pub(crate) struct OptKeys<A: Aead, H: HeaderProtection>(
-    #[cfg(not(feature = "alloc"))]
-    Option<DirectionalKeys<A, H>>,
-    #[cfg(feature = "alloc")]
-    Option<alloc::boxed::Box<DirectionalKeys<A, H>>>,
+    #[cfg(not(feature = "alloc"))] Option<DirectionalKeys<A, H>>,
+    #[cfg(feature = "alloc")] Option<alloc::boxed::Box<DirectionalKeys<A, H>>>,
 );
 
 impl<A: Aead, H: HeaderProtection> OptKeys<A, H> {
@@ -40,16 +38,24 @@ impl<A: Aead, H: HeaderProtection> OptKeys<A, H> {
 
     pub fn some(keys: DirectionalKeys<A, H>) -> Self {
         #[cfg(not(feature = "alloc"))]
-        { Self(Some(keys)) }
+        {
+            Self(Some(keys))
+        }
         #[cfg(feature = "alloc")]
-        { Self(Some(alloc::boxed::Box::new(keys))) }
+        {
+            Self(Some(alloc::boxed::Box::new(keys)))
+        }
     }
 
     pub fn as_ref(&self) -> Option<&DirectionalKeys<A, H>> {
         #[cfg(not(feature = "alloc"))]
-        { self.0.as_ref() }
+        {
+            self.0.as_ref()
+        }
         #[cfg(feature = "alloc")]
-        { self.0.as_deref() }
+        {
+            self.0.as_deref()
+        }
     }
 
     pub fn take(&mut self) -> OptKeys<A, H> {
@@ -218,10 +224,16 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
             &mut server_secret,
         )?;
 
-        let client_keys =
-            crate::crypto::key_schedule::derive_directional_keys(&aes_provider, &hkdf, &client_secret)?;
-        let server_keys =
-            crate::crypto::key_schedule::derive_directional_keys(&aes_provider, &hkdf, &server_secret)?;
+        let client_keys = crate::crypto::key_schedule::derive_directional_keys(
+            &aes_provider,
+            &hkdf,
+            &client_secret,
+        )?;
+        let server_keys = crate::crypto::key_schedule::derive_directional_keys(
+            &aes_provider,
+            &hkdf,
+            &server_secret,
+        )?;
         client_secret.zeroize();
         server_secret.zeroize();
 
@@ -237,11 +249,7 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
 
     /// Install keys derived from TLS (handshake or application level).
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
-    pub fn install_derived(
-        &mut self,
-        provider: &C,
-        derived: &DerivedKeys,
-    ) -> Result<(), Error> {
+    pub fn install_derived(&mut self, provider: &C, derived: &DerivedKeys) -> Result<(), Error> {
         let hkdf = provider.hkdf();
         let send_keys = crate::crypto::key_schedule::derive_directional_keys(
             provider,
@@ -304,13 +312,17 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
 
     /// Get the send-direction initial keys (AES-128-GCM per RFC 9001).
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
-    pub fn initial_send_keys(&self) -> Option<&DirectionalKeys<Aes128GcmAead, AesHeaderProtection>> {
+    pub fn initial_send_keys(
+        &self,
+    ) -> Option<&DirectionalKeys<Aes128GcmAead, AesHeaderProtection>> {
         self.initial_send.as_ref()
     }
 
     /// Get the recv-direction initial keys (AES-128-GCM per RFC 9001).
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
-    pub fn initial_recv_keys(&self) -> Option<&DirectionalKeys<Aes128GcmAead, AesHeaderProtection>> {
+    pub fn initial_recv_keys(
+        &self,
+    ) -> Option<&DirectionalKeys<Aes128GcmAead, AesHeaderProtection>> {
         self.initial_recv.as_ref()
     }
 
@@ -428,11 +440,13 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
         let key_len = C::Aead::KEY_LEN;
 
         crate::crypto::key_schedule::hkdf_expand_label(
-            &hkdf, secret, b"quic key", &[], &mut key_buf[..key_len],
+            &hkdf,
+            secret,
+            b"quic key",
+            &[],
+            &mut key_buf[..key_len],
         )?;
-        crate::crypto::key_schedule::hkdf_expand_label(
-            &hkdf, secret, b"quic iv", &[], &mut iv,
-        )?;
+        crate::crypto::key_schedule::hkdf_expand_label(&hkdf, secret, b"quic iv", &[], &mut iv)?;
 
         let aead = provider.aead(&key_buf[..key_len])?;
         // Re-create HP from the ORIGINAL HP key (unchanged across key updates)
@@ -459,7 +473,9 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
     pub fn perform_key_update(&mut self, provider: &C) -> Result<(), Error> {
         if !self.can_initiate_key_update() {
-            return Err(Error::Transport(crate::error::TransportError::KeyUpdateError));
+            return Err(Error::Transport(
+                crate::error::TransportError::KeyUpdateError,
+            ));
         }
 
         let hkdf = provider.hkdf();
@@ -502,10 +518,8 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
         self.app_recv = OptKeys::some(new_recv_keys);
 
         // Update secrets
-        self.key_update.send_secret[..secret_len]
-            .copy_from_slice(&new_send_secret[..secret_len]);
-        self.key_update.recv_secret[..secret_len]
-            .copy_from_slice(&new_recv_secret[..secret_len]);
+        self.key_update.send_secret[..secret_len].copy_from_slice(&new_send_secret[..secret_len]);
+        self.key_update.recv_secret[..secret_len].copy_from_slice(&new_recv_secret[..secret_len]);
 
         // Flip key phase
         self.key_update.key_phase ^= 1;
@@ -604,10 +618,8 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
         self.app_recv = OptKeys::some(new_recv_keys);
 
         // Update secrets
-        self.key_update.send_secret[..secret_len]
-            .copy_from_slice(&new_send_secret[..secret_len]);
-        self.key_update.recv_secret[..secret_len]
-            .copy_from_slice(&new_recv_secret[..secret_len]);
+        self.key_update.send_secret[..secret_len].copy_from_slice(&new_send_secret[..secret_len]);
+        self.key_update.recv_secret[..secret_len].copy_from_slice(&new_recv_secret[..secret_len]);
 
         // Flip key phase
         self.key_update.key_phase ^= 1;
@@ -771,7 +783,10 @@ mod tests {
 
         let recv = server_keys.initial_recv_keys().unwrap();
         let nonce = recv.nonce(0);
-        let pt_len = recv.aead.open_in_place(&nonce, aad, &mut buf, ct_len).unwrap();
+        let pt_len = recv
+            .aead
+            .open_in_place(&nonce, aad, &mut buf, ct_len)
+            .unwrap();
         assert_eq!(&buf[..pt_len], plaintext);
     }
 
@@ -923,11 +938,17 @@ mod tests {
 
             let send = client_keys.app_send.as_ref().unwrap();
             let nonce = send.nonce(0);
-            let ct_len = send.aead.seal_in_place(&nonce, aad, &mut buf, plaintext.len()).unwrap();
+            let ct_len = send
+                .aead
+                .seal_in_place(&nonce, aad, &mut buf, plaintext.len())
+                .unwrap();
 
             let recv = server_keys.app_recv.as_ref().unwrap();
             let nonce = recv.nonce(0);
-            let pt_len = recv.aead.open_in_place(&nonce, aad, &mut buf, ct_len).unwrap();
+            let pt_len = recv
+                .aead
+                .open_in_place(&nonce, aad, &mut buf, ct_len)
+                .unwrap();
             assert_eq!(&buf[..pt_len], plaintext);
 
             // Client initiates key update
@@ -942,11 +963,17 @@ mod tests {
 
             let send = client_keys.app_send.as_ref().unwrap();
             let nonce = send.nonce(1);
-            let ct_len = send.aead.seal_in_place(&nonce, aad, &mut buf, plaintext2.len()).unwrap();
+            let ct_len = send
+                .aead
+                .seal_in_place(&nonce, aad, &mut buf, plaintext2.len())
+                .unwrap();
 
             let recv = server_keys.app_recv.as_ref().unwrap();
             let nonce = recv.nonce(1);
-            let pt_len = recv.aead.open_in_place(&nonce, aad, &mut buf, ct_len).unwrap();
+            let pt_len = recv
+                .aead
+                .open_in_place(&nonce, aad, &mut buf, ct_len)
+                .unwrap();
             assert_eq!(&buf[..pt_len], plaintext2);
         }
 
@@ -969,7 +996,10 @@ mod tests {
             let recv = keys.app_recv.as_ref().unwrap();
             let nonce = recv.nonce(42);
             // Encrypt using what would be the sender's key (which matches our recv key)
-            let ct_len = recv.aead.seal_in_place(&nonce, aad, &mut buf, plaintext.len()).unwrap();
+            let ct_len = recv
+                .aead
+                .seal_in_place(&nonce, aad, &mut buf, plaintext.len())
+                .unwrap();
 
             // Now perform a key update
             keys.perform_key_update(&provider).unwrap();
@@ -977,7 +1007,10 @@ mod tests {
             // The old key should now be in prev_recv
             let prev = keys.prev_recv_keys().unwrap();
             let nonce = prev.nonce(42);
-            let pt_len = prev.aead.open_in_place(&nonce, aad, &mut buf, ct_len).unwrap();
+            let pt_len = prev
+                .aead
+                .open_in_place(&nonce, aad, &mut buf, ct_len)
+                .unwrap();
             assert_eq!(&buf[..pt_len], plaintext);
         }
 
@@ -1007,10 +1040,16 @@ mod tests {
 
             let server_send = server_keys.app_send.as_ref().unwrap();
             let nonce = server_send.nonce(0);
-            let ct_len = server_send.aead.seal_in_place(&nonce, aad, &mut buf, plaintext.len()).unwrap();
+            let ct_len = server_send
+                .aead
+                .seal_in_place(&nonce, aad, &mut buf, plaintext.len())
+                .unwrap();
 
             let nonce = next_recv.nonce(0);
-            let pt_len = next_recv.aead.open_in_place(&nonce, aad, &mut buf, ct_len).unwrap();
+            let pt_len = next_recv
+                .aead
+                .open_in_place(&nonce, aad, &mut buf, ct_len)
+                .unwrap();
             assert_eq!(&buf[..pt_len], plaintext);
         }
 
@@ -1031,7 +1070,9 @@ mod tests {
             // Client detects the key phase change and derives next recv keys
             let next_recv = client_keys.derive_next_recv_keys(&provider).unwrap();
             // After successful decryption, client confirms the peer key update
-            client_keys.confirm_peer_key_update(&provider, next_recv).unwrap();
+            client_keys
+                .confirm_peer_key_update(&provider, next_recv)
+                .unwrap();
 
             // Client's key phase should now be 1 (matching server)
             assert_eq!(client_keys.key_phase(), 1);
@@ -1048,11 +1089,17 @@ mod tests {
 
             let send = server_keys.app_send.as_ref().unwrap();
             let nonce = send.nonce(0);
-            let ct_len = send.aead.seal_in_place(&nonce, aad, &mut buf, plaintext.len()).unwrap();
+            let ct_len = send
+                .aead
+                .seal_in_place(&nonce, aad, &mut buf, plaintext.len())
+                .unwrap();
 
             let recv = client_keys.app_recv.as_ref().unwrap();
             let nonce = recv.nonce(0);
-            let pt_len = recv.aead.open_in_place(&nonce, aad, &mut buf, ct_len).unwrap();
+            let pt_len = recv
+                .aead
+                .open_in_place(&nonce, aad, &mut buf, ct_len)
+                .unwrap();
             assert_eq!(&buf[..pt_len], plaintext);
         }
 
@@ -1067,14 +1114,8 @@ mod tests {
             keys.perform_key_update(&provider).unwrap();
 
             // Secrets must have changed
-            assert_ne!(
-                &keys.key_update.send_secret[..32],
-                &old_send_secret[..32]
-            );
-            assert_ne!(
-                &keys.key_update.recv_secret[..32],
-                &old_recv_secret[..32]
-            );
+            assert_ne!(&keys.key_update.send_secret[..32], &old_send_secret[..32]);
+            assert_ne!(&keys.key_update.recv_secret[..32], &old_recv_secret[..32]);
         }
 
         #[test]
@@ -1103,15 +1144,17 @@ mod tests {
 
                 let send = client_keys.app_send.as_ref().unwrap();
                 let nonce = send.nonce(0);
-                let ct_len = send.aead.seal_in_place(
-                    &nonce, aad, &mut buf, plaintext.len(),
-                ).unwrap();
+                let ct_len = send
+                    .aead
+                    .seal_in_place(&nonce, aad, &mut buf, plaintext.len())
+                    .unwrap();
 
                 let recv = server_keys.app_recv.as_ref().unwrap();
                 let nonce = recv.nonce(0);
-                let pt_len = recv.aead.open_in_place(
-                    &nonce, aad, &mut buf, ct_len,
-                ).unwrap();
+                let pt_len = recv
+                    .aead
+                    .open_in_place(&nonce, aad, &mut buf, ct_len)
+                    .unwrap();
                 assert_eq!(&buf[..pt_len], plaintext);
 
                 // Simulate confirmation for next round

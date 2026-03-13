@@ -30,11 +30,7 @@ pub fn parse_short_header(buf: &[u8], dcid_len: usize) -> Result<(ShortHeader<'_
 /// Encode a short header packet into `buf`.
 ///
 /// Writes the first byte and DCID. Returns the number of bytes written.
-pub fn encode_short_header(
-    dcid: &[u8],
-    first_byte: u8,
-    buf: &mut [u8],
-) -> Result<usize, Error> {
+pub fn encode_short_header(dcid: &[u8], first_byte: u8, buf: &mut [u8]) -> Result<usize, Error> {
     let needed = 1 + dcid.len();
     if buf.len() < needed {
         return Err(Error::BufferTooSmall { needed });

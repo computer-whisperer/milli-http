@@ -1,6 +1,6 @@
+use crate::Instant;
 use crate::crypto::Level;
 use crate::transport::recovery::SentPacketTracker;
-use crate::Instant;
 
 /// Time threshold for loss detection: 9/8 (RFC 9002 §6.1.2).
 const TIME_THRESHOLD_NUM: u64 = 9;
@@ -185,10 +185,7 @@ impl LossDetector {
     }
 
     /// Get the PTO timeout. Returns deadline if there are ack-eliciting packets in flight.
-    pub fn pto_timeout<const N: usize>(
-        &self,
-        tracker: &SentPacketTracker<N>,
-    ) -> Option<Instant> {
+    pub fn pto_timeout<const N: usize>(&self, tracker: &SentPacketTracker<N>) -> Option<Instant> {
         let pto = self.pto_duration() * (1u64 << self.pto_count.min(62));
 
         // Find the most recent ack-eliciting send time across all spaces.
@@ -238,16 +235,9 @@ impl LossDetector {
     }
 
     /// Get the next timer deadline (min of loss timer and PTO).
-    pub fn next_timeout<const N: usize>(
-        &self,
-        tracker: &SentPacketTracker<N>,
-    ) -> Option<Instant> {
+    pub fn next_timeout<const N: usize>(&self, tracker: &SentPacketTracker<N>) -> Option<Instant> {
         // Find earliest loss timer across all spaces.
-        let loss_timer = self
-            .loss_time
-            .iter()
-            .filter_map(|t| *t)
-            .min();
+        let loss_timer = self.loss_time.iter().filter_map(|t| *t).min();
 
         let pto = self.pto_timeout(tracker);
 

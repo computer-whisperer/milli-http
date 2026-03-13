@@ -2,15 +2,15 @@
 //!
 //! Standalone middleware: TCP socket ↔ TlsConnection ↔ H2Connection / Http1Connection.
 
-pub mod record;
+pub mod client;
 pub mod connection;
 pub mod io;
-pub mod client;
+pub mod record;
 pub mod server;
 
+pub use client::TlsClient;
 pub use connection::{TlsConnection, TlsEvent};
 pub use io::{TlsIo, TlsIoBufs};
-pub use client::TlsClient;
 pub use server::TlsServer;
 
 use crate::buf::Buf;
@@ -36,7 +36,12 @@ where
     C::Hkdf: Default,
 {
     /// Create new server-side TLS parts.
-    pub fn new_server(provider: C, config: ServerTlsConfig, secret: [u8; 32], random: [u8; 32]) -> Self {
+    pub fn new_server(
+        provider: C,
+        config: ServerTlsConfig,
+        secret: [u8; 32],
+        random: [u8; 32],
+    ) -> Self {
         Self {
             tls: TlsConnection::new_server(provider, config, secret, random),
             net_recv: Buf::new(),

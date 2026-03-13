@@ -14,12 +14,12 @@ use std::net::TcpListener;
 
 use milli_http::crypto::ed25519::{build_ed25519_cert_der, ed25519_public_key_from_seed};
 use milli_http::crypto::rustcrypto::Aes128GcmProvider;
-use milli_http::h2::server::H2Server;
 use milli_http::h2::H2Event;
-use milli_http::tcp_tls::server::TlsServer;
+use milli_http::h2::server::H2Server;
 use milli_http::tcp_tls::connection::TlsEvent;
-use milli_http::tls::handshake::ServerTlsConfig;
+use milli_http::tcp_tls::server::TlsServer;
 use milli_http::tls::TransportParams;
+use milli_http::tls::handshake::ServerTlsConfig;
 
 fn main() {
     println!("milli-http HTTP/2 (TLS) server");
@@ -29,8 +29,8 @@ fn main() {
     let seed: [u8; 32] = [0x42u8; 32];
     let pk = ed25519_public_key_from_seed(&seed);
     let mut cert_buf = [0u8; 512];
-    let cert_len = build_ed25519_cert_der(&pk, &mut cert_buf)
-        .expect("failed to build certificate DER");
+    let cert_len =
+        build_ed25519_cert_der(&pk, &mut cert_buf).expect("failed to build certificate DER");
     let cert_der: &'static [u8] = Box::leak(cert_buf[..cert_len].to_vec().into_boxed_slice());
     let private_key_der: &'static [u8] = Box::leak(Box::new(seed));
     println!("[init] generated self-signed Ed25519 certificate ({cert_len} bytes)");
@@ -139,7 +139,8 @@ fn main() {
                             path[..copy].copy_from_slice(&value[..copy]);
                             path_len = copy;
                         }
-                    }).ok();
+                    })
+                    .ok();
 
                     let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("/");
                     route_h2(&mut h2, stream_id, path_str);
@@ -195,28 +196,42 @@ fn route_h2(h2: &mut H2Server<32, 65536>, stream_id: u64, path: &str) {
         "/status/404" => {
             let body = b"Not Found";
             let cl = body.len().to_string();
-            h2.send_response(stream_id, 404, &[
-                (b"content-type", b"text/plain"),
-                (b"content-length", cl.as_bytes()),
-                (b"server", b"milli-http"),
-            ], false).ok();
+            h2.send_response(
+                stream_id,
+                404,
+                &[
+                    (b"content-type", b"text/plain"),
+                    (b"content-length", cl.as_bytes()),
+                    (b"server", b"milli-http"),
+                ],
+                false,
+            )
+            .ok();
             h2.send_body(stream_id, body, true).ok();
         }
         "/large" => {
             let data = [b'X'; 32768];
             let cl = "32768";
-            h2.send_response(stream_id, 200, &[
-                (b"content-type", b"application/octet-stream"),
-                (b"content-length", cl.as_bytes()),
-                (b"server", b"milli-http"),
-            ], false).ok();
+            h2.send_response(
+                stream_id,
+                200,
+                &[
+                    (b"content-type", b"application/octet-stream"),
+                    (b"content-length", cl.as_bytes()),
+                    (b"server", b"milli-http"),
+                ],
+                false,
+            )
+            .ok();
             // Send in chunks — H2 max frame size is 16384
             let mut offset = 0;
             while offset < data.len() {
                 let end_stream = false; // we'll set true on the last chunk
                 match h2.send_body(stream_id, &data[offset..], offset + 16384 >= data.len()) {
                     Ok(n) => {
-                        println!("[h2] sent {n} body bytes on stream {stream_id} (offset {offset})");
+                        println!(
+                            "[h2] sent {n} body bytes on stream {stream_id} (offset {offset})"
+                        );
                         offset += n;
                     }
                     Err(e) => {
@@ -230,11 +245,17 @@ fn route_h2(h2: &mut H2Server<32, 65536>, stream_id: u64, path: &str) {
         _ => {
             let body = b"<!DOCTYPE html>\n<html>\n<head><title>milli-http</title></head>\n<body>\n<h1>Hello from milli-http!</h1>\n<p>You are connected via HTTP/2 (TLS).</p>\n</body>\n</html>\n";
             let cl = body.len().to_string();
-            h2.send_response(stream_id, 200, &[
-                (b"content-type", b"text/html"),
-                (b"content-length", cl.as_bytes()),
-                (b"server", b"milli-http"),
-            ], false).ok();
+            h2.send_response(
+                stream_id,
+                200,
+                &[
+                    (b"content-type", b"text/html"),
+                    (b"content-length", cl.as_bytes()),
+                    (b"server", b"milli-http"),
+                ],
+                false,
+            )
+            .ok();
             h2.send_body(stream_id, body, true).ok();
         }
     }

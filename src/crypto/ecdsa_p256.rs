@@ -27,20 +27,17 @@ pub fn sign_certificate_verify(
         return Err(Error::Tls);
     }
 
-    let signing_key =
-        SigningKey::from_bytes(signing_key_bytes.into()).map_err(|_| Error::Tls)?;
+    let signing_key = SigningKey::from_bytes(signing_key_bytes.into()).map_err(|_| Error::Tls)?;
 
     // Build the TLS 1.3 CertificateVerify signed content
-    let (content, content_len) =
-        crate::crypto::ed25519::build_server_cv_content(transcript_hash);
+    let (content, content_len) = crate::crypto::ed25519::build_server_cv_content(transcript_hash);
 
     // Sign the content directly -- the p256 crate's Signer impl for SigningKey
     // hashes with SHA-256 internally, but for TLS 1.3 CertificateVerify with
     // ecdsa_secp256r1_sha256, the content to sign IS the raw content
     // (64 spaces + context + 0x00 + transcript_hash), and it gets SHA-256'd
     // by the signing operation.
-    let signature: p256::ecdsa::DerSignature =
-        signing_key.sign(&content[..content_len]);
+    let signature: p256::ecdsa::DerSignature = signing_key.sign(&content[..content_len]);
 
     let sig_bytes = signature.as_bytes();
     let mut result = heapless::Vec::new();
@@ -65,11 +62,9 @@ pub fn verify_certificate_verify(
 
     let verifying_key = VerifyingKey::from_sec1_bytes(public_key_bytes).map_err(|_| Error::Tls)?;
 
-    let sig =
-        p256::ecdsa::DerSignature::try_from(signature).map_err(|_| Error::Tls)?;
+    let sig = p256::ecdsa::DerSignature::try_from(signature).map_err(|_| Error::Tls)?;
 
-    let (content, content_len) =
-        crate::crypto::ed25519::build_server_cv_content(transcript_hash);
+    let (content, content_len) = crate::crypto::ed25519::build_server_cv_content(transcript_hash);
 
     verifying_key
         .verify(&content[..content_len], &sig)
@@ -201,15 +196,15 @@ pub fn build_p256_cert_der(public_key: &[u8], out: &mut [u8]) -> Result<usize, E
     // CN = "milli-quic" in RDN format:
     // SET { SEQUENCE { OID 2.5.4.3, UTF8String "milli-quic" } }
     let cn_rdn: &[u8] = &[
-        0x31, 0x13, 0x30, 0x11, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x0a, b'm', b'i', b'l',
-        b'l', b'i', b'-', b'q', b'u', b'i', b'c',
+        0x31, 0x13, 0x30, 0x11, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x0a, b'm', b'i', b'l', b'l',
+        b'i', b'-', b'q', b'u', b'i', b'c',
     ];
 
     // Validity: UTCTime "250101000000Z" to "350101000000Z"
     let validity: &[u8] = &[
-        0x30, 0x1e, 0x17, 0x0d, b'2', b'5', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0',
-        b'0', b'0', b'Z', 0x17, 0x0d, b'3', b'5', b'0', b'1', b'0', b'1', b'0', b'0', b'0',
-        b'0', b'0', b'0', b'Z',
+        0x30, 0x1e, 0x17, 0x0d, b'2', b'5', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0',
+        b'0', b'Z', 0x17, 0x0d, b'3', b'5', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0',
+        b'0', b'Z',
     ];
 
     // Signature algorithm for the outer cert: ecdsaWithSHA256
@@ -301,8 +296,11 @@ pub fn build_p256_cert_der(public_key: &[u8], out: &mut [u8]) -> Result<usize, E
     // ---- Outer Certificate SEQUENCE ----
     // Content: TBS-SEQUENCE + sigAlgo-SEQUENCE + sig-BIT-STRING
     let tbs_seq_encoded_len = 1 + asn1_length_size(tbs_len) + tbs_len;
-    let outer_content_len =
-        tbs_seq_encoded_len + ecdsa_sha256_algo.len() + 1 + asn1_length_size(fake_sig_bitstring_len) + fake_sig_bitstring_len;
+    let outer_content_len = tbs_seq_encoded_len
+        + ecdsa_sha256_algo.len()
+        + 1
+        + asn1_length_size(fake_sig_bitstring_len)
+        + fake_sig_bitstring_len;
 
     if out.len() < 1 + asn1_length_size(outer_content_len) + outer_content_len {
         return Err(Error::BufferTooSmall {
@@ -368,9 +366,7 @@ fn parse_asn1_length(data: &[u8]) -> Result<(usize, usize), Error> {
         if data.len() < 3 {
             return Err(Error::Tls);
         }
-        Ok(
-            (((data[1] as usize) << 8) | (data[2] as usize), 3),
-        )
+        Ok((((data[1] as usize) << 8) | (data[2] as usize), 3))
     } else {
         Err(Error::Tls)
     }
@@ -425,8 +421,11 @@ mod tests {
         let signature = sign_certificate_verify(&scalar, &transcript_hash).unwrap();
         assert!(!signature.is_empty());
         // DER-encoded ECDSA signatures are typically 70-72 bytes
-        assert!(signature.len() >= 68 && signature.len() <= 74,
-            "unexpected signature length: {}", signature.len());
+        assert!(
+            signature.len() >= 68 && signature.len() <= 74,
+            "unexpected signature length: {}",
+            signature.len()
+        );
 
         let pubkey = p256_public_key_from_scalar(&scalar).unwrap();
         assert_eq!(pubkey.len(), 65);

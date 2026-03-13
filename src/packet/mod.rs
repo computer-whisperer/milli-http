@@ -115,8 +115,8 @@ mod tests {
         let payload_len = 100; // pn + encrypted payload
 
         let mut buf = [0u8; 256];
-        let written = encode_initial_header(dcid, scid, token, pn_len, payload_len, &mut buf)
-            .unwrap();
+        let written =
+            encode_initial_header(dcid, scid, token, pn_len, payload_len, &mut buf).unwrap();
 
         let (hdr, consumed) = parse_initial_header(&buf[..written]).unwrap();
         assert_eq!(hdr.version, QUIC_VERSION_1);
@@ -138,8 +138,7 @@ mod tests {
         let payload_len = 500;
 
         let mut buf = [0u8; 256];
-        let written =
-            encode_handshake_header(dcid, scid, pn_len, payload_len, &mut buf).unwrap();
+        let written = encode_handshake_header(dcid, scid, pn_len, payload_len, &mut buf).unwrap();
 
         let (hdr, consumed) = parse_handshake_header(&buf[..written]).unwrap();
         assert_eq!(hdr.version, QUIC_VERSION_1);
@@ -252,7 +251,12 @@ mod tests {
 
         // Encode Initial header
         let hdr_len = encode_initial_header(
-            dcid, scid, token, 2, initial_payload_len, &mut datagram[offset..],
+            dcid,
+            scid,
+            token,
+            2,
+            initial_payload_len,
+            &mut datagram[offset..],
         )
         .unwrap();
         offset += hdr_len;
@@ -261,7 +265,11 @@ mod tests {
 
         // Encode Handshake header
         let hdr_len = encode_handshake_header(
-            dcid, scid, 2, handshake_payload_len, &mut datagram[offset..],
+            dcid,
+            scid,
+            2,
+            handshake_payload_len,
+            &mut datagram[offset..],
         )
         .unwrap();
         offset += hdr_len;
@@ -338,8 +346,7 @@ mod tests {
         let token = b"";
 
         let mut buf = [0u8; 256];
-        let written =
-            encode_initial_header(&dcid, &scid, token, 1, 10, &mut buf).unwrap();
+        let written = encode_initial_header(&dcid, &scid, token, 1, 10, &mut buf).unwrap();
 
         let (hdr, _) = parse_initial_header(&buf[..written]).unwrap();
         assert_eq!(hdr.dcid, &dcid[..]);

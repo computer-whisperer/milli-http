@@ -8,7 +8,10 @@
 //! a separate integration test file. Tests run sequentially (not in parallel)
 //! to get accurate per-scenario measurements.
 
-#![cfg(all(feature = "alloc", any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")))]
+#![cfg(all(
+    feature = "alloc",
+    any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")
+))]
 
 extern crate alloc;
 
@@ -42,7 +45,8 @@ impl TrackingAllocator {
     }
 
     fn reset_peak(&self) {
-        self.peak.store(self.current.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.peak
+            .store(self.current.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
@@ -62,7 +66,12 @@ unsafe impl GlobalAlloc for TrackingAllocator {
             // Update peak (relaxed CAS loop)
             let mut peak = self.peak.load(Ordering::Relaxed);
             while new > peak {
-                match self.peak.compare_exchange_weak(peak, new, Ordering::Relaxed, Ordering::Relaxed) {
+                match self.peak.compare_exchange_weak(
+                    peak,
+                    new,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
                     Ok(_) => break,
                     Err(actual) => peak = actual,
                 }
@@ -84,6 +93,8 @@ static ALLOC: TrackingAllocator = TrackingAllocator::new();
 // Protocol imports
 // ===========================================================================
 
+use milli_http::QuicStreamIoBufs;
+use milli_http::Rng;
 use milli_http::connection::Connection;
 use milli_http::connection::HandshakePool;
 use milli_http::crypto::ed25519::{build_ed25519_cert_der, ed25519_public_key_from_seed};
@@ -97,8 +108,6 @@ use milli_http::tcp_tls::connection::TlsConnection;
 use milli_http::tcp_tls::io::TlsIoBufs;
 use milli_http::tls::handshake::{ServerTlsConfig, TlsConfig};
 use milli_http::tls::transport_params::TransportParams;
-use milli_http::QuicStreamIoBufs;
-use milli_http::Rng;
 
 type C = Aes128GcmProvider;
 
@@ -487,15 +496,25 @@ fn measure_h3_handshake_and_data() {
     let h3_pair_current = snap.current_above_baseline();
 
     println!("--- H3 pair (2 connections + pool, established) ---");
-    println!("  Peak heap:    {:>8} bytes  ({:.1} KB)", h3_pair_peak, h3_pair_peak as f64 / 1024.0);
-    println!("  Current heap: {:>8} bytes  ({:.1} KB)", h3_pair_current, h3_pair_current as f64 / 1024.0);
+    println!(
+        "  Peak heap:    {:>8} bytes  ({:.1} KB)",
+        h3_pair_peak,
+        h3_pair_peak as f64 / 1024.0
+    );
+    println!(
+        "  Current heap: {:>8} bytes  ({:.1} KB)",
+        h3_pair_current,
+        h3_pair_current as f64 / 1024.0
+    );
     println!("  (includes HandshakePool<4>, H3Client, H3Server, QuicStreamIoBufs)");
     println!();
 
     // --- Measure H3 request/response data flow ---
     let snap = HeapSnapshot::begin();
 
-    let stream_id = client.send_request("GET", "/test", "test.local", &[], false).unwrap();
+    let stream_id = client
+        .send_request("GET", "/test", "test.local", &[], false)
+        .unwrap();
     client.send_body(stream_id, &[], true).unwrap();
     exchange_h3(&mut client, &mut server, now, &mut pool);
 
@@ -526,7 +545,11 @@ fn measure_h3_handshake_and_data() {
     let snap = snap.finish();
     let data_peak = snap.peak_above_baseline();
     println!("--- H3 request/response data flow (additional) ---");
-    println!("  Peak heap:    {:>8} bytes  ({:.1} KB)", data_peak, data_peak as f64 / 1024.0);
+    println!(
+        "  Peak heap:    {:>8} bytes  ({:.1} KB)",
+        data_peak,
+        data_peak as f64 / 1024.0
+    );
     println!();
 
     // Drop everything and verify cleanup
@@ -554,13 +577,27 @@ fn measure_https1_handshake_and_data() {
     let hs_peak = snap.peak_above_baseline();
     let hs_current = snap.current_above_baseline();
 
-    assert!(client.is_established(), "HTTPS/1.1 handshake should complete");
+    assert!(
+        client.is_established(),
+        "HTTPS/1.1 handshake should complete"
+    );
     assert!(server.is_established());
 
     println!("--- HTTPS/1.1 pair (established) ---");
-    println!("  Peak heap during handshake: {:>8} bytes  ({:.1} KB)", hs_peak, hs_peak as f64 / 1024.0);
-    println!("  Current heap (post-shrink): {:>8} bytes  ({:.1} KB)", hs_current, hs_current as f64 / 1024.0);
-    println!("  Struct size (client+server): {:>7} bytes", 2 * size_of::<TestHttps1Server>());
+    println!(
+        "  Peak heap during handshake: {:>8} bytes  ({:.1} KB)",
+        hs_peak,
+        hs_peak as f64 / 1024.0
+    );
+    println!(
+        "  Current heap (post-shrink): {:>8} bytes  ({:.1} KB)",
+        hs_current,
+        hs_current as f64 / 1024.0
+    );
+    println!(
+        "  Struct size (client+server): {:>7} bytes",
+        2 * size_of::<TestHttps1Server>()
+    );
     println!();
 
     // --- Measure data flow ---
@@ -570,14 +607,18 @@ fn measure_https1_handshake_and_data() {
 
     let snap = HeapSnapshot::begin();
 
-    let _sid = client.send_request("GET", "/hello", "test.local", &[], true).unwrap();
+    let _sid = client
+        .send_request("GET", "/hello", "test.local", &[], true)
+        .unwrap();
     https1_exchange(&mut client, &mut server);
 
     // Server reads and responds
     while let Some(ev) = server.poll_event() {
         if let Http1Event::Headers(sid) = ev {
             server.recv_headers(sid, |_, _| {}).unwrap();
-            server.send_response(sid, 200, &[(b"content-length", b"14")], false).unwrap();
+            server
+                .send_response(sid, 200, &[(b"content-length", b"14")], false)
+                .unwrap();
             server.send_body(sid, b"Hello, HTTPS1!", true).unwrap();
         }
     }
@@ -586,7 +627,11 @@ fn measure_https1_handshake_and_data() {
     let snap = snap.finish();
     let data_peak = snap.peak_above_baseline();
     println!("--- HTTPS/1.1 request/response (additional) ---");
-    println!("  Peak heap:    {:>8} bytes  ({:.1} KB)", data_peak, data_peak as f64 / 1024.0);
+    println!(
+        "  Peak heap:    {:>8} bytes  ({:.1} KB)",
+        data_peak,
+        data_peak as f64 / 1024.0
+    );
     println!();
 
     drop(client);
@@ -616,9 +661,20 @@ fn measure_h2_tls_handshake_and_data() {
     assert!(server.is_established());
 
     println!("--- H2/TLS pair (established) ---");
-    println!("  Peak heap during handshake: {:>8} bytes  ({:.1} KB)", hs_peak, hs_peak as f64 / 1024.0);
-    println!("  Current heap (post-shrink): {:>8} bytes  ({:.1} KB)", hs_current, hs_current as f64 / 1024.0);
-    println!("  Struct size (client+server): {:>7} bytes", size_of::<TestH2TlsClient>() + size_of::<TestH2TlsServer>());
+    println!(
+        "  Peak heap during handshake: {:>8} bytes  ({:.1} KB)",
+        hs_peak,
+        hs_peak as f64 / 1024.0
+    );
+    println!(
+        "  Current heap (post-shrink): {:>8} bytes  ({:.1} KB)",
+        hs_current,
+        hs_current as f64 / 1024.0
+    );
+    println!(
+        "  Struct size (client+server): {:>7} bytes",
+        size_of::<TestH2TlsClient>() + size_of::<TestH2TlsServer>()
+    );
     println!();
 
     // --- Measure data flow ---
@@ -627,14 +683,18 @@ fn measure_h2_tls_handshake_and_data() {
 
     let snap = HeapSnapshot::begin();
 
-    let _stream_id = client.send_request("GET", "/hello", "test.local", &[], true).unwrap();
+    let _stream_id = client
+        .send_request("GET", "/hello", "test.local", &[], true)
+        .unwrap();
     h2tls_exchange(&mut client, &mut server);
 
     // Server reads and responds
     while let Some(ev) = server.poll_event() {
         if let H2Event::Headers(sid) = ev {
             server.recv_headers(sid, |_, _| {}).unwrap();
-            server.send_response(sid, 200, &[(b"content-length", b"14")], false).unwrap();
+            server
+                .send_response(sid, 200, &[(b"content-length", b"14")], false)
+                .unwrap();
             server.send_body(sid, b"Hello from H2!", true).unwrap();
         }
     }
@@ -654,7 +714,11 @@ fn measure_h2_tls_handshake_and_data() {
     let snap = snap.finish();
     let data_peak = snap.peak_above_baseline();
     println!("--- H2/TLS request/response (additional) ---");
-    println!("  Peak heap:    {:>8} bytes  ({:.1} KB)", data_peak, data_peak as f64 / 1024.0);
+    println!(
+        "  Peak heap:    {:>8} bytes  ({:.1} KB)",
+        data_peak,
+        data_peak as f64 / 1024.0
+    );
     println!();
 
     drop(client);
@@ -682,9 +746,20 @@ fn measure_tls_connection_only() {
     let create_current = snap_pre_hs.current_above_baseline();
 
     println!("--- TLS connection pair (created, before handshake) ---");
-    println!("  Peak heap:    {:>8} bytes  ({:.1} KB)", create_peak, create_peak as f64 / 1024.0);
-    println!("  Current heap: {:>8} bytes  ({:.1} KB)", create_current, create_current as f64 / 1024.0);
-    println!("  Struct size (conn+io): {:>7} bytes each", size_of::<TlsConnection<C>>() + size_of::<TestTlsIo>());
+    println!(
+        "  Peak heap:    {:>8} bytes  ({:.1} KB)",
+        create_peak,
+        create_peak as f64 / 1024.0
+    );
+    println!(
+        "  Current heap: {:>8} bytes  ({:.1} KB)",
+        create_current,
+        create_current as f64 / 1024.0
+    );
+    println!(
+        "  Struct size (conn+io): {:>7} bytes each",
+        size_of::<TlsConnection<C>>() + size_of::<TestTlsIo>()
+    );
     println!();
 
     let snap = HeapSnapshot::begin();
@@ -702,12 +777,18 @@ fn measure_tls_connection_only() {
     assert!(server.is_active());
 
     println!("--- TLS handshake ---");
-    println!("  Peak heap during handshake: {:>8} bytes  ({:.1} KB)", hs_peak, hs_peak as f64 / 1024.0);
+    println!(
+        "  Peak heap during handshake: {:>8} bytes  ({:.1} KB)",
+        hs_peak,
+        hs_peak as f64 / 1024.0
+    );
     println!();
 
     // Measure post-handshake steady state
     let snap = HeapSnapshot::begin();
-    client.send_app_data(&mut cio.as_io(), b"Hello from client").unwrap();
+    client
+        .send_app_data(&mut cio.as_io(), b"Hello from client")
+        .unwrap();
     tls_transfer(&mut client, &mut cio, &mut server, &mut sio);
     while let Some(_) = server.poll_event() {}
     let mut recv = [0u8; 256];
@@ -717,7 +798,11 @@ fn measure_tls_connection_only() {
     let data_peak = snap.peak_above_baseline();
 
     println!("--- TLS app data exchange ---");
-    println!("  Peak heap:    {:>8} bytes  ({:.1} KB)", data_peak, data_peak as f64 / 1024.0);
+    println!(
+        "  Peak heap:    {:>8} bytes  ({:.1} KB)",
+        data_peak,
+        data_peak as f64 / 1024.0
+    );
     println!();
 }
 
@@ -796,8 +881,16 @@ fn measure_target_config() {
     let established_peak = snap_established.peak_above_baseline();
 
     println!("--- Phase 1: 1 HTTPS/1.1 + 2 H2/TLS + 2 established H3 ---");
-    println!("  Current heap: {:>8} bytes  ({:.1} KB)", established_current, established_current as f64 / 1024.0);
-    println!("  Peak heap:    {:>8} bytes  ({:.1} KB)", established_peak, established_peak as f64 / 1024.0);
+    println!(
+        "  Current heap: {:>8} bytes  ({:.1} KB)",
+        established_current,
+        established_current as f64 / 1024.0
+    );
+    println!(
+        "  Peak heap:    {:>8} bytes  ({:.1} KB)",
+        established_peak,
+        established_peak as f64 / 1024.0
+    );
     println!();
 
     // Now add 2 more H3 connections in handshaking state
@@ -850,37 +943,60 @@ fn measure_target_config() {
     let handshaking_peak = snap.peak_above_baseline();
 
     println!("--- Phase 2: +2 handshaking H3 connections (additional) ---");
-    println!("  Peak heap:    {:>8} bytes  ({:.1} KB)", handshaking_peak, handshaking_peak as f64 / 1024.0);
+    println!(
+        "  Peak heap:    {:>8} bytes  ({:.1} KB)",
+        handshaking_peak,
+        handshaking_peak as f64 / 1024.0
+    );
     println!();
 
     // Grand total
     let total_current = ALLOC.current();
     println!("--- Combined state (all connections live) ---");
-    println!("  Total heap:   {:>8} bytes  ({:.1} KB)", total_current, total_current as f64 / 1024.0);
-    println!("  Total peak:   {:>8} bytes  ({:.1} KB)", established_peak + handshaking_peak, (established_peak + handshaking_peak) as f64 / 1024.0);
+    println!(
+        "  Total heap:   {:>8} bytes  ({:.1} KB)",
+        total_current,
+        total_current as f64 / 1024.0
+    );
+    println!(
+        "  Total peak:   {:>8} bytes  ({:.1} KB)",
+        established_peak + handshaking_peak,
+        (established_peak + handshaking_peak) as f64 / 1024.0
+    );
 
     // Struct sizes (note: this test runs BOTH client and server per connection)
-    let struct_both =
-        size_of::<TestHttps1Client>() + size_of::<TestHttps1Server>()
+    let struct_both = size_of::<TestHttps1Client>()
+        + size_of::<TestHttps1Server>()
         + 2 * (size_of::<TestH2TlsClient>() + size_of::<TestH2TlsServer>())
         + 4 * (size_of::<H3Client<C>>() + size_of::<H3Server<C>>())
         + size_of::<HandshakePool<C, 4>>();
-    let struct_server_only =
-        size_of::<TestHttps1Server>()
+    let struct_server_only = size_of::<TestHttps1Server>()
         + 2 * size_of::<TestH2TlsServer>()
         + 4 * size_of::<H3Server<C>>()
         + size_of::<HandshakePool<C, 4>>();
 
-    println!("  Struct (both sides): {:>8} bytes  ({:.1} KB)", struct_both, struct_both as f64 / 1024.0);
-    println!("  Struct (server only): {:>7} bytes  ({:.1} KB)", struct_server_only, struct_server_only as f64 / 1024.0);
-    println!("  Both+heap:   {:>8} bytes  ({:.1} KB)",
+    println!(
+        "  Struct (both sides): {:>8} bytes  ({:.1} KB)",
+        struct_both,
+        struct_both as f64 / 1024.0
+    );
+    println!(
+        "  Struct (server only): {:>7} bytes  ({:.1} KB)",
+        struct_server_only,
+        struct_server_only as f64 / 1024.0
+    );
+    println!(
+        "  Both+heap:   {:>8} bytes  ({:.1} KB)",
         struct_both + total_current,
-        (struct_both + total_current) as f64 / 1024.0);
+        (struct_both + total_current) as f64 / 1024.0
+    );
     // Rough server-only estimate: heap is ~half (only one side's buffers)
     let server_heap_est = total_current / 2;
-    println!("  Server+heap (est): {:>5} bytes  ({:.1} KB)",
+    println!(
+        "  Server+heap (est): {:>5} bytes  ({:.1} KB)",
         struct_server_only + server_heap_est,
-        (struct_server_only + server_heap_est) as f64 / 1024.0);
+        (struct_server_only + server_heap_est) as f64 / 1024.0
+    );
     println!();
     println!("  NOTE: heap includes BOTH client and server allocations.");
     println!("  A real server would use roughly half the heap.");
@@ -889,11 +1005,17 @@ fn measure_target_config() {
     let goal: usize = 102400;
     let combined = struct_server_only + server_heap_est;
     if combined <= goal {
-        println!("  UNDER BUDGET by {} bytes ({:.1} KB)",
-            goal - combined, (goal - combined) as f64 / 1024.0);
+        println!(
+            "  UNDER BUDGET by {} bytes ({:.1} KB)",
+            goal - combined,
+            (goal - combined) as f64 / 1024.0
+        );
     } else {
-        println!("  OVER BUDGET by {} bytes ({:.1} KB)",
-            combined - goal, (combined - goal) as f64 / 1024.0);
+        println!(
+            "  OVER BUDGET by {} bytes ({:.1} KB)",
+            combined - goal,
+            (combined - goal) as f64 / 1024.0
+        );
     }
     println!("============================================================");
 }

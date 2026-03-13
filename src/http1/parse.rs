@@ -148,8 +148,15 @@ fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
 
 /// Trim optional whitespace (OWS: SP / HTAB) from both ends.
 fn trim_ows(buf: &[u8]) -> &[u8] {
-    let start = buf.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(buf.len());
-    let end = buf.iter().rposition(|&b| b != b' ' && b != b'\t').map(|i| i + 1).unwrap_or(start);
+    let start = buf
+        .iter()
+        .position(|&b| b != b' ' && b != b'\t')
+        .unwrap_or(buf.len());
+    let end = buf
+        .iter()
+        .rposition(|&b| b != b' ' && b != b'\t')
+        .map(|i| i + 1)
+        .unwrap_or(start);
     &buf[start..end]
 }
 

@@ -19,15 +19,12 @@
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let protocol = args.get(1).map(|s| s.as_str()).unwrap_or("h2");
-    let addr = args
-        .get(2)
-        .map(|s| s.as_str())
-        .unwrap_or(match protocol {
-            "h3" => "127.0.0.1:4433",
-            "h2" => "127.0.0.1:8443",
-            "h1" => "127.0.0.1:8080",
-            _ => "127.0.0.1:8443",
-        });
+    let addr = args.get(2).map(|s| s.as_str()).unwrap_or(match protocol {
+        "h3" => "127.0.0.1:4433",
+        "h2" => "127.0.0.1:8443",
+        "h1" => "127.0.0.1:8080",
+        _ => "127.0.0.1:8443",
+    });
 
     println!("milli-http omni-client");
     println!("======================");
@@ -55,8 +52,8 @@ fn run_h1(addr: &str) {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
-    use milli_http::http1::client::Http1Client;
     use milli_http::http1::Http1Event;
+    use milli_http::http1::client::Http1Client;
 
     let mut stream = TcpStream::connect(addr).expect("failed to connect");
     stream.set_nonblocking(true).expect("set_nonblocking");
@@ -64,7 +61,8 @@ fn run_h1(addr: &str) {
 
     let mut http1 = Http1Client::<8192, 2048, 4096>::new();
 
-    let stream_id = http1.send_request("GET", "/", addr, &[], true)
+    let stream_id = http1
+        .send_request("GET", "/", addr, &[], true)
         .expect("send_request failed");
     println!("[h1] sent GET / (stream {stream_id})");
 
@@ -76,10 +74,18 @@ fn run_h1(addr: &str) {
 
         let mut recv_buf = [0u8; 8192];
         match stream.read(&mut recv_buf) {
-            Ok(0) => { println!("[conn] server disconnected"); return; }
-            Ok(n) => { http1.feed_data(&recv_buf[..n]).ok(); }
+            Ok(0) => {
+                println!("[conn] server disconnected");
+                return;
+            }
+            Ok(n) => {
+                http1.feed_data(&recv_buf[..n]).ok();
+            }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => { eprintln!("[conn] read error: {e}"); return; }
+            Err(e) => {
+                eprintln!("[conn] read error: {e}");
+                return;
+            }
         }
 
         while let Some(event) = http1.poll_event() {
@@ -89,11 +95,13 @@ fn run_h1(addr: &str) {
                 }
                 Http1Event::Headers(sid) => {
                     print!("[h1] response headers:");
-                    http1.recv_headers(sid, |name, value| {
-                        let n = core::str::from_utf8(name).unwrap_or("<bin>");
-                        let v = core::str::from_utf8(value).unwrap_or("<bin>");
-                        print!(" {n}={v}");
-                    }).ok();
+                    http1
+                        .recv_headers(sid, |name, value| {
+                            let n = core::str::from_utf8(name).unwrap_or("<bin>");
+                            let v = core::str::from_utf8(value).unwrap_or("<bin>");
+                            print!(" {n}={v}");
+                        })
+                        .ok();
                     println!();
                 }
                 Http1Event::Data(sid) => {
@@ -124,8 +132,8 @@ fn run_h2(addr: &str) {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
-    use milli_http::h2::client::H2Client;
     use milli_http::h2::H2Event;
+    use milli_http::h2::client::H2Client;
 
     let mut stream = TcpStream::connect(addr).expect("failed to connect");
     stream.set_nonblocking(true).expect("set_nonblocking");
@@ -144,10 +152,18 @@ fn run_h2(addr: &str) {
 
         let mut recv_buf = [0u8; 65535];
         match stream.read(&mut recv_buf) {
-            Ok(0) => { println!("[conn] server disconnected"); return; }
-            Ok(n) => { h2.feed_data(&recv_buf[..n]).ok(); }
+            Ok(0) => {
+                println!("[conn] server disconnected");
+                return;
+            }
+            Ok(n) => {
+                h2.feed_data(&recv_buf[..n]).ok();
+            }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => { eprintln!("[conn] read error: {e}"); return; }
+            Err(e) => {
+                eprintln!("[conn] read error: {e}");
+                return;
+            }
         }
 
         while let Some(event) = h2.poll_event() {
@@ -162,7 +178,8 @@ fn run_h2(addr: &str) {
                         let n = core::str::from_utf8(name).unwrap_or("<bin>");
                         let v = core::str::from_utf8(value).unwrap_or("<bin>");
                         print!(" {n}={v}");
-                    }).ok();
+                    })
+                    .ok();
                     println!();
                 }
                 H2Event::Data(sid) => {
@@ -183,7 +200,8 @@ fn run_h2(addr: &str) {
         }
 
         if handshake_done && !request_sent {
-            let sid = h2.send_request("GET", "/", addr, &[], true)
+            let sid = h2
+                .send_request("GET", "/", addr, &[], true)
                 .expect("send_request");
             println!("[h2] sent GET /");
             request_stream = Some(sid);
@@ -202,16 +220,18 @@ fn run_h2(addr: &str) {
 fn run_h3(addr: &str) {
     use std::net::UdpSocket;
 
+    use milli_http::Rng;
     use milli_http::connection::{Connection, HandshakePool};
     use milli_http::crypto::rustcrypto::Aes128GcmProvider;
-    use milli_http::h3::client::H3Client;
     use milli_http::h3::H3Event;
+    use milli_http::h3::client::H3Client;
     use milli_http::tls::transport_params::TransportParams;
-    use milli_http::Rng;
 
     struct StdRng(rand::rngs::ThreadRng);
     impl StdRng {
-        fn new() -> Self { Self(rand::rng()) }
+        fn new() -> Self {
+            Self(rand::rng())
+        }
     }
     impl Rng for StdRng {
         fn fill(&mut self, buf: &mut [u8]) {
@@ -221,9 +241,8 @@ fn run_h3(addr: &str) {
     }
 
     let epoch = std::time::Instant::now();
-    let to_micros = |now: std::time::Instant| -> u64 {
-        now.duration_since(epoch).as_micros() as u64
-    };
+    let to_micros =
+        |now: std::time::Instant| -> u64 { now.duration_since(epoch).as_micros() as u64 };
 
     let socket = UdpSocket::bind("0.0.0.0:0").expect("bind UDP");
     socket.connect(addr).expect("connect UDP");
@@ -236,8 +255,14 @@ fn run_h3(addr: &str) {
     let mut pool = HandshakePool::<Aes128GcmProvider, 4>::new();
     let tp = TransportParams::default_params();
     let conn = Connection::<Aes128GcmProvider>::client(
-        Aes128GcmProvider, "localhost", &[b"h3"], tp, &mut rng, &mut pool,
-    ).expect("create client");
+        Aes128GcmProvider,
+        "localhost",
+        &[b"h3"],
+        tp,
+        &mut rng,
+        &mut pool,
+    )
+    .expect("create client");
 
     let mut h3: H3Client<Aes128GcmProvider> = H3Client::new(conn);
     let mut request_sent = false;
@@ -250,14 +275,18 @@ fn run_h3(addr: &str) {
         let mut tx_buf = [0u8; 65535];
         loop {
             match h3.poll_transmit(&mut tx_buf, now, &mut pool) {
-                Some(tx) => { let _ = socket.send(tx.data); }
+                Some(tx) => {
+                    let _ = socket.send(tx.data);
+                }
                 None => break,
             }
         }
 
         if let Some(deadline) = h3.next_timeout() {
             let now = to_micros(std::time::Instant::now());
-            if now >= deadline { h3.handle_timeout(now); }
+            if now >= deadline {
+                h3.handle_timeout(now);
+            }
         }
 
         let mut recv_buf = [0u8; 65535];
@@ -268,7 +297,10 @@ fn run_h3(addr: &str) {
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => { eprintln!("[recv] error: {e}"); return; }
+            Err(e) => {
+                eprintln!("[recv] error: {e}");
+                return;
+            }
         }
 
         while let Some(event) = h3.poll_event(&mut scratch) {
@@ -280,7 +312,8 @@ fn run_h3(addr: &str) {
                         let n = core::str::from_utf8(name).unwrap_or("<bin>");
                         let v = core::str::from_utf8(value).unwrap_or("<bin>");
                         print!(" {n}={v}");
-                    }).ok();
+                    })
+                    .ok();
                     println!();
                 }
                 H3Event::Data(sid) => {
@@ -296,7 +329,10 @@ fn run_h3(addr: &str) {
                         return;
                     }
                 }
-                H3Event::GoAway(_) => { println!("[h3] GOAWAY"); return; }
+                H3Event::GoAway(_) => {
+                    println!("[h3] GOAWAY");
+                    return;
+                }
                 _ => {}
             }
         }

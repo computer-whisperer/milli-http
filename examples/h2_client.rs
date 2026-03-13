@@ -13,8 +13,8 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-use milli_http::h2::client::H2Client;
 use milli_http::h2::H2Event;
+use milli_http::h2::client::H2Client;
 
 fn main() {
     println!("milli-http HTTP/2 client (h2c)");

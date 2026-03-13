@@ -14,12 +14,12 @@ use std::net::TcpListener;
 
 use milli_http::crypto::ed25519::{build_ed25519_cert_der, ed25519_public_key_from_seed};
 use milli_http::crypto::rustcrypto::Aes128GcmProvider;
-use milli_http::http1::server::Http1Server;
 use milli_http::http1::Http1Event;
-use milli_http::tcp_tls::server::TlsServer;
+use milli_http::http1::server::Http1Server;
 use milli_http::tcp_tls::connection::TlsEvent;
-use milli_http::tls::handshake::ServerTlsConfig;
+use milli_http::tcp_tls::server::TlsServer;
 use milli_http::tls::TransportParams;
+use milli_http::tls::handshake::ServerTlsConfig;
 
 fn main() {
     println!("milli-http HTTPS/1.1 server");
@@ -29,8 +29,8 @@ fn main() {
     let seed: [u8; 32] = [0x42u8; 32];
     let pk = ed25519_public_key_from_seed(&seed);
     let mut cert_buf = [0u8; 512];
-    let cert_len = build_ed25519_cert_der(&pk, &mut cert_buf)
-        .expect("failed to build certificate DER");
+    let cert_len =
+        build_ed25519_cert_der(&pk, &mut cert_buf).expect("failed to build certificate DER");
     let cert_der: &'static [u8] = Box::leak(cert_buf[..cert_len].to_vec().into_boxed_slice());
     let private_key_der: &'static [u8] = Box::leak(Box::new(seed));
     println!("[init] generated self-signed Ed25519 certificate ({cert_len} bytes)");
@@ -130,16 +130,18 @@ fn main() {
                     let mut path = [0u8; 256];
                     let mut path_len = 0usize;
 
-                    http1.recv_headers(stream_id, |name, value| {
-                        let n = core::str::from_utf8(name).unwrap_or("<bin>");
-                        let v = core::str::from_utf8(value).unwrap_or("<bin>");
-                        println!("[http1]   {n}: {v}");
-                        if name == b":path" {
-                            let copy = value.len().min(path.len());
-                            path[..copy].copy_from_slice(&value[..copy]);
-                            path_len = copy;
-                        }
-                    }).ok();
+                    http1
+                        .recv_headers(stream_id, |name, value| {
+                            let n = core::str::from_utf8(name).unwrap_or("<bin>");
+                            let v = core::str::from_utf8(value).unwrap_or("<bin>");
+                            println!("[http1]   {n}: {v}");
+                            if name == b":path" {
+                                let copy = value.len().min(path.len());
+                                path[..copy].copy_from_slice(&value[..copy]);
+                                path_len = copy;
+                            }
+                        })
+                        .ok();
 
                     let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("/");
                     route_http1(&mut http1, stream_id, path_str);
@@ -176,31 +178,52 @@ fn route_http1(http1: &mut Http1Server<40960, 2048, 4096>, stream_id: u64, path:
         "/status/404" => {
             let body = b"Not Found";
             let cl = body.len().to_string();
-            http1.send_response(stream_id, 404, &[
-                (b"content-type", b"text/plain"),
-                (b"content-length", cl.as_bytes()),
-                (b"server", b"milli-http"),
-            ], false).ok();
+            http1
+                .send_response(
+                    stream_id,
+                    404,
+                    &[
+                        (b"content-type", b"text/plain"),
+                        (b"content-length", cl.as_bytes()),
+                        (b"server", b"milli-http"),
+                    ],
+                    false,
+                )
+                .ok();
             http1.send_body(stream_id, body, true).ok();
         }
         "/large" => {
             let body = [b'X'; 32768];
             let cl = "32768";
-            http1.send_response(stream_id, 200, &[
-                (b"content-type", b"application/octet-stream"),
-                (b"content-length", cl.as_bytes()),
-                (b"server", b"milli-http"),
-            ], false).ok();
+            http1
+                .send_response(
+                    stream_id,
+                    200,
+                    &[
+                        (b"content-type", b"application/octet-stream"),
+                        (b"content-length", cl.as_bytes()),
+                        (b"server", b"milli-http"),
+                    ],
+                    false,
+                )
+                .ok();
             http1.send_body(stream_id, &body, true).ok();
         }
         _ => {
             let body = b"<!DOCTYPE html>\n<html>\n<head><title>milli-http</title></head>\n<body>\n<h1>Hello from milli-http!</h1>\n<p>You are connected via HTTPS/1.1.</p>\n</body>\n</html>\n";
             let cl = body.len().to_string();
-            http1.send_response(stream_id, 200, &[
-                (b"content-type", b"text/html"),
-                (b"content-length", cl.as_bytes()),
-                (b"server", b"milli-http"),
-            ], false).ok();
+            http1
+                .send_response(
+                    stream_id,
+                    200,
+                    &[
+                        (b"content-type", b"text/html"),
+                        (b"content-length", cl.as_bytes()),
+                        (b"server", b"milli-http"),
+                    ],
+                    false,
+                )
+                .ok();
             http1.send_body(stream_id, body, true).ok();
         }
     }

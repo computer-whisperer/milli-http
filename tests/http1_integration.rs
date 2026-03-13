@@ -99,9 +99,7 @@ fn http1_get_request_response() {
     // Server receives request.
     let events = drain_events_server(&mut server);
     assert!(
-        events
-            .iter()
-            .any(|ev| matches!(ev, Http1Event::Headers(_))),
+        events.iter().any(|ev| matches!(ev, Http1Event::Headers(_))),
         "server should receive Request event"
     );
 
@@ -109,12 +107,10 @@ fn http1_get_request_response() {
     let mut method = Vec::new();
     let mut path = Vec::new();
     server
-        .recv_headers(1, |name, value| {
-            match name {
-                b":method" => method.extend_from_slice(value),
-                b":path" => path.extend_from_slice(value),
-                _ => {}
-            }
+        .recv_headers(1, |name, value| match name {
+            b":method" => method.extend_from_slice(value),
+            b":path" => path.extend_from_slice(value),
+            _ => {}
         })
         .unwrap();
     assert_eq!(method, b"GET");
@@ -164,12 +160,10 @@ fn http1_get_request_response() {
     let mut status = Vec::new();
     let mut ct = Vec::new();
     client
-        .recv_headers(stream_id, |name, value| {
-            match name {
-                b":status" => status.extend_from_slice(value),
-                b"content-type" => ct.extend_from_slice(value),
-                _ => {}
-            }
+        .recv_headers(stream_id, |name, value| match name {
+            b":status" => status.extend_from_slice(value),
+            b"content-type" => ct.extend_from_slice(value),
+            _ => {}
         })
         .unwrap();
     assert_eq!(status, b"200");
@@ -219,12 +213,10 @@ fn http1_post_with_body() {
     let mut method = Vec::new();
     let mut ct = Vec::new();
     server
-        .recv_headers(1, |name, value| {
-            match name {
-                b":method" => method.extend_from_slice(value),
-                b"content-type" => ct.extend_from_slice(value),
-                _ => {}
-            }
+        .recv_headers(1, |name, value| match name {
+            b":method" => method.extend_from_slice(value),
+            b"content-type" => ct.extend_from_slice(value),
+            _ => {}
         })
         .unwrap();
     assert_eq!(method, b"POST");
@@ -257,7 +249,11 @@ fn http1_post_with_body() {
 
     // Client reads response.
     let events = drain_events_client(&mut client);
-    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Finished(sid) if *sid == stream_id)));
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, Http1Event::Finished(sid) if *sid == stream_id))
+    );
 
     let mut status = Vec::new();
     client
@@ -301,7 +297,9 @@ fn http1_keep_alive_sequential() {
         // Server receives request.
         let events = drain_events_server(&mut server);
         assert!(
-            events.iter().any(|ev| matches!(ev, Http1Event::Headers(sid) if *sid == i)),
+            events
+                .iter()
+                .any(|ev| matches!(ev, Http1Event::Headers(sid) if *sid == i)),
             "server should receive request {i}"
         );
 
@@ -309,12 +307,10 @@ fn http1_keep_alive_sequential() {
         let mut method = Vec::new();
         let mut recv_path = Vec::new();
         server
-            .recv_headers(i, |name, value| {
-                match name {
-                    b":method" => method.extend_from_slice(value),
-                    b":path" => recv_path.extend_from_slice(value),
-                    _ => {}
-                }
+            .recv_headers(i, |name, value| match name {
+                b":method" => method.extend_from_slice(value),
+                b":path" => recv_path.extend_from_slice(value),
+                _ => {}
             })
             .unwrap();
         assert_eq!(method, b"GET");
@@ -332,7 +328,9 @@ fn http1_keep_alive_sequential() {
         // Client receives and consumes response.
         let events = drain_events_client(&mut client);
         assert!(
-            events.iter().any(|ev| matches!(ev, Http1Event::Headers(sid) if *sid == stream_id)),
+            events
+                .iter()
+                .any(|ev| matches!(ev, Http1Event::Headers(sid) if *sid == stream_id)),
             "client should receive response headers for request {i}"
         );
 
@@ -401,7 +399,11 @@ fn http1_connection_close() {
 
     // Client receives response.
     let events = drain_events_client(&mut client);
-    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Finished(sid) if *sid == stream_id)));
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, Http1Event::Finished(sid) if *sid == stream_id))
+    );
 
     let mut status = Vec::new();
     client
@@ -583,15 +585,13 @@ fn http1_multiple_headers() {
     let mut x_b = Vec::new();
     let mut x_c = Vec::new();
     server
-        .recv_headers(1, |name, value| {
-            match name {
-                b"Accept" => accept.extend_from_slice(value),
-                b"Accept-Language" => accept_lang.extend_from_slice(value),
-                b"X-Custom-A" => x_a.extend_from_slice(value),
-                b"X-Custom-B" => x_b.extend_from_slice(value),
-                b"X-Custom-C" => x_c.extend_from_slice(value),
-                _ => {}
-            }
+        .recv_headers(1, |name, value| match name {
+            b"Accept" => accept.extend_from_slice(value),
+            b"Accept-Language" => accept_lang.extend_from_slice(value),
+            b"X-Custom-A" => x_a.extend_from_slice(value),
+            b"X-Custom-B" => x_b.extend_from_slice(value),
+            b"X-Custom-C" => x_c.extend_from_slice(value),
+            _ => {}
         })
         .unwrap();
 
@@ -619,19 +619,21 @@ fn http1_multiple_headers() {
 
     // Client reads response headers.
     let events = drain_events_client(&mut client);
-    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Headers(sid) if *sid == stream_id)));
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, Http1Event::Headers(sid) if *sid == stream_id))
+    );
 
     let mut status = Vec::new();
     let mut resp_a = Vec::new();
     let mut resp_b = Vec::new();
     client
-        .recv_headers(stream_id, |name, value| {
-            match name {
-                b":status" => status.extend_from_slice(value),
-                b"X-Response-A" => resp_a.extend_from_slice(value),
-                b"X-Response-B" => resp_b.extend_from_slice(value),
-                _ => {}
-            }
+        .recv_headers(stream_id, |name, value| match name {
+            b":status" => status.extend_from_slice(value),
+            b"X-Response-A" => resp_a.extend_from_slice(value),
+            b"X-Response-B" => resp_b.extend_from_slice(value),
+            _ => {}
         })
         .unwrap();
 
@@ -671,7 +673,11 @@ fn http1_different_status_codes() {
         transfer_to_client(&mut server, &mut client);
 
         let events = drain_events_client(&mut client);
-        assert!(events.iter().any(|ev| matches!(ev, Http1Event::Headers(sid) if *sid == stream_id)));
+        assert!(
+            events
+                .iter()
+                .any(|ev| matches!(ev, Http1Event::Headers(sid) if *sid == stream_id))
+        );
 
         let mut status = Vec::new();
         client
@@ -725,10 +731,7 @@ fn http1_head_request() {
         .send_response(
             1,
             200,
-            &[
-                (b"content-type", b"text/plain"),
-                (b"content-length", b"0"),
-            ],
+            &[(b"content-type", b"text/plain"), (b"content-length", b"0")],
             false,
         )
         .unwrap();
@@ -737,7 +740,11 @@ fn http1_head_request() {
 
     // Client receives response with no body.
     let events = drain_events_client(&mut client);
-    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Headers(sid) if *sid == stream_id)));
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, Http1Event::Headers(sid) if *sid == stream_id))
+    );
     assert!(
         events
             .iter()
@@ -813,7 +820,11 @@ fn http1_post_then_get_keep_alive() {
 
     // Client consumes response 1.
     let events = drain_events_client(&mut client);
-    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Headers(sid) if *sid == sid1)));
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, Http1Event::Headers(sid) if *sid == sid1))
+    );
 
     let mut status = Vec::new();
     client
@@ -850,12 +861,10 @@ fn http1_post_then_get_keep_alive() {
     let mut method2 = Vec::new();
     let mut path2 = Vec::new();
     server
-        .recv_headers(2, |name, value| {
-            match name {
-                b":method" => method2.extend_from_slice(value),
-                b":path" => path2.extend_from_slice(value),
-                _ => {}
-            }
+        .recv_headers(2, |name, value| match name {
+            b":method" => method2.extend_from_slice(value),
+            b":path" => path2.extend_from_slice(value),
+            _ => {}
         })
         .unwrap();
     assert_eq!(method2, b"GET");
@@ -871,7 +880,11 @@ fn http1_post_then_get_keep_alive() {
 
     // Client receives response 2.
     let events = drain_events_client(&mut client);
-    assert!(events.iter().any(|ev| matches!(ev, Http1Event::Headers(sid) if *sid == sid2)));
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, Http1Event::Headers(sid) if *sid == sid2))
+    );
 
     let mut status2 = Vec::new();
     client

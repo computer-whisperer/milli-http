@@ -11,63 +11,234 @@ pub struct StaticEntry {
 
 /// The full QPACK static table (99 entries).
 pub static STATIC_TABLE: [StaticEntry; 99] = [
-    StaticEntry { name: b":authority", value: b"" },                                 // 0
-    StaticEntry { name: b":path", value: b"/" },                                     // 1
-    StaticEntry { name: b"age", value: b"0" },                                       // 2
-    StaticEntry { name: b"content-disposition", value: b"" },                         // 3
-    StaticEntry { name: b"content-length", value: b"0" },                             // 4
-    StaticEntry { name: b"cookie", value: b"" },                                     // 5
-    StaticEntry { name: b"date", value: b"" },                                       // 6
-    StaticEntry { name: b"etag", value: b"" },                                       // 7
-    StaticEntry { name: b"if-modified-since", value: b"" },                           // 8
-    StaticEntry { name: b"if-none-match", value: b"" },                               // 9
-    StaticEntry { name: b"last-modified", value: b"" },                               // 10
-    StaticEntry { name: b"link", value: b"" },                                       // 11
-    StaticEntry { name: b"location", value: b"" },                                   // 12
-    StaticEntry { name: b"referer", value: b"" },                                    // 13
-    StaticEntry { name: b"set-cookie", value: b"" },                                 // 14
-    StaticEntry { name: b":method", value: b"CONNECT" },                             // 15
-    StaticEntry { name: b":method", value: b"DELETE" },                              // 16
-    StaticEntry { name: b":method", value: b"GET" },                                 // 17
-    StaticEntry { name: b":method", value: b"HEAD" },                                // 18
-    StaticEntry { name: b":method", value: b"OPTIONS" },                             // 19
-    StaticEntry { name: b":method", value: b"POST" },                                // 20
-    StaticEntry { name: b":method", value: b"PUT" },                                 // 21
-    StaticEntry { name: b":scheme", value: b"http" },                                // 22
-    StaticEntry { name: b":scheme", value: b"https" },                               // 23
-    StaticEntry { name: b":status", value: b"103" },                                 // 24
-    StaticEntry { name: b":status", value: b"200" },                                 // 25
-    StaticEntry { name: b":status", value: b"304" },                                 // 26
-    StaticEntry { name: b":status", value: b"404" },                                 // 27
-    StaticEntry { name: b":status", value: b"503" },                                 // 28
-    StaticEntry { name: b"accept", value: b"*/*" },                                  // 29
-    StaticEntry { name: b"accept", value: b"application/dns-message" },               // 30
-    StaticEntry { name: b"accept-encoding", value: b"gzip, deflate, br" },            // 31
-    StaticEntry { name: b"accept-ranges", value: b"bytes" },                          // 32
-    StaticEntry { name: b"access-control-allow-headers", value: b"cache-control" },   // 33
-    StaticEntry { name: b"access-control-allow-headers", value: b"content-type" },    // 34
-    StaticEntry { name: b"access-control-allow-origin", value: b"*" },                // 35
-    StaticEntry { name: b"cache-control", value: b"max-age=0" },                      // 36
-    StaticEntry { name: b"cache-control", value: b"max-age=2592000" },                // 37
-    StaticEntry { name: b"cache-control", value: b"max-age=604800" },                 // 38
-    StaticEntry { name: b"cache-control", value: b"no-cache" },                       // 39
-    StaticEntry { name: b"cache-control", value: b"no-store" },                       // 40
-    StaticEntry { name: b"cache-control", value: b"public, max-age=31536000" },       // 41
-    StaticEntry { name: b"content-encoding", value: b"br" },                          // 42
-    StaticEntry { name: b"content-encoding", value: b"gzip" },                        // 43
-    StaticEntry { name: b"content-type", value: b"application/dns-message" },         // 44
-    StaticEntry { name: b"content-type", value: b"application/javascript" },          // 45
-    StaticEntry { name: b"content-type", value: b"application/json" },                // 46
-    StaticEntry { name: b"content-type", value: b"application/x-www-form-urlencoded" }, // 47
-    StaticEntry { name: b"content-type", value: b"image/gif" },                       // 48
-    StaticEntry { name: b"content-type", value: b"image/jpeg" },                      // 49
-    StaticEntry { name: b"content-type", value: b"image/png" },                       // 50
-    StaticEntry { name: b"content-type", value: b"text/css" },                        // 51
-    StaticEntry { name: b"content-type", value: b"text/html; charset=utf-8" },        // 52
-    StaticEntry { name: b"content-type", value: b"text/plain" },                      // 53
-    StaticEntry { name: b"content-type", value: b"text/plain;charset=utf-8" },        // 54
-    StaticEntry { name: b"range", value: b"bytes=0-" },                              // 55
-    StaticEntry { name: b"strict-transport-security", value: b"max-age=31536000" },   // 56
+    StaticEntry {
+        name: b":authority",
+        value: b"",
+    }, // 0
+    StaticEntry {
+        name: b":path",
+        value: b"/",
+    }, // 1
+    StaticEntry {
+        name: b"age",
+        value: b"0",
+    }, // 2
+    StaticEntry {
+        name: b"content-disposition",
+        value: b"",
+    }, // 3
+    StaticEntry {
+        name: b"content-length",
+        value: b"0",
+    }, // 4
+    StaticEntry {
+        name: b"cookie",
+        value: b"",
+    }, // 5
+    StaticEntry {
+        name: b"date",
+        value: b"",
+    }, // 6
+    StaticEntry {
+        name: b"etag",
+        value: b"",
+    }, // 7
+    StaticEntry {
+        name: b"if-modified-since",
+        value: b"",
+    }, // 8
+    StaticEntry {
+        name: b"if-none-match",
+        value: b"",
+    }, // 9
+    StaticEntry {
+        name: b"last-modified",
+        value: b"",
+    }, // 10
+    StaticEntry {
+        name: b"link",
+        value: b"",
+    }, // 11
+    StaticEntry {
+        name: b"location",
+        value: b"",
+    }, // 12
+    StaticEntry {
+        name: b"referer",
+        value: b"",
+    }, // 13
+    StaticEntry {
+        name: b"set-cookie",
+        value: b"",
+    }, // 14
+    StaticEntry {
+        name: b":method",
+        value: b"CONNECT",
+    }, // 15
+    StaticEntry {
+        name: b":method",
+        value: b"DELETE",
+    }, // 16
+    StaticEntry {
+        name: b":method",
+        value: b"GET",
+    }, // 17
+    StaticEntry {
+        name: b":method",
+        value: b"HEAD",
+    }, // 18
+    StaticEntry {
+        name: b":method",
+        value: b"OPTIONS",
+    }, // 19
+    StaticEntry {
+        name: b":method",
+        value: b"POST",
+    }, // 20
+    StaticEntry {
+        name: b":method",
+        value: b"PUT",
+    }, // 21
+    StaticEntry {
+        name: b":scheme",
+        value: b"http",
+    }, // 22
+    StaticEntry {
+        name: b":scheme",
+        value: b"https",
+    }, // 23
+    StaticEntry {
+        name: b":status",
+        value: b"103",
+    }, // 24
+    StaticEntry {
+        name: b":status",
+        value: b"200",
+    }, // 25
+    StaticEntry {
+        name: b":status",
+        value: b"304",
+    }, // 26
+    StaticEntry {
+        name: b":status",
+        value: b"404",
+    }, // 27
+    StaticEntry {
+        name: b":status",
+        value: b"503",
+    }, // 28
+    StaticEntry {
+        name: b"accept",
+        value: b"*/*",
+    }, // 29
+    StaticEntry {
+        name: b"accept",
+        value: b"application/dns-message",
+    }, // 30
+    StaticEntry {
+        name: b"accept-encoding",
+        value: b"gzip, deflate, br",
+    }, // 31
+    StaticEntry {
+        name: b"accept-ranges",
+        value: b"bytes",
+    }, // 32
+    StaticEntry {
+        name: b"access-control-allow-headers",
+        value: b"cache-control",
+    }, // 33
+    StaticEntry {
+        name: b"access-control-allow-headers",
+        value: b"content-type",
+    }, // 34
+    StaticEntry {
+        name: b"access-control-allow-origin",
+        value: b"*",
+    }, // 35
+    StaticEntry {
+        name: b"cache-control",
+        value: b"max-age=0",
+    }, // 36
+    StaticEntry {
+        name: b"cache-control",
+        value: b"max-age=2592000",
+    }, // 37
+    StaticEntry {
+        name: b"cache-control",
+        value: b"max-age=604800",
+    }, // 38
+    StaticEntry {
+        name: b"cache-control",
+        value: b"no-cache",
+    }, // 39
+    StaticEntry {
+        name: b"cache-control",
+        value: b"no-store",
+    }, // 40
+    StaticEntry {
+        name: b"cache-control",
+        value: b"public, max-age=31536000",
+    }, // 41
+    StaticEntry {
+        name: b"content-encoding",
+        value: b"br",
+    }, // 42
+    StaticEntry {
+        name: b"content-encoding",
+        value: b"gzip",
+    }, // 43
+    StaticEntry {
+        name: b"content-type",
+        value: b"application/dns-message",
+    }, // 44
+    StaticEntry {
+        name: b"content-type",
+        value: b"application/javascript",
+    }, // 45
+    StaticEntry {
+        name: b"content-type",
+        value: b"application/json",
+    }, // 46
+    StaticEntry {
+        name: b"content-type",
+        value: b"application/x-www-form-urlencoded",
+    }, // 47
+    StaticEntry {
+        name: b"content-type",
+        value: b"image/gif",
+    }, // 48
+    StaticEntry {
+        name: b"content-type",
+        value: b"image/jpeg",
+    }, // 49
+    StaticEntry {
+        name: b"content-type",
+        value: b"image/png",
+    }, // 50
+    StaticEntry {
+        name: b"content-type",
+        value: b"text/css",
+    }, // 51
+    StaticEntry {
+        name: b"content-type",
+        value: b"text/html; charset=utf-8",
+    }, // 52
+    StaticEntry {
+        name: b"content-type",
+        value: b"text/plain",
+    }, // 53
+    StaticEntry {
+        name: b"content-type",
+        value: b"text/plain;charset=utf-8",
+    }, // 54
+    StaticEntry {
+        name: b"range",
+        value: b"bytes=0-",
+    }, // 55
+    StaticEntry {
+        name: b"strict-transport-security",
+        value: b"max-age=31536000",
+    }, // 56
     StaticEntry {
         name: b"strict-transport-security",
         value: b"max-age=31536000; includesubdomains",
@@ -76,20 +247,62 @@ pub static STATIC_TABLE: [StaticEntry; 99] = [
         name: b"strict-transport-security",
         value: b"max-age=31536000; includesubdomains; preload",
     }, // 58
-    StaticEntry { name: b"vary", value: b"accept-encoding" },                        // 59
-    StaticEntry { name: b"vary", value: b"origin" },                                 // 60
-    StaticEntry { name: b"x-content-type-options", value: b"nosniff" },               // 61
-    StaticEntry { name: b"x-xss-protection", value: b"1; mode=block" },               // 62
-    StaticEntry { name: b":status", value: b"100" },                                 // 63
-    StaticEntry { name: b":status", value: b"204" },                                 // 64
-    StaticEntry { name: b":status", value: b"206" },                                 // 65
-    StaticEntry { name: b":status", value: b"302" },                                 // 66
-    StaticEntry { name: b":status", value: b"400" },                                 // 67
-    StaticEntry { name: b":status", value: b"403" },                                 // 68
-    StaticEntry { name: b":status", value: b"421" },                                 // 69
-    StaticEntry { name: b":status", value: b"425" },                                 // 70
-    StaticEntry { name: b":status", value: b"500" },                                 // 71
-    StaticEntry { name: b"accept-language", value: b"" },                            // 72
+    StaticEntry {
+        name: b"vary",
+        value: b"accept-encoding",
+    }, // 59
+    StaticEntry {
+        name: b"vary",
+        value: b"origin",
+    }, // 60
+    StaticEntry {
+        name: b"x-content-type-options",
+        value: b"nosniff",
+    }, // 61
+    StaticEntry {
+        name: b"x-xss-protection",
+        value: b"1; mode=block",
+    }, // 62
+    StaticEntry {
+        name: b":status",
+        value: b"100",
+    }, // 63
+    StaticEntry {
+        name: b":status",
+        value: b"204",
+    }, // 64
+    StaticEntry {
+        name: b":status",
+        value: b"206",
+    }, // 65
+    StaticEntry {
+        name: b":status",
+        value: b"302",
+    }, // 66
+    StaticEntry {
+        name: b":status",
+        value: b"400",
+    }, // 67
+    StaticEntry {
+        name: b":status",
+        value: b"403",
+    }, // 68
+    StaticEntry {
+        name: b":status",
+        value: b"421",
+    }, // 69
+    StaticEntry {
+        name: b":status",
+        value: b"425",
+    }, // 70
+    StaticEntry {
+        name: b":status",
+        value: b"500",
+    }, // 71
+    StaticEntry {
+        name: b"accept-language",
+        value: b"",
+    }, // 72
     StaticEntry {
         name: b"access-control-allow-credentials",
         value: b"FALSE",
@@ -98,36 +311,102 @@ pub static STATIC_TABLE: [StaticEntry; 99] = [
         name: b"access-control-allow-credentials",
         value: b"TRUE",
     }, // 74
-    StaticEntry { name: b"access-control-allow-headers", value: b"*" },              // 75
-    StaticEntry { name: b"access-control-allow-methods", value: b"get" },             // 76
+    StaticEntry {
+        name: b"access-control-allow-headers",
+        value: b"*",
+    }, // 75
+    StaticEntry {
+        name: b"access-control-allow-methods",
+        value: b"get",
+    }, // 76
     StaticEntry {
         name: b"access-control-allow-methods",
         value: b"get, post, options",
     }, // 77
-    StaticEntry { name: b"access-control-allow-methods", value: b"options" },         // 78
-    StaticEntry { name: b"access-control-expose-headers", value: b"content-length" }, // 79
-    StaticEntry { name: b"access-control-request-headers", value: b"content-type" },  // 80
-    StaticEntry { name: b"access-control-request-method", value: b"get" },            // 81
-    StaticEntry { name: b"access-control-request-method", value: b"post" },           // 82
-    StaticEntry { name: b"alt-svc", value: b"clear" },                               // 83
-    StaticEntry { name: b"authorization", value: b"" },                              // 84
+    StaticEntry {
+        name: b"access-control-allow-methods",
+        value: b"options",
+    }, // 78
+    StaticEntry {
+        name: b"access-control-expose-headers",
+        value: b"content-length",
+    }, // 79
+    StaticEntry {
+        name: b"access-control-request-headers",
+        value: b"content-type",
+    }, // 80
+    StaticEntry {
+        name: b"access-control-request-method",
+        value: b"get",
+    }, // 81
+    StaticEntry {
+        name: b"access-control-request-method",
+        value: b"post",
+    }, // 82
+    StaticEntry {
+        name: b"alt-svc",
+        value: b"clear",
+    }, // 83
+    StaticEntry {
+        name: b"authorization",
+        value: b"",
+    }, // 84
     StaticEntry {
         name: b"content-security-policy",
         value: b"script-src 'none'; object-src 'none'; base-uri 'none'",
     }, // 85
-    StaticEntry { name: b"early-data", value: b"1" },                                // 86
-    StaticEntry { name: b"expect-ct", value: b"" },                                  // 87
-    StaticEntry { name: b"forwarded", value: b"" },                                  // 88
-    StaticEntry { name: b"if-range", value: b"" },                                   // 89
-    StaticEntry { name: b"origin", value: b"" },                                     // 90
-    StaticEntry { name: b"purpose", value: b"prefetch" },                            // 91
-    StaticEntry { name: b"server", value: b"" },                                     // 92
-    StaticEntry { name: b"timing-allow-origin", value: b"*" },                        // 93
-    StaticEntry { name: b"upgrade-insecure-requests", value: b"1" },                  // 94
-    StaticEntry { name: b"user-agent", value: b"" },                                 // 95
-    StaticEntry { name: b"x-forwarded-for", value: b"" },                            // 96
-    StaticEntry { name: b"x-frame-options", value: b"deny" },                         // 97
-    StaticEntry { name: b"x-frame-options", value: b"sameorigin" },                   // 98
+    StaticEntry {
+        name: b"early-data",
+        value: b"1",
+    }, // 86
+    StaticEntry {
+        name: b"expect-ct",
+        value: b"",
+    }, // 87
+    StaticEntry {
+        name: b"forwarded",
+        value: b"",
+    }, // 88
+    StaticEntry {
+        name: b"if-range",
+        value: b"",
+    }, // 89
+    StaticEntry {
+        name: b"origin",
+        value: b"",
+    }, // 90
+    StaticEntry {
+        name: b"purpose",
+        value: b"prefetch",
+    }, // 91
+    StaticEntry {
+        name: b"server",
+        value: b"",
+    }, // 92
+    StaticEntry {
+        name: b"timing-allow-origin",
+        value: b"*",
+    }, // 93
+    StaticEntry {
+        name: b"upgrade-insecure-requests",
+        value: b"1",
+    }, // 94
+    StaticEntry {
+        name: b"user-agent",
+        value: b"",
+    }, // 95
+    StaticEntry {
+        name: b"x-forwarded-for",
+        value: b"",
+    }, // 96
+    StaticEntry {
+        name: b"x-frame-options",
+        value: b"deny",
+    }, // 97
+    StaticEntry {
+        name: b"x-frame-options",
+        value: b"sameorigin",
+    }, // 98
 ];
 
 /// Result of a static table lookup.

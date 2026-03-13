@@ -9,8 +9,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::task::{Context, Poll};
 
-use crate::crypto::CryptoProvider;
 use crate::connection::HandshakePoolAccess;
+use crate::crypto::CryptoProvider;
 use crate::transport::{Address, Rng, TcpAccept, TcpStream, UdpSocket};
 
 use super::{ConnId, ServerEvent, ServerManager};
@@ -37,8 +37,21 @@ struct PendingUdpTx<A> {
 ///
 /// Drives TCP accept, TCP read/write, and UDP recv/send, forwarding
 /// everything through the pure-logic manager.
-pub struct ServerRunner<'a, C, L, U, R, A, const BUF: usize = 18432, const CRYPTO_BUF: usize = 4096, const MAX_STREAMS: usize = 4, const SENT_PER_SPACE: usize = 16, const MAX_CIDS: usize = 2, const STREAM_BUF: usize = 256, const SEND_QUEUE: usize = 4>
-where
+pub struct ServerRunner<
+    'a,
+    C,
+    L,
+    U,
+    R,
+    A,
+    const BUF: usize = 18432,
+    const CRYPTO_BUF: usize = 4096,
+    const MAX_STREAMS: usize = 4,
+    const SENT_PER_SPACE: usize = 16,
+    const MAX_CIDS: usize = 2,
+    const STREAM_BUF: usize = 256,
+    const SEND_QUEUE: usize = 4,
+> where
     C: CryptoProvider + Clone + 'static,
     C::Hkdf: Default,
     L: TcpAccept,
@@ -46,7 +59,8 @@ where
     R: Rng,
     A: Address,
 {
-    pub manager: ServerManager<C, A, BUF, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>,
+    pub manager:
+        ServerManager<C, A, BUF, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>,
     tcp_listener: &'a mut L,
     udp_socket: &'a mut U,
     rng: &'a mut R,
@@ -55,8 +69,36 @@ where
     pending_udp_tx: Option<PendingUdpTx<A>>,
 }
 
-impl<'a, C, L, U, R, A, const BUF: usize, const CRYPTO_BUF: usize, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>
-    ServerRunner<'a, C, L, U, R, A, BUF, CRYPTO_BUF, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>
+impl<
+    'a,
+    C,
+    L,
+    U,
+    R,
+    A,
+    const BUF: usize,
+    const CRYPTO_BUF: usize,
+    const MAX_STREAMS: usize,
+    const SENT_PER_SPACE: usize,
+    const MAX_CIDS: usize,
+    const STREAM_BUF: usize,
+    const SEND_QUEUE: usize,
+>
+    ServerRunner<
+        'a,
+        C,
+        L,
+        U,
+        R,
+        A,
+        BUF,
+        CRYPTO_BUF,
+        MAX_STREAMS,
+        SENT_PER_SPACE,
+        MAX_CIDS,
+        STREAM_BUF,
+        SEND_QUEUE,
+    >
 where
     C: CryptoProvider + Clone + 'static,
     C::Hkdf: Default,
@@ -67,7 +109,16 @@ where
 {
     /// Create a new server runner.
     pub fn new(
-        manager: ServerManager<C, A, BUF, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>,
+        manager: ServerManager<
+            C,
+            A,
+            BUF,
+            MAX_STREAMS,
+            SENT_PER_SPACE,
+            MAX_CIDS,
+            STREAM_BUF,
+            SEND_QUEUE,
+        >,
         tcp_listener: &'a mut L,
         udp_socket: &'a mut U,
         rng: &'a mut R,
@@ -102,11 +153,7 @@ where
     /// cooperative executors. The runner only schedules a re-poll when there
     /// is buffered output still waiting to be flushed (i.e., actual pending
     /// work), not merely because input was consumed.
-    pub fn poll_event(
-        &mut self,
-        cx: &mut Context<'_>,
-        now: u64,
-    ) -> Poll<ServerEvent> {
+    pub fn poll_event(&mut self, cx: &mut Context<'_>, now: u64) -> Poll<ServerEvent> {
         let mut has_pending_output = false;
 
         // 1. Accept new TCP connections (accept at most one per cycle to
@@ -164,7 +211,10 @@ where
         for conn in &mut self.tcp_conns {
             // 3a. Flush pending partial write from previous poll cycle.
             while conn.write_offset < conn.pending_write.len() {
-                match conn.stream.poll_write(cx, &conn.pending_write[conn.write_offset..]) {
+                match conn
+                    .stream
+                    .poll_write(cx, &conn.pending_write[conn.write_offset..])
+                {
                     Poll::Ready(Ok(n)) => {
                         conn.write_offset += n;
                     }
@@ -245,7 +295,10 @@ where
 
         // 5. Write pending UDP transmits.
         if let Some(pending) = &self.pending_udp_tx {
-            match self.udp_socket.poll_send_to(cx, &pending.data, &pending.addr) {
+            match self
+                .udp_socket
+                .poll_send_to(cx, &pending.data, &pending.addr)
+            {
                 Poll::Ready(Ok(())) => {
                     self.pending_udp_tx = None;
                 }
@@ -260,9 +313,10 @@ where
         if self.pending_udp_tx.is_none() {
             let mut tx_buf = [0u8; 1500];
             loop {
-                if let Some((addr, len)) = self.manager.udp_poll_transmit::<CRYPTO_BUF>(
-                    &mut tx_buf, now, self.pool,
-                ) {
+                if let Some((addr, len)) =
+                    self.manager
+                        .udp_poll_transmit::<CRYPTO_BUF>(&mut tx_buf, now, self.pool)
+                {
                     match self.udp_socket.poll_send_to(cx, &tx_buf[..len], &addr) {
                         Poll::Ready(Ok(())) => {}
                         Poll::Ready(Err(_)) => {}

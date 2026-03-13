@@ -42,8 +42,8 @@ impl AeadTrait for Aes128GcmAead {
         buf: &mut [u8],
         payload_len: usize,
     ) -> Result<usize, Error> {
-        use aes_gcm::aead::AeadInPlace;
         use aes_gcm::Nonce;
+        use aes_gcm::aead::AeadInPlace;
 
         if nonce.len() != 12 {
             return Err(Error::Crypto);
@@ -174,8 +174,8 @@ pub struct AesHeaderProtection {
 
 impl HeaderProtection for AesHeaderProtection {
     fn mask(&self, sample: &[u8]) -> [u8; 5] {
-        use aes::cipher::BlockEncrypt;
         use aes::Block;
+        use aes::cipher::BlockEncrypt;
 
         let mut block = Block::clone_from_slice(&sample[..16]);
         self.cipher.encrypt_block(&mut block);
@@ -215,8 +215,7 @@ impl HeaderProtection for ChaChaHeaderProtection {
 
         // Build a ChaCha20 cipher with the specified counter.
         // The chacha20 crate starts at counter 0; we need to seek to the right position.
-        let mut cipher =
-            chacha20::ChaCha20::new((&self.key).into(), (&nonce_bytes).into());
+        let mut cipher = chacha20::ChaCha20::new((&self.key).into(), (&nonce_bytes).into());
         // Seek to the counter position
         use chacha20::cipher::StreamCipherSeek;
         cipher.seek(counter as u64 * 64);

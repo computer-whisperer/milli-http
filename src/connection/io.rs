@@ -1,11 +1,16 @@
 //! I/O buffers for QUIC stream data.
 
-use super::{StreamSendEntry, StreamRecvBuf};
+use super::{StreamRecvBuf, StreamSendEntry};
 
 /// Borrowed stream I/O buffers for a QUIC connection.
 ///
 /// Callers provide these on every method that reads or writes stream data.
-pub struct QuicStreamIo<'a, const MAX_STREAMS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize> {
+pub struct QuicStreamIo<
+    'a,
+    const MAX_STREAMS: usize,
+    const STREAM_BUF: usize,
+    const SEND_QUEUE: usize,
+> {
     #[cfg(not(feature = "alloc"))]
     pub send_queue: &'a mut heapless::Vec<StreamSendEntry<STREAM_BUF>, SEND_QUEUE>,
     #[cfg(feature = "alloc")]

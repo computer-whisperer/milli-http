@@ -21,7 +21,9 @@ pub struct Buf<const N: usize> {
 #[cfg(feature = "alloc")]
 impl<const N: usize> Buf<N> {
     pub const fn new() -> Self {
-        Self { inner: alloc::vec::Vec::new() }
+        Self {
+            inner: alloc::vec::Vec::new(),
+        }
     }
 
     #[inline]
@@ -122,7 +124,9 @@ impl<const N: usize> AsMut<[u8]> for Buf<N> {
 /// Common operations on byte buffers, abstracting over heapless and alloc backends.
 pub trait BufExt {
     fn buf_len(&self) -> usize;
-    fn buf_is_empty(&self) -> bool { self.buf_len() == 0 }
+    fn buf_is_empty(&self) -> bool {
+        self.buf_len() == 0
+    }
     fn buf_clear(&mut self);
     fn buf_truncate(&mut self, len: usize);
     fn buf_extend_from_slice(&mut self, data: &[u8]) -> Result<(), crate::error::Error>;
@@ -134,21 +138,33 @@ pub trait BufExt {
 }
 
 impl<const N: usize> BufExt for heapless::Vec<u8, N> {
-    fn buf_len(&self) -> usize { self.len() }
-    fn buf_clear(&mut self) { self.clear(); }
-    fn buf_truncate(&mut self, len: usize) { self.truncate(len); }
+    fn buf_len(&self) -> usize {
+        self.len()
+    }
+    fn buf_clear(&mut self) {
+        self.clear();
+    }
+    fn buf_truncate(&mut self, len: usize) {
+        self.truncate(len);
+    }
     fn buf_extend_from_slice(&mut self, data: &[u8]) -> Result<(), crate::error::Error> {
-        self.extend_from_slice(data).map_err(|_| crate::error::Error::BufferTooSmall {
-            needed: self.len() + data.len(),
-        })
+        self.extend_from_slice(data)
+            .map_err(|_| crate::error::Error::BufferTooSmall {
+                needed: self.len() + data.len(),
+            })
     }
     fn buf_push(&mut self, byte: u8) -> Result<(), crate::error::Error> {
-        self.push(byte).map_err(|_| crate::error::Error::BufferTooSmall {
-            needed: self.len() + 1,
-        })
+        self.push(byte)
+            .map_err(|_| crate::error::Error::BufferTooSmall {
+                needed: self.len() + 1,
+            })
     }
-    fn buf_as_slice(&self) -> &[u8] { self }
-    fn buf_as_mut_slice(&mut self) -> &mut [u8] { self }
+    fn buf_as_slice(&self) -> &[u8] {
+        self
+    }
+    fn buf_as_mut_slice(&mut self) -> &mut [u8] {
+        self
+    }
     fn buf_drain_front(&mut self, n: usize) {
         self.copy_within(n.., 0);
         self.truncate(self.len() - n);
@@ -157,21 +173,33 @@ impl<const N: usize> BufExt for heapless::Vec<u8, N> {
 
 #[cfg(feature = "alloc")]
 impl<const N: usize> BufExt for Buf<N> {
-    fn buf_len(&self) -> usize { self.len() }
-    fn buf_clear(&mut self) { self.clear(); }
-    fn buf_truncate(&mut self, len: usize) { self.truncate(len); }
+    fn buf_len(&self) -> usize {
+        self.len()
+    }
+    fn buf_clear(&mut self) {
+        self.clear();
+    }
+    fn buf_truncate(&mut self, len: usize) {
+        self.truncate(len);
+    }
     fn buf_extend_from_slice(&mut self, data: &[u8]) -> Result<(), crate::error::Error> {
-        self.extend_from_slice(data).map_err(|_| crate::error::Error::BufferTooSmall {
-            needed: self.inner.len() + data.len(),
-        })
+        self.extend_from_slice(data)
+            .map_err(|_| crate::error::Error::BufferTooSmall {
+                needed: self.inner.len() + data.len(),
+            })
     }
     fn buf_push(&mut self, byte: u8) -> Result<(), crate::error::Error> {
-        self.push(byte).map_err(|_| crate::error::Error::BufferTooSmall {
-            needed: self.inner.len() + 1,
-        })
+        self.push(byte)
+            .map_err(|_| crate::error::Error::BufferTooSmall {
+                needed: self.inner.len() + 1,
+            })
     }
-    fn buf_as_slice(&self) -> &[u8] { self }
-    fn buf_as_mut_slice(&mut self) -> &mut [u8] { self }
+    fn buf_as_slice(&self) -> &[u8] {
+        self
+    }
+    fn buf_as_mut_slice(&mut self) -> &mut [u8] {
+        self
+    }
     fn buf_drain_front(&mut self, n: usize) {
         self.inner.copy_within(n.., 0);
         self.inner.truncate(self.inner.len() - n);

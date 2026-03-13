@@ -28,8 +28,13 @@ pub struct H2TlsClient<
     app_send: Buf<BUF>,
 }
 
-impl<C: CryptoProvider, const BUF: usize, const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
-    H2TlsClient<C, BUF, MAX_STREAMS, HDRBUF, DATABUF>
+impl<
+    C: CryptoProvider,
+    const BUF: usize,
+    const MAX_STREAMS: usize,
+    const HDRBUF: usize,
+    const DATABUF: usize,
+> H2TlsClient<C, BUF, MAX_STREAMS, HDRBUF, DATABUF>
 where
     C::Hkdf: Default,
 {
@@ -166,11 +171,7 @@ where
     }
 
     /// Read response body.
-    pub fn recv_body(
-        &mut self,
-        stream_id: u64,
-        buf: &mut [u8],
-    ) -> Result<(usize, bool), Error> {
+    pub fn recv_body(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
         let mut h2_io: H2Io<'_, BUF> = H2Io {
             recv_buf: &mut self.app_recv,
             send_buf: &mut self.app_send,
@@ -253,8 +254,13 @@ pub struct H2TlsServer<
     app_send: Buf<BUF>,
 }
 
-impl<C: CryptoProvider, const BUF: usize, const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
-    H2TlsServer<C, BUF, MAX_STREAMS, HDRBUF, DATABUF>
+impl<
+    C: CryptoProvider,
+    const BUF: usize,
+    const MAX_STREAMS: usize,
+    const HDRBUF: usize,
+    const DATABUF: usize,
+> H2TlsServer<C, BUF, MAX_STREAMS, HDRBUF, DATABUF>
 where
     C::Hkdf: Default,
 {
@@ -350,11 +356,7 @@ where
     }
 
     /// Read request body.
-    pub fn recv_body(
-        &mut self,
-        stream_id: u64,
-        buf: &mut [u8],
-    ) -> Result<(usize, bool), Error> {
+    pub fn recv_body(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
         let mut h2_io: H2Io<'_, BUF> = H2Io {
             recv_buf: &mut self.app_recv,
             send_buf: &mut self.app_send,
@@ -384,7 +386,8 @@ where
             recv_buf: &mut self.app_recv,
             send_buf: &mut self.app_send,
         };
-        self.h2.send_headers(&mut h2_io, stream_id, &all_headers, end_stream)
+        self.h2
+            .send_headers(&mut h2_io, stream_id, &all_headers, end_stream)
     }
 
     /// Send response body data.
@@ -487,8 +490,13 @@ fn map_h2_event(ev: H2Event) -> crate::http::server_conn::HttpEvent {
     }
 }
 
-impl<C: CryptoProvider, const BUF: usize, const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
-    crate::http::server_conn::HttpServerConn for H2TlsServer<C, BUF, MAX_STREAMS, HDRBUF, DATABUF>
+impl<
+    C: CryptoProvider,
+    const BUF: usize,
+    const MAX_STREAMS: usize,
+    const HDRBUF: usize,
+    const DATABUF: usize,
+> crate::http::server_conn::HttpServerConn for H2TlsServer<C, BUF, MAX_STREAMS, HDRBUF, DATABUF>
 where
     C::Hkdf: Default,
 {
@@ -518,12 +526,7 @@ where
         H2TlsServer::send_response(self, stream_id, status, headers, end_stream)
     }
 
-    fn send_body(
-        &mut self,
-        stream_id: u64,
-        data: &[u8],
-        end_stream: bool,
-    ) -> Result<usize, Error> {
+    fn send_body(&mut self, stream_id: u64, data: &[u8], end_stream: bool) -> Result<usize, Error> {
         H2TlsServer::send_body(self, stream_id, data, end_stream)
     }
 
@@ -552,8 +555,13 @@ where
     }
 }
 
-impl<C: CryptoProvider, const BUF: usize, const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
-    crate::http::server_conn::HttpServerConn for H2TlsClient<C, BUF, MAX_STREAMS, HDRBUF, DATABUF>
+impl<
+    C: CryptoProvider,
+    const BUF: usize,
+    const MAX_STREAMS: usize,
+    const HDRBUF: usize,
+    const DATABUF: usize,
+> crate::http::server_conn::HttpServerConn for H2TlsClient<C, BUF, MAX_STREAMS, HDRBUF, DATABUF>
 where
     C::Hkdf: Default,
 {
@@ -583,12 +591,7 @@ where
         Err(Error::InvalidState) // clients don't send responses
     }
 
-    fn send_body(
-        &mut self,
-        stream_id: u64,
-        data: &[u8],
-        end_stream: bool,
-    ) -> Result<usize, Error> {
+    fn send_body(&mut self, stream_id: u64, data: &[u8], end_stream: bool) -> Result<usize, Error> {
         H2TlsClient::send_body(self, stream_id, data, end_stream)
     }
 
@@ -727,13 +730,12 @@ mod tests {
         assert!(got_headers);
 
         // Server sends response
-        server.send_response(
-            request_sid,
-            200,
-            &[(b"content-type", b"text/plain")],
-            false,
-        ).unwrap();
-        server.send_body(request_sid, b"Hello from H2-TLS!", true).unwrap();
+        server
+            .send_response(request_sid, 200, &[(b"content-type", b"text/plain")], false)
+            .unwrap();
+        server
+            .send_body(request_sid, b"Hello from H2-TLS!", true)
+            .unwrap();
 
         // Transfer
         exchange(&mut client, &mut server);

@@ -167,7 +167,8 @@ where
             recv_buf: &mut self.app_recv,
             send_buf: &mut self.app_send,
         };
-        self.http.send_data(&mut http_io, stream_id, data, end_stream)
+        self.http
+            .send_data(&mut http_io, stream_id, data, end_stream)
     }
 
     /// Read response headers.
@@ -180,11 +181,7 @@ where
     }
 
     /// Read response body.
-    pub fn recv_body(
-        &mut self,
-        stream_id: u64,
-        buf: &mut [u8],
-    ) -> Result<(usize, bool), Error> {
+    pub fn recv_body(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
         self.http.recv_body(stream_id, buf)
     }
 
@@ -347,11 +344,7 @@ where
     }
 
     /// Read request body.
-    pub fn recv_body(
-        &mut self,
-        stream_id: u64,
-        buf: &mut [u8],
-    ) -> Result<(usize, bool), Error> {
+    pub fn recv_body(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
         self.http.recv_body(stream_id, buf)
     }
 
@@ -380,7 +373,8 @@ where
             recv_buf: &mut self.app_recv,
             send_buf: &mut self.app_send,
         };
-        self.http.send_headers(&mut http_io, stream_id, &all_headers, end_stream)
+        self.http
+            .send_headers(&mut http_io, stream_id, &all_headers, end_stream)
     }
 
     /// Send response body data.
@@ -397,7 +391,8 @@ where
             recv_buf: &mut self.app_recv,
             send_buf: &mut self.app_send,
         };
-        self.http.send_data(&mut http_io, stream_id, data, end_stream)
+        self.http
+            .send_data(&mut http_io, stream_id, data, end_stream)
     }
 
     /// Configure timeouts.
@@ -497,12 +492,7 @@ where
         Https1Server::send_response(self, stream_id, status, headers, end_stream)
     }
 
-    fn send_body(
-        &mut self,
-        stream_id: u64,
-        data: &[u8],
-        end_stream: bool,
-    ) -> Result<usize, Error> {
+    fn send_body(&mut self, stream_id: u64, data: &[u8], end_stream: bool) -> Result<usize, Error> {
         Https1Server::send_body(self, stream_id, data, end_stream)
     }
 
@@ -562,12 +552,7 @@ where
         Err(Error::InvalidState) // clients don't send responses
     }
 
-    fn send_body(
-        &mut self,
-        stream_id: u64,
-        data: &[u8],
-        end_stream: bool,
-    ) -> Result<usize, Error> {
+    fn send_body(&mut self, stream_id: u64, data: &[u8], end_stream: bool) -> Result<usize, Error> {
         Https1Client::send_body(self, stream_id, data, end_stream)
     }
 
@@ -718,21 +703,22 @@ mod tests {
 
         // Server reads request headers
         let mut method = heapless::Vec::<u8, 16>::new();
-        server.recv_headers(request_sid, |name, value| {
-            if name == b":method" {
-                let _ = method.extend_from_slice(value);
-            }
-        }).unwrap();
+        server
+            .recv_headers(request_sid, |name, value| {
+                if name == b":method" {
+                    let _ = method.extend_from_slice(value);
+                }
+            })
+            .unwrap();
         assert_eq!(method.as_slice(), b"GET");
 
         // Server sends response
-        server.send_response(
-            request_sid,
-            200,
-            &[(b"content-length", b"13")],
-            false,
-        ).unwrap();
-        server.send_body(request_sid, b"Hello, HTTPS!", true).unwrap();
+        server
+            .send_response(request_sid, 200, &[(b"content-length", b"13")], false)
+            .unwrap();
+        server
+            .send_body(request_sid, b"Hello, HTTPS!", true)
+            .unwrap();
 
         // Transfer server → client
         exchange(&mut client, &mut server);
@@ -755,11 +741,13 @@ mod tests {
 
         // Read status
         let mut status = heapless::Vec::<u8, 16>::new();
-        client.recv_headers(stream_id, |name, value| {
-            if name == b":status" {
-                let _ = status.extend_from_slice(value);
-            }
-        }).unwrap();
+        client
+            .recv_headers(stream_id, |name, value| {
+                if name == b":status" {
+                    let _ = status.extend_from_slice(value);
+                }
+            })
+            .unwrap();
         assert_eq!(status.as_slice(), b"200");
 
         // Read body

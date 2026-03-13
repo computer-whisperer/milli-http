@@ -274,8 +274,7 @@ pub fn build_ed25519_cert_der(public_key: &[u8; 32], out: &mut [u8]) -> Result<u
 
     // Find the public key location: after BIT STRING tag 0x03 0x21 0x00
     // in the SubjectPublicKeyInfo section. We search for the OID first.
-    let pubkey_offset = find_subsequence(&out[..total], &[0x03, 0x21, 0x00])
-        .ok_or(Error::Tls)? + 3;
+    let pubkey_offset = find_subsequence(&out[..total], &[0x03, 0x21, 0x00]).ok_or(Error::Tls)? + 3;
     out[pubkey_offset..pubkey_offset + 32].copy_from_slice(public_key);
 
     Ok(total)
@@ -363,10 +362,7 @@ mod tests {
 
         // Then the context string
         let context_str = b"TLS 1.3, server CertificateVerify";
-        assert_eq!(
-            &content[64..64 + context_str.len()],
-            context_str
-        );
+        assert_eq!(&content[64..64 + context_str.len()], context_str);
 
         // Then 0x00
         let sep_pos = 64 + context_str.len();

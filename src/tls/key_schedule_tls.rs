@@ -233,8 +233,13 @@ mod tests {
         let transcript_hash = [0xAA; 32];
         let mut client_hs = [0u8; 32];
         let mut server_hs = [0u8; 32];
-        ks.derive_handshake_traffic_secrets(&hkdf, &transcript_hash, &mut client_hs, &mut server_hs)
-            .unwrap();
+        ks.derive_handshake_traffic_secrets(
+            &hkdf,
+            &transcript_hash,
+            &mut client_hs,
+            &mut server_hs,
+        )
+        .unwrap();
 
         // Client and server secrets should be different
         assert_ne!(client_hs, server_hs);
@@ -276,8 +281,13 @@ mod tests {
         let transcript_hash = [0xAA; 32];
         let mut client_hs = [0u8; 32];
         let mut server_hs = [0u8; 32];
-        ks.derive_handshake_traffic_secrets(&hkdf, &transcript_hash, &mut client_hs, &mut server_hs)
-            .unwrap();
+        ks.derive_handshake_traffic_secrets(
+            &hkdf,
+            &transcript_hash,
+            &mut client_hs,
+            &mut server_hs,
+        )
+        .unwrap();
 
         // Derive finished key
         let mut finished_key = [0u8; 32];
@@ -457,8 +467,7 @@ mod tests {
         let server_hs_traffic =
             hex!("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38");
         let mut finished_key = [0u8; 32];
-        TlsKeySchedule::derive_finished_key(&hkdf, &server_hs_traffic, &mut finished_key)
-            .unwrap();
+        TlsKeySchedule::derive_finished_key(&hkdf, &server_hs_traffic, &mut finished_key).unwrap();
         assert_eq!(
             finished_key,
             hex!("008d3b66f816ea559f96b537e885c31fc068bf492c652f01f288a1d8cdc19fc8")
@@ -475,8 +484,7 @@ mod tests {
         let client_hs_traffic =
             hex!("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21");
         let mut finished_key = [0u8; 32];
-        TlsKeySchedule::derive_finished_key(&hkdf, &client_hs_traffic, &mut finished_key)
-            .unwrap();
+        TlsKeySchedule::derive_finished_key(&hkdf, &client_hs_traffic, &mut finished_key).unwrap();
         assert_eq!(
             finished_key,
             hex!("b80ad01015fb2f0bd65ff7d4da5d6bf83f84821d1f87fdc7d3c75b5a7b42d9c4")

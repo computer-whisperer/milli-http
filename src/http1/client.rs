@@ -1,8 +1,8 @@
 //! HTTP/1.1 client wrapper.
 
-use crate::error::Error;
 use super::connection::{Http1Connection, Http1Event};
 use super::io::Http1IoBufs;
+use crate::error::Error;
 
 /// HTTP/1.1 client — owns both the connection state and I/O buffers.
 pub struct Http1Client<
@@ -62,7 +62,8 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         for &(name, value) in extra_headers {
             let _ = headers.push((name, value));
         }
-        self.inner.open_stream(&mut self.io.as_io(), &headers, end_stream)
+        self.inner
+            .open_stream(&mut self.io.as_io(), &headers, end_stream)
     }
 
     /// Send body data on a stream.
@@ -72,7 +73,8 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         data: &[u8],
         end_stream: bool,
     ) -> Result<usize, Error> {
-        self.inner.send_data(&mut self.io.as_io(), stream_id, data, end_stream)
+        self.inner
+            .send_data(&mut self.io.as_io(), stream_id, data, end_stream)
     }
 
     /// Read response headers.
@@ -85,11 +87,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     }
 
     /// Read response body.
-    pub fn recv_body(
-        &mut self,
-        stream_id: u64,
-        buf: &mut [u8],
-    ) -> Result<(usize, bool), Error> {
+    pub fn recv_body(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
         self.inner.recv_body(stream_id, buf)
     }
 
@@ -124,8 +122,8 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     }
 }
 
-impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
-    Default for Http1Client<BUF, HDRBUF, DATABUF>
+impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize> Default
+    for Http1Client<BUF, HDRBUF, DATABUF>
 {
     fn default() -> Self {
         Self::new()
@@ -163,10 +161,22 @@ mod tests {
         let mut client = Http1Client::<8192>::new();
         // 3 pseudo + 17 user = 20, at the limit
         let hdrs: [(&[u8], &[u8]); 17] = [
-            (b"h1", b"v"), (b"h2", b"v"), (b"h3", b"v"), (b"h4", b"v"),
-            (b"h5", b"v"), (b"h6", b"v"), (b"h7", b"v"), (b"h8", b"v"),
-            (b"h9", b"v"), (b"h10", b"v"), (b"h11", b"v"), (b"h12", b"v"),
-            (b"h13", b"v"), (b"h14", b"v"), (b"h15", b"v"), (b"h16", b"v"),
+            (b"h1", b"v"),
+            (b"h2", b"v"),
+            (b"h3", b"v"),
+            (b"h4", b"v"),
+            (b"h5", b"v"),
+            (b"h6", b"v"),
+            (b"h7", b"v"),
+            (b"h8", b"v"),
+            (b"h9", b"v"),
+            (b"h10", b"v"),
+            (b"h11", b"v"),
+            (b"h12", b"v"),
+            (b"h13", b"v"),
+            (b"h14", b"v"),
+            (b"h15", b"v"),
+            (b"h16", b"v"),
             (b"h17", b"v"),
         ];
         let result = client.send_request("GET", "/", "example.com", &hdrs, true);
@@ -178,11 +188,24 @@ mod tests {
         let mut client = Http1Client::<8192>::new();
         // 3 pseudo + 18 user = 21, over the limit
         let hdrs: [(&[u8], &[u8]); 18] = [
-            (b"h1", b"v"), (b"h2", b"v"), (b"h3", b"v"), (b"h4", b"v"),
-            (b"h5", b"v"), (b"h6", b"v"), (b"h7", b"v"), (b"h8", b"v"),
-            (b"h9", b"v"), (b"h10", b"v"), (b"h11", b"v"), (b"h12", b"v"),
-            (b"h13", b"v"), (b"h14", b"v"), (b"h15", b"v"), (b"h16", b"v"),
-            (b"h17", b"v"), (b"h18", b"v"),
+            (b"h1", b"v"),
+            (b"h2", b"v"),
+            (b"h3", b"v"),
+            (b"h4", b"v"),
+            (b"h5", b"v"),
+            (b"h6", b"v"),
+            (b"h7", b"v"),
+            (b"h8", b"v"),
+            (b"h9", b"v"),
+            (b"h10", b"v"),
+            (b"h11", b"v"),
+            (b"h12", b"v"),
+            (b"h13", b"v"),
+            (b"h14", b"v"),
+            (b"h15", b"v"),
+            (b"h16", b"v"),
+            (b"h17", b"v"),
+            (b"h18", b"v"),
         ];
         let result = client.send_request("GET", "/", "example.com", &hdrs, true);
         assert_eq!(result, Err(crate::error::Error::TooManyHeaders));

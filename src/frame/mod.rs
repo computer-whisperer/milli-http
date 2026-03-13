@@ -107,26 +107,26 @@ pub struct ConnectionCloseFrame<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame<'a> {
-    Padding,                                    // 0x00
-    Ping,                                       // 0x01
-    Ack(AckFrame<'a>),                          // 0x02-0x03
-    ResetStream(ResetStreamFrame),              // 0x04
-    StopSending(StopSendingFrame),              // 0x05
-    Crypto(CryptoFrame<'a>),                    // 0x06
-    NewToken(NewTokenFrame<'a>),                // 0x07
-    Stream(StreamFrame<'a>),                    // 0x08-0x0f
-    MaxData(u64),                               // 0x10
-    MaxStreamData(MaxStreamDataFrame),          // 0x11
-    MaxStreams(MaxStreamsFrame),                 // 0x12-0x13
-    DataBlocked(u64),                           // 0x14
-    StreamDataBlocked(StreamDataBlockedFrame),  // 0x15
-    StreamsBlocked(StreamsBlockedFrame),        // 0x16-0x17
-    NewConnectionId(NewConnectionIdFrame<'a>),  // 0x18
-    RetireConnectionId(u64),                    // 0x19
-    PathChallenge([u8; 8]),                     // 0x1a
-    PathResponse([u8; 8]),                      // 0x1b
-    ConnectionClose(ConnectionCloseFrame<'a>),  // 0x1c-0x1d
-    HandshakeDone,                              // 0x1e
+    Padding,                                   // 0x00
+    Ping,                                      // 0x01
+    Ack(AckFrame<'a>),                         // 0x02-0x03
+    ResetStream(ResetStreamFrame),             // 0x04
+    StopSending(StopSendingFrame),             // 0x05
+    Crypto(CryptoFrame<'a>),                   // 0x06
+    NewToken(NewTokenFrame<'a>),               // 0x07
+    Stream(StreamFrame<'a>),                   // 0x08-0x0f
+    MaxData(u64),                              // 0x10
+    MaxStreamData(MaxStreamDataFrame),         // 0x11
+    MaxStreams(MaxStreamsFrame),               // 0x12-0x13
+    DataBlocked(u64),                          // 0x14
+    StreamDataBlocked(StreamDataBlockedFrame), // 0x15
+    StreamsBlocked(StreamsBlockedFrame),       // 0x16-0x17
+    NewConnectionId(NewConnectionIdFrame<'a>), // 0x18
+    RetireConnectionId(u64),                   // 0x19
+    PathChallenge([u8; 8]),                    // 0x1a
+    PathResponse([u8; 8]),                     // 0x1b
+    ConnectionClose(ConnectionCloseFrame<'a>), // 0x1c-0x1d
+    HandshakeDone,                             // 0x1e
 }
 
 // ---------------------------------------------------------------------------
@@ -832,10 +832,10 @@ mod tests {
         let cases = [
             // (offset, fin, expected lowest nibble)
             // base = 0x08, always set length (0x02)
-            (0u64, false, 0x0a_u8),        // 0x08 | 0x02
-            (0, true, 0x0b),               // 0x08 | 0x02 | 0x01
-            (1, false, 0x0e),              // 0x08 | 0x04 | 0x02
-            (1, true, 0x0f),               // 0x08 | 0x04 | 0x02 | 0x01
+            (0u64, false, 0x0a_u8), // 0x08 | 0x02
+            (0, true, 0x0b),        // 0x08 | 0x02 | 0x01
+            (1, false, 0x0e),       // 0x08 | 0x04 | 0x02
+            (1, true, 0x0f),        // 0x08 | 0x04 | 0x02 | 0x01
         ];
         for (offset, fin, expected_type) in cases {
             let frame = Frame::Stream(StreamFrame {

@@ -1,8 +1,8 @@
 //! HTTP/2 client wrapper.
 
-use crate::error::Error;
 use super::connection::{H2Connection, H2Event};
 use super::io::H2IoBufs;
+use crate::error::Error;
 
 /// HTTP/2 client — owns both the connection state and I/O buffers.
 pub struct H2Client<
@@ -62,7 +62,8 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         for &(name, value) in extra_headers {
             let _ = headers.push((name, value));
         }
-        self.inner.open_stream(&mut self.io.as_io(), &headers, end_stream)
+        self.inner
+            .open_stream(&mut self.io.as_io(), &headers, end_stream)
     }
 
     /// Send body data on a stream.
@@ -72,7 +73,8 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
         data: &[u8],
         end_stream: bool,
     ) -> Result<usize, Error> {
-        self.inner.send_data(&mut self.io.as_io(), stream_id, data, end_stream)
+        self.inner
+            .send_data(&mut self.io.as_io(), stream_id, data, end_stream)
     }
 
     /// Read response headers.
@@ -85,11 +87,7 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     }
 
     /// Read response body.
-    pub fn recv_body(
-        &mut self,
-        stream_id: u64,
-        buf: &mut [u8],
-    ) -> Result<(usize, bool), Error> {
+    pub fn recv_body(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
         self.inner.recv_body(&mut self.io.as_io(), stream_id, buf)
     }
 
@@ -124,8 +122,8 @@ impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATA
     }
 }
 
-impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
-    Default for H2Client<MAX_STREAMS, BUF, HDRBUF, DATABUF>
+impl<const MAX_STREAMS: usize, const BUF: usize, const HDRBUF: usize, const DATABUF: usize> Default
+    for H2Client<MAX_STREAMS, BUF, HDRBUF, DATABUF>
 {
     fn default() -> Self {
         Self::new()
@@ -155,10 +153,22 @@ mod tests {
     fn client_max_headers_succeeds() {
         let mut client = H2Client::<16, 16384>::new();
         let hdrs: [(&[u8], &[u8]); 16] = [
-            (b"h1", b"v"), (b"h2", b"v"), (b"h3", b"v"), (b"h4", b"v"),
-            (b"h5", b"v"), (b"h6", b"v"), (b"h7", b"v"), (b"h8", b"v"),
-            (b"h9", b"v"), (b"h10", b"v"), (b"h11", b"v"), (b"h12", b"v"),
-            (b"h13", b"v"), (b"h14", b"v"), (b"h15", b"v"), (b"h16", b"v"),
+            (b"h1", b"v"),
+            (b"h2", b"v"),
+            (b"h3", b"v"),
+            (b"h4", b"v"),
+            (b"h5", b"v"),
+            (b"h6", b"v"),
+            (b"h7", b"v"),
+            (b"h8", b"v"),
+            (b"h9", b"v"),
+            (b"h10", b"v"),
+            (b"h11", b"v"),
+            (b"h12", b"v"),
+            (b"h13", b"v"),
+            (b"h14", b"v"),
+            (b"h15", b"v"),
+            (b"h16", b"v"),
         ];
         let result = client.send_request("GET", "/", "example.com", &hdrs, true);
         assert!(result.is_ok());
@@ -168,10 +178,22 @@ mod tests {
     fn client_too_many_headers() {
         let mut client = H2Client::<16, 16384>::new();
         let hdrs: [(&[u8], &[u8]); 17] = [
-            (b"h1", b"v"), (b"h2", b"v"), (b"h3", b"v"), (b"h4", b"v"),
-            (b"h5", b"v"), (b"h6", b"v"), (b"h7", b"v"), (b"h8", b"v"),
-            (b"h9", b"v"), (b"h10", b"v"), (b"h11", b"v"), (b"h12", b"v"),
-            (b"h13", b"v"), (b"h14", b"v"), (b"h15", b"v"), (b"h16", b"v"),
+            (b"h1", b"v"),
+            (b"h2", b"v"),
+            (b"h3", b"v"),
+            (b"h4", b"v"),
+            (b"h5", b"v"),
+            (b"h6", b"v"),
+            (b"h7", b"v"),
+            (b"h8", b"v"),
+            (b"h9", b"v"),
+            (b"h10", b"v"),
+            (b"h11", b"v"),
+            (b"h12", b"v"),
+            (b"h13", b"v"),
+            (b"h14", b"v"),
+            (b"h15", b"v"),
+            (b"h16", b"v"),
             (b"h17", b"v"),
         ];
         let result = client.send_request("GET", "/", "example.com", &hdrs, true);
@@ -206,7 +228,9 @@ mod tests {
         }
 
         // Client sends request
-        let stream_id = client.send_request("GET", "/", "example.com", &[], true).unwrap();
+        let stream_id = client
+            .send_request("GET", "/", "example.com", &[], true)
+            .unwrap();
 
         // Exchange
         let mut buf = [0u8; 8192];
@@ -231,8 +255,17 @@ mod tests {
         assert!(got_headers);
 
         // Server sends response
-        server.send_response(header_stream, 200, &[(b"content-type", b"text/plain")], false).unwrap();
-        server.send_body(header_stream, b"Hello from H2!", true).unwrap();
+        server
+            .send_response(
+                header_stream,
+                200,
+                &[(b"content-type", b"text/plain")],
+                false,
+            )
+            .unwrap();
+        server
+            .send_body(header_stream, b"Hello from H2!", true)
+            .unwrap();
 
         // Exchange
         let mut buf2 = [0u8; 8192];

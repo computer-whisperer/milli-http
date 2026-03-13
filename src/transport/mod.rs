@@ -42,7 +42,11 @@ pub trait TcpStream {
     type Error;
 
     /// Attempt to read data. Registers waker if `Poll::Pending`.
-    fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, Self::Error>>;
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, Self::Error>>;
 
     /// Attempt to write data. Registers waker if `Poll::Pending`.
     fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>>;

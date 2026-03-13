@@ -168,7 +168,9 @@ mod tests {
     #[test]
     fn roundtrip_various_prefixes() {
         let prefixes = [1, 2, 3, 4, 5, 6, 7, 8];
-        let values = [0, 1, 5, 30, 31, 62, 63, 127, 128, 255, 256, 1337, 65535, 100_000];
+        let values = [
+            0, 1, 5, 30, 31, 62, 63, 127, 128, 255, 256, 1337, 65535, 100_000,
+        ];
 
         for &prefix in &prefixes {
             for &value in &values {

@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # no_std build — the core use case
+  build-no-std:
+    name: Build (no_std)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features:
+          - "rustcrypto-chacha"
+          - "rustcrypto-aes"
+          - "h3,rustcrypto-chacha"
+          - "h3,rustcrypto-aes"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --no-default-features --features "${{ matrix.features }}"
+
+  # Full server build (pulls in alloc + all protocols)
+  build-server:
+    name: Build (server)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --features "server,rustcrypto-chacha,std"
+
+  # Tests require std for test harness
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --features "rustcrypto-aes,rustcrypto-chacha,server,std"
+
+  # Clippy
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --features "rustcrypto-aes,rustcrypto-chacha,server,std" -- -W clippy::all
+
+  # Format check
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check

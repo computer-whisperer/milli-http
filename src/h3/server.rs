@@ -3,10 +3,10 @@
 //! Wraps a QUIC [`Connection`] as an HTTP/3 server capable of receiving
 //! requests and sending responses.
 
+use crate::Instant;
 use crate::connection::{Connection, HandshakePoolAccess, Transmit};
 use crate::crypto::CryptoProvider;
 use crate::error::Error;
-use crate::Instant;
 
 use super::connection::{H3Connection, H3Event};
 
@@ -25,11 +25,38 @@ pub struct H3Server<
     const H3_HDR_BUF: usize = 512,
     const H3_DATA_BUF: usize = 1024,
 > {
-    inner: H3Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, H3_HDR_BUF, H3_DATA_BUF>,
+    inner: H3Connection<
+        C,
+        MAX_STREAMS,
+        SENT_PER_SPACE,
+        MAX_CIDS,
+        STREAM_BUF,
+        SEND_QUEUE,
+        H3_HDR_BUF,
+        H3_DATA_BUF,
+    >,
 }
 
-impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize, const H3_HDR_BUF: usize, const H3_DATA_BUF: usize>
-    H3Server<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, H3_HDR_BUF, H3_DATA_BUF>
+impl<
+    C: CryptoProvider,
+    const MAX_STREAMS: usize,
+    const SENT_PER_SPACE: usize,
+    const MAX_CIDS: usize,
+    const STREAM_BUF: usize,
+    const SEND_QUEUE: usize,
+    const H3_HDR_BUF: usize,
+    const H3_DATA_BUF: usize,
+>
+    H3Server<
+        C,
+        MAX_STREAMS,
+        SENT_PER_SPACE,
+        MAX_CIDS,
+        STREAM_BUF,
+        SEND_QUEUE,
+        H3_HDR_BUF,
+        H3_DATA_BUF,
+    >
 where
     C::Hkdf: Default,
 {
@@ -63,11 +90,7 @@ where
     }
 
     /// Read request body data from a stream.
-    pub fn recv_body(
-        &mut self,
-        stream_id: u64,
-        buf: &mut [u8],
-    ) -> Result<(usize, bool), Error> {
+    pub fn recv_body(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
         self.inner.recv_body(stream_id, buf)
     }
 
@@ -135,7 +158,13 @@ where
     /// decryption, avoiding internal stack allocations. It must be at
     /// least as large as the biggest packet in the datagram (typically
     /// MTU-sized, e.g. 1500 bytes).
-    pub fn recv<const CRYPTO_BUF: usize>(&mut self, datagram: &[u8], scratch: &mut [u8], now: Instant, pool: &mut dyn HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<(), Error> {
+    pub fn recv<const CRYPTO_BUF: usize>(
+        &mut self,
+        datagram: &[u8],
+        scratch: &mut [u8],
+        now: Instant,
+        pool: &mut dyn HandshakePoolAccess<C, CRYPTO_BUF>,
+    ) -> Result<(), Error> {
         let mut sio = self.inner.sio_bufs.as_io();
         self.inner.quic.recv(&mut sio, datagram, scratch, now, pool)
     }
@@ -184,13 +213,37 @@ pub(crate) fn map_h3_event(ev: H3Event) -> crate::http::server_conn::HttpEvent {
         H3Event::Data(s) => HttpEvent::Data(s),
         H3Event::Finished(s) => HttpEvent::Finished(s),
         H3Event::GoAway(_) => HttpEvent::GoAway { error_code: 0 },
-        H3Event::StreamReset { stream_id, error_code } => HttpEvent::StreamReset { stream_id, error_code },
+        H3Event::StreamReset {
+            stream_id,
+            error_code,
+        } => HttpEvent::StreamReset {
+            stream_id,
+            error_code,
+        },
         H3Event::ConnectionClose { error_code } => HttpEvent::GoAway { error_code },
     }
 }
 
-impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize, const H3_HDR_BUF: usize, const H3_DATA_BUF: usize>
-    crate::http::server_conn::HttpServerConn for H3Server<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, H3_HDR_BUF, H3_DATA_BUF>
+impl<
+    C: CryptoProvider,
+    const MAX_STREAMS: usize,
+    const SENT_PER_SPACE: usize,
+    const MAX_CIDS: usize,
+    const STREAM_BUF: usize,
+    const SEND_QUEUE: usize,
+    const H3_HDR_BUF: usize,
+    const H3_DATA_BUF: usize,
+> crate::http::server_conn::HttpServerConn
+    for H3Server<
+        C,
+        MAX_STREAMS,
+        SENT_PER_SPACE,
+        MAX_CIDS,
+        STREAM_BUF,
+        SEND_QUEUE,
+        H3_HDR_BUF,
+        H3_DATA_BUF,
+    >
 where
     C::Hkdf: Default,
 {
@@ -220,12 +273,7 @@ where
         H3Server::send_response(self, stream_id, status, headers, end_stream)
     }
 
-    fn send_body(
-        &mut self,
-        stream_id: u64,
-        data: &[u8],
-        end_stream: bool,
-    ) -> Result<usize, Error> {
+    fn send_body(&mut self, stream_id: u64, data: &[u8], end_stream: bool) -> Result<usize, Error> {
         H3Server::send_body(self, stream_id, data, end_stream)
     }
 
@@ -253,4 +301,3 @@ where
         None // H3 uses UDP, not TCP
     }
 }
-

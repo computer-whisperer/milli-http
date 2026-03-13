@@ -175,8 +175,12 @@ struct PacketResult {
     pn: u64,
 }
 
-impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize>
-    Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>
+impl<
+    C: CryptoProvider,
+    const MAX_STREAMS: usize,
+    const SENT_PER_SPACE: usize,
+    const MAX_CIDS: usize,
+> Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>
 where
     C::Hkdf: Default,
 {
@@ -186,7 +190,14 @@ where
     /// decryption, avoiding internal stack allocations. It must be at
     /// least as large as the biggest packet in the datagram (typically
     /// MTU-sized, e.g. 1500 bytes).
-    pub fn recv<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(&mut self, sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>, datagram: &[u8], scratch: &mut [u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<(), Error> {
+    pub fn recv<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(
+        &mut self,
+        sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>,
+        datagram: &[u8],
+        scratch: &mut [u8],
+        now: Instant,
+        pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>,
+    ) -> Result<(), Error> {
         if matches!(self.state, ConnectionState::Closed) {
             return Err(Error::Closed);
         }
@@ -195,8 +206,9 @@ where
 
         // Anti-amplification: track bytes received (RFC 9000 section 8.1)
         if !self.address_validated {
-            self.anti_amplification_bytes_received =
-                self.anti_amplification_bytes_received.saturating_add(datagram.len());
+            self.anti_amplification_bytes_received = self
+                .anti_amplification_bytes_received
+                .saturating_add(datagram.len());
         }
 
         // Iterate over coalesced packets in the datagram.
@@ -231,8 +243,11 @@ where
             match result {
                 Ok(pr) => {
                     #[cfg(feature = "std")]
-                    eprintln!("[debug] processed {:?} pkt pn={} ack_eliciting={}", pr.level, pr.pn, pr.ack_eliciting);
-                                        if pr.ack_eliciting {
+                    eprintln!(
+                        "[debug] processed {:?} pkt pn={} ack_eliciting={}",
+                        pr.level, pr.pn, pr.ack_eliciting
+                    );
+                    if pr.ack_eliciting {
                         let idx = level_index(pr.level);
                         self.ack_eliciting_received[idx] = true;
                     }
@@ -252,7 +267,12 @@ where
                     // Decryption failure or parse error: silently discard this packet
                     // per RFC 9000 Section 12.2
                     #[cfg(feature = "std")]
-                    eprintln!("[debug] packet error: {:?} (first_byte=0x{:02x}, len={})", _e, pkt_data[0], pkt_data.len());
+                    eprintln!(
+                        "[debug] packet error: {:?} (first_byte=0x{:02x}, len={})",
+                        _e,
+                        pkt_data[0],
+                        pkt_data.len()
+                    );
                     continue;
                 }
             }
@@ -265,7 +285,14 @@ where
     }
 
     /// Process an Initial packet.
-    fn recv_initial<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(&mut self, sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>, pkt_data: &[u8], scratch: &mut [u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<PacketResult, Error> {
+    fn recv_initial<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(
+        &mut self,
+        sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>,
+        pkt_data: &[u8],
+        scratch: &mut [u8],
+        now: Instant,
+        pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>,
+    ) -> Result<PacketResult, Error> {
         let (hdr, _consumed) = packet::parse_initial_header(pkt_data)?;
 
         // If we are server and this is the first Initial, derive Initial keys from DCID
@@ -274,8 +301,11 @@ where
         #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
         if !self.keys.has_recv_keys(Level::Initial) {
             // Server receiving first client Initial
-            self.keys
-                .derive_initial(&self.crypto, hdr.dcid, self.role == crate::tls::handshake::Role::Client)?;
+            self.keys.derive_initial(
+                &self.crypto,
+                hdr.dcid,
+                self.role == crate::tls::handshake::Role::Client,
+            )?;
 
             // For the server: set original_destination_connection_id (the DCID from
             // the client's first Initial) and initial_source_connection_id (our own
@@ -288,7 +318,9 @@ where
                     } else {
                         self.local_cids[0].as_slice()
                     };
-                    pool.get_mut(slot).tls.set_transport_param_cids(hdr.dcid, local_scid);
+                    pool.get_mut(slot)
+                        .tls
+                        .set_transport_param_cids(hdr.dcid, local_scid);
                 }
             }
         }
@@ -315,15 +347,34 @@ where
                 let largest_pn = self.largest_recv_pn[level_index(level)].unwrap_or(0);
                 let recv = self.keys.initial_recv_keys().ok_or(Error::Crypto)?;
                 decrypt_long_packet(
-                    pkt_data, hdr.pn_offset, hdr.payload_length, largest_pn, recv, scratch,
+                    pkt_data,
+                    hdr.pn_offset,
+                    hdr.payload_length,
+                    largest_pn,
+                    recv,
+                    scratch,
                 )?
             };
             // RFC 9000 §12.3: discard duplicate packet numbers
             if self.recv_pn_tracker[level_index(level)].contains(pn) {
-                return Ok(PacketResult { ack_eliciting: false, level, pn });
+                return Ok(PacketResult {
+                    ack_eliciting: false,
+                    level,
+                    pn,
+                });
             }
-            let ack_eliciting = self.dispatch_frames(sio, &scratch[payload_offset..payload_offset + pt_len], level, now, pool)?;
-            Ok(PacketResult { ack_eliciting, level, pn })
+            let ack_eliciting = self.dispatch_frames(
+                sio,
+                &scratch[payload_offset..payload_offset + pt_len],
+                level,
+                now,
+                pool,
+            )?;
+            Ok(PacketResult {
+                ack_eliciting,
+                level,
+                pn,
+            })
         }
         #[cfg(not(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")))]
         {
@@ -333,7 +384,14 @@ where
     }
 
     /// Process a Handshake packet.
-    fn recv_handshake<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(&mut self, sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>, pkt_data: &[u8], scratch: &mut [u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<PacketResult, Error> {
+    fn recv_handshake<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(
+        &mut self,
+        sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>,
+        pkt_data: &[u8],
+        scratch: &mut [u8],
+        now: Instant,
+        pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>,
+    ) -> Result<PacketResult, Error> {
         let (hdr, _consumed) = packet::parse_handshake_header(pkt_data)?;
 
         let level = Level::Handshake;
@@ -341,19 +399,45 @@ where
             let largest_pn = self.largest_recv_pn[level_index(level)].unwrap_or(0);
             let recv = self.keys.recv_keys(Level::Handshake).ok_or(Error::Crypto)?;
             decrypt_long_packet(
-                pkt_data, hdr.pn_offset, hdr.payload_length, largest_pn, recv, scratch,
+                pkt_data,
+                hdr.pn_offset,
+                hdr.payload_length,
+                largest_pn,
+                recv,
+                scratch,
             )?
         };
         // RFC 9000 §12.3: discard duplicate packet numbers
         if self.recv_pn_tracker[level_index(level)].contains(pn) {
-            return Ok(PacketResult { ack_eliciting: false, level, pn });
+            return Ok(PacketResult {
+                ack_eliciting: false,
+                level,
+                pn,
+            });
         }
-        let ack_eliciting = self.dispatch_frames(sio, &scratch[payload_offset..payload_offset + pt_len], level, now, pool)?;
-        Ok(PacketResult { ack_eliciting, level, pn })
+        let ack_eliciting = self.dispatch_frames(
+            sio,
+            &scratch[payload_offset..payload_offset + pt_len],
+            level,
+            now,
+            pool,
+        )?;
+        Ok(PacketResult {
+            ack_eliciting,
+            level,
+            pn,
+        })
     }
 
     /// Process a short (1-RTT) packet with key phase handling (RFC 9001 section 6).
-    fn recv_short<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(&mut self, sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>, pkt_data: &[u8], scratch: &mut [u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<PacketResult, Error> {
+    fn recv_short<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(
+        &mut self,
+        sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>,
+        pkt_data: &[u8],
+        scratch: &mut [u8],
+        now: Instant,
+        pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>,
+    ) -> Result<PacketResult, Error> {
         let dcid_len = if self.local_cids.is_empty() {
             0
         } else {
@@ -366,7 +450,10 @@ where
         let pn_offset = hdr_len;
 
         // Need recv keys for Application level (for header protection removal)
-        let recv = self.keys.recv_keys(Level::Application).ok_or(Error::Crypto)?;
+        let recv = self
+            .keys
+            .recv_keys(Level::Application)
+            .ok_or(Error::Crypto)?;
 
         // Copy packet data into caller-provided scratch for in-place decryption
         let pkt_len = pkt_data.len();
@@ -406,12 +493,18 @@ where
 
         // Reject unreasonably large packet numbers (> 2^62)
         if pn > crate::varint::MAX_VARINT {
-            return Err(Error::Transport(crate::error::TransportError::ProtocolViolation));
+            return Err(Error::Transport(
+                crate::error::TransportError::ProtocolViolation,
+            ));
         }
 
         // RFC 9000 §12.3: discard duplicate packet numbers (saves AEAD cost)
         if self.recv_pn_tracker[level_index(Level::Application)].contains(pn) {
-            return Ok(PacketResult { ack_eliciting: false, level: Level::Application, pn });
+            return Ok(PacketResult {
+                ack_eliciting: false,
+                level: Level::Application,
+                pn,
+            });
         }
 
         // Decrypt payload — key phase aware (RFC 9001 section 6)
@@ -422,13 +515,17 @@ where
 
         if received_key_phase == current_key_phase {
             // Key phase matches: decrypt with current key
-            let recv = self.keys.recv_keys(Level::Application).ok_or(Error::Crypto)?;
+            let recv = self
+                .keys
+                .recv_keys(Level::Application)
+                .ok_or(Error::Crypto)?;
             let nonce = recv.nonce(pn);
 
             // Use split_at_mut for zero-copy AAD
             let pt_result = {
                 let (aad, payload_area) = scratch[..pkt_len].split_at_mut(payload_offset);
-                recv.aead.open_in_place(&nonce, &*aad, payload_area, payload_len)
+                recv.aead
+                    .open_in_place(&nonce, &*aad, payload_area, payload_len)
             };
 
             match pt_result {
@@ -442,7 +539,8 @@ where
                         self.keys.key_update.update_confirmed = true;
                     }
 
-                    let ack_eliciting = self.dispatch_frames(sio,
+                    let ack_eliciting = self.dispatch_frames(
+                        sio,
                         &scratch[payload_offset..payload_offset + pt_len],
                         Level::Application,
                         now,
@@ -459,16 +557,20 @@ where
                     // (for delayed packets from before a key update we initiated).
                     // Header (AAD) at scratch[..payload_offset] is still intact;
                     // only restore the payload portion from the original packet.
-                    scratch[payload_offset..pkt_len].copy_from_slice(&pkt_data[payload_offset..pkt_len]);
+                    scratch[payload_offset..pkt_len]
+                        .copy_from_slice(&pkt_data[payload_offset..pkt_len]);
 
                     if let Some(prev) = self.keys.prev_recv_keys() {
                         let nonce = prev.nonce(pn);
                         let pt_len = {
-                            let (aad, payload_area) = scratch[..pkt_len].split_at_mut(payload_offset);
-                            prev.aead.open_in_place(&nonce, &*aad, payload_area, payload_len)?
+                            let (aad, payload_area) =
+                                scratch[..pkt_len].split_at_mut(payload_offset);
+                            prev.aead
+                                .open_in_place(&nonce, &*aad, payload_area, payload_len)?
                         };
 
-                        let ack_eliciting = self.dispatch_frames(sio,
+                        let ack_eliciting = self.dispatch_frames(
+                            sio,
                             &scratch[payload_offset..payload_offset + pt_len],
                             Level::Application,
                             now,
@@ -493,13 +595,17 @@ where
                 let nonce = next_recv_keys.nonce(pn);
                 let pt_len = {
                     let (aad, payload_area) = scratch[..pkt_len].split_at_mut(payload_offset);
-                    next_recv_keys.aead.open_in_place(&nonce, &*aad, payload_area, payload_len)?
+                    next_recv_keys
+                        .aead
+                        .open_in_place(&nonce, &*aad, payload_area, payload_len)?
                 };
 
                 // Decryption succeeded: confirm the peer key update and rotate keys.
-                self.keys.confirm_peer_key_update(&self.crypto, next_recv_keys)?;
+                self.keys
+                    .confirm_peer_key_update(&self.crypto, next_recv_keys)?;
 
-                let ack_eliciting = self.dispatch_frames(sio,
+                let ack_eliciting = self.dispatch_frames(
+                    sio,
                     &scratch[payload_offset..payload_offset + pt_len],
                     Level::Application,
                     now,
@@ -524,7 +630,11 @@ where
 
     /// Parse and dispatch all frames from decrypted payload.
     /// Returns true if any frame was ack-eliciting.
-    fn dispatch_frames<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(
+    fn dispatch_frames<
+        const CRYPTO_BUF: usize,
+        const STREAM_BUF: usize,
+        const SEND_QUEUE: usize,
+    >(
         &mut self,
         sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>,
         payload: &[u8],
@@ -554,7 +664,11 @@ where
     }
 
     /// Dispatch a single frame.
-    pub(crate) fn dispatch_frame<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(
+    pub(crate) fn dispatch_frame<
+        const CRYPTO_BUF: usize,
+        const STREAM_BUF: usize,
+        const SEND_QUEUE: usize,
+    >(
         &mut self,
         sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>,
         frame: Frame<'_>,
@@ -594,8 +708,7 @@ where
                     if largest.time_sent > 0 && now >= largest.time_sent {
                         let latest_rtt = now - largest.time_sent;
                         let ack_delay = ack.ack_delay; // in microseconds (simplified)
-                        let handshake_confirmed =
-                            matches!(self.state, ConnectionState::Active);
+                        let handshake_confirmed = matches!(self.state, ConnectionState::Active);
                         self.loss_detector
                             .update_rtt(latest_rtt, ack_delay, handshake_confirmed);
                     }
@@ -622,7 +735,12 @@ where
 
             Frame::Crypto(crypto) => {
                 #[cfg(feature = "std")]
-                eprintln!("[debug] CRYPTO frame at {:?} offset={} len={}", level, crypto.offset, crypto.data.len());
+                eprintln!(
+                    "[debug] CRYPTO frame at {:?} offset={} len={}",
+                    level,
+                    crypto.offset,
+                    crypto.data.len()
+                );
                 self.handle_crypto_frame(level, crypto.offset, crypto.data, pool)?;
             }
 
@@ -631,9 +749,9 @@ where
 
                 // Get or create the stream
                 let initial_max = self.local_params.initial_max_stream_data_bidi_remote;
-                let _stream_state = self
-                    .streams
-                    .get_or_create(stream.stream_id, is_client, initial_max);
+                let _stream_state =
+                    self.streams
+                        .get_or_create(stream.stream_id, is_client, initial_max);
 
                 // Even if get_or_create fails (e.g., capacity), try to mark received
                 if self.streams.get(stream.stream_id).is_some() {
@@ -645,7 +763,13 @@ where
                     );
 
                     // Store the stream data in our receive buffer
-                    self.store_stream_data(sio, stream.stream_id, stream.offset, stream.data, stream.fin);
+                    self.store_stream_data(
+                        sio,
+                        stream.stream_id,
+                        stream.offset,
+                        stream.data,
+                        stream.fin,
+                    );
 
                     // Generate event
                     self.push_event(Event::StreamReadable(stream.stream_id));
@@ -726,9 +850,7 @@ where
                 // We don't currently initiate PATH_CHALLENGEs, so ignore responses.
             }
 
-            Frame::DataBlocked(_)
-            | Frame::StreamDataBlocked(_)
-            | Frame::StreamsBlocked(_) => {
+            Frame::DataBlocked(_) | Frame::StreamDataBlocked(_) | Frame::StreamsBlocked(_) => {
                 // Informational; peer is blocked. No action needed.
             }
         }
@@ -804,9 +926,7 @@ where
             if msg_len > tmp.len() {
                 return Err(Error::Tls);
             }
-            tmp[..msg_len].copy_from_slice(
-                &ctx.crypto_reasm[idx].contiguous_data()[..msg_len],
-            );
+            tmp[..msg_len].copy_from_slice(&ctx.crypto_reasm[idx].contiguous_data()[..msg_len]);
 
             // Advance the reassembly buffer past this message.
             ctx.crypto_reasm[idx].advance(msg_len);
@@ -823,7 +943,10 @@ where
 
     /// Check if TLS engine has produced new keys and install them.
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
-    fn check_tls_keys<const CRYPTO_BUF: usize>(&mut self, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<(), Error> {
+    fn check_tls_keys<const CRYPTO_BUF: usize>(
+        &mut self,
+        pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>,
+    ) -> Result<(), Error> {
         let slot = match self.handshake_slot {
             Some(s) => s,
             None => return Ok(()),
@@ -904,7 +1027,10 @@ where
     }
 
     #[cfg(not(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")))]
-    fn check_tls_keys<const CRYPTO_BUF: usize>(&mut self, _pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<(), Error> {
+    fn check_tls_keys<const CRYPTO_BUF: usize>(
+        &mut self,
+        _pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>,
+    ) -> Result<(), Error> {
         // Without crypto features, we can't install keys
         Ok(())
     }
@@ -1000,7 +1126,9 @@ fn decrypt_long_packet<A: Aead, HP: HeaderProtection>(
     let pn = packet::decode_pn(truncated_pn, pn_len, largest_pn);
 
     if pn > crate::varint::MAX_VARINT {
-        return Err(Error::Transport(crate::error::TransportError::ProtocolViolation));
+        return Err(Error::Transport(
+            crate::error::TransportError::ProtocolViolation,
+        ));
     }
 
     // Decrypt payload using split_at_mut for zero-copy AAD
@@ -1009,8 +1137,10 @@ fn decrypt_long_packet<A: Aead, HP: HeaderProtection>(
 
     let nonce = recv.nonce(pn);
     let pt_len = {
-        let (aad, payload_area) = scratch[..payload_offset + encrypted_len].split_at_mut(payload_offset);
-        recv.aead.open_in_place(&nonce, &*aad, payload_area, encrypted_len)?
+        let (aad, payload_area) =
+            scratch[..payload_offset + encrypted_len].split_at_mut(payload_offset);
+        recv.aead
+            .open_in_place(&nonce, &*aad, payload_area, encrypted_len)?
     };
 
     // Decrypted payload is now at scratch[payload_offset..payload_offset + pt_len]

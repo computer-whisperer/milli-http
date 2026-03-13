@@ -3,10 +3,10 @@
 //! Follows the milli-http `feed_data()` → `poll_output()` → `poll_event()` pattern.
 
 use crate::buf::Buf;
-use crate::crypto::{CryptoProvider, Aead, Level};
 use crate::crypto::key_schedule::derive_tls_record_keys;
+use crate::crypto::{Aead, CryptoProvider, Level};
 use crate::error::Error;
-use crate::tls::handshake::{TlsConfig, ServerTlsConfig, TlsEngine};
+use crate::tls::handshake::{ServerTlsConfig, TlsConfig, TlsEngine};
 use crate::tls::{DerivedKeys, TlsSession};
 
 use super::io::TlsIo;
@@ -92,7 +92,12 @@ where
     }
 
     /// Create a new server-side TLS connection.
-    pub fn new_server(provider: C, config: ServerTlsConfig, secret: [u8; 32], random: [u8; 32]) -> Self {
+    pub fn new_server(
+        provider: C,
+        config: ServerTlsConfig,
+        secret: [u8; 32],
+        random: [u8; 32],
+    ) -> Self {
         let engine = TlsEngine::<C>::new_tcp_server(config, secret, random);
         Self::new(provider, engine)
     }
@@ -118,7 +123,11 @@ where
     }
 
     /// Feed raw TCP data into the connection.
-    pub fn feed_data<const BUF: usize>(&mut self, io: &mut TlsIo<'_, BUF>, data: &[u8]) -> Result<(), Error> {
+    pub fn feed_data<const BUF: usize>(
+        &mut self,
+        io: &mut TlsIo<'_, BUF>,
+        data: &[u8],
+    ) -> Result<(), Error> {
         if io.recv_buf.len() + data.len() > BUF {
             return Err(Error::BufferTooSmall {
                 needed: io.recv_buf.len() + data.len(),
@@ -129,7 +138,11 @@ where
     }
 
     /// Pull the next chunk of outgoing TCP data.
-    pub fn poll_output<'a, const BUF: usize>(&mut self, io: &mut TlsIo<'_, BUF>, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+    pub fn poll_output<'a, const BUF: usize>(
+        &mut self,
+        io: &mut TlsIo<'_, BUF>,
+        buf: &'a mut [u8],
+    ) -> Option<&'a [u8]> {
         self.flush_engine_output(io);
         self.flush_app_send(io);
 
@@ -156,7 +169,11 @@ where
     }
 
     /// Read decrypted application data.
-    pub fn recv_app_data<const BUF: usize>(&mut self, io: &mut TlsIo<'_, BUF>, buf: &mut [u8]) -> Result<usize, Error> {
+    pub fn recv_app_data<const BUF: usize>(
+        &mut self,
+        io: &mut TlsIo<'_, BUF>,
+        buf: &mut [u8],
+    ) -> Result<usize, Error> {
         if io.app_recv_buf.is_empty() {
             return Err(Error::WouldBlock);
         }
@@ -169,7 +186,11 @@ where
     }
 
     /// Queue application data for encryption and sending.
-    pub fn send_app_data<const BUF: usize>(&mut self, io: &mut TlsIo<'_, BUF>, data: &[u8]) -> Result<usize, Error> {
+    pub fn send_app_data<const BUF: usize>(
+        &mut self,
+        io: &mut TlsIo<'_, BUF>,
+        data: &[u8],
+    ) -> Result<usize, Error> {
         if self.state != ConnState::Active {
             return Err(Error::InvalidState);
         }
@@ -226,8 +247,11 @@ where
             }
 
             let header_bytes: [u8; 5] = [
-                io.recv_buf[0], io.recv_buf[1], io.recv_buf[2],
-                io.recv_buf[3], io.recv_buf[4],
+                io.recv_buf[0],
+                io.recv_buf[1],
+                io.recv_buf[2],
+                io.recv_buf[3],
+                io.recv_buf[4],
             ];
             let payload_len = hdr.length as usize;
             let ct = hdr.content_type;
@@ -236,67 +260,67 @@ where
             let mut need_check_keys = false;
 
             match self.state {
-                ConnState::Handshake => {
-                    match ct {
-                        ContentType::Handshake => {
-                            self.engine.read_handshake(
-                                Level::Initial,
-                                &io.recv_buf[ps..ps + payload_len],
-                            ).map_err(|_| Error::Tls)?;
-                            need_check_keys = true;
-                        }
-                        ContentType::ChangeCipherSpec => {}
-                        ContentType::Alert => {
-                            if payload_len < 2 { return Err(Error::Tls); }
-                            let desc = io.recv_buf[ps + 1];
-                            io.drain_recv(total);
-                            return self.handle_alert_desc(desc);
-                        }
-                        _ => return Err(Error::Tls),
+                ConnState::Handshake => match ct {
+                    ContentType::Handshake => {
+                        self.engine
+                            .read_handshake(Level::Initial, &io.recv_buf[ps..ps + payload_len])
+                            .map_err(|_| Error::Tls)?;
+                        need_check_keys = true;
                     }
-                }
-                ConnState::HandshakeEncrypted => {
-                    match ct {
-                        ContentType::ApplicationData => {
-                            let keys = self.hs_recv.as_ref().ok_or(Error::Tls)?;
-                            let nonce = record::build_nonce(&keys.iv, self.hs_recv_seq);
-                            self.hs_recv_seq += 1;
-                            let plain_len = keys.aead.open_in_place(
-                                &nonce, &header_bytes,
-                                &mut io.recv_buf[ps..ps + payload_len],
-                                payload_len,
-                            )?;
-                            let (data_len, inner_ct) = find_inner_content_type(
-                                &io.recv_buf[ps..ps + plain_len],
-                            )?;
-                            match inner_ct {
-                                ContentType::Handshake => {
-                                    self.engine.read_handshake(
+                    ContentType::ChangeCipherSpec => {}
+                    ContentType::Alert => {
+                        if payload_len < 2 {
+                            return Err(Error::Tls);
+                        }
+                        let desc = io.recv_buf[ps + 1];
+                        io.drain_recv(total);
+                        return self.handle_alert_desc(desc);
+                    }
+                    _ => return Err(Error::Tls),
+                },
+                ConnState::HandshakeEncrypted => match ct {
+                    ContentType::ApplicationData => {
+                        let keys = self.hs_recv.as_ref().ok_or(Error::Tls)?;
+                        let nonce = record::build_nonce(&keys.iv, self.hs_recv_seq);
+                        self.hs_recv_seq += 1;
+                        let plain_len = keys.aead.open_in_place(
+                            &nonce,
+                            &header_bytes,
+                            &mut io.recv_buf[ps..ps + payload_len],
+                            payload_len,
+                        )?;
+                        let (data_len, inner_ct) =
+                            find_inner_content_type(&io.recv_buf[ps..ps + plain_len])?;
+                        match inner_ct {
+                            ContentType::Handshake => {
+                                self.engine
+                                    .read_handshake(
                                         Level::Handshake,
                                         &io.recv_buf[ps..ps + data_len],
-                                    ).map_err(|_| Error::Tls)?;
-                                    need_check_keys = true;
-                                }
-                                ContentType::Alert => {
-                                    if data_len < 2 { return Err(Error::Tls); }
-                                    let desc = io.recv_buf[ps + 1];
-                                    io.drain_recv(total);
-                                    return self.handle_alert_desc(desc);
-                                }
-                                _ => return Err(Error::Tls),
+                                    )
+                                    .map_err(|_| Error::Tls)?;
+                                need_check_keys = true;
                             }
+                            ContentType::Alert => {
+                                if data_len < 2 {
+                                    return Err(Error::Tls);
+                                }
+                                let desc = io.recv_buf[ps + 1];
+                                io.drain_recv(total);
+                                return self.handle_alert_desc(desc);
+                            }
+                            _ => return Err(Error::Tls),
                         }
-                        ContentType::ChangeCipherSpec => {}
-                        ContentType::Handshake => {
-                            self.engine.read_handshake(
-                                Level::Initial,
-                                &io.recv_buf[ps..ps + payload_len],
-                            ).map_err(|_| Error::Tls)?;
-                            need_check_keys = true;
-                        }
-                        _ => return Err(Error::Tls),
                     }
-                }
+                    ContentType::ChangeCipherSpec => {}
+                    ContentType::Handshake => {
+                        self.engine
+                            .read_handshake(Level::Initial, &io.recv_buf[ps..ps + payload_len])
+                            .map_err(|_| Error::Tls)?;
+                        need_check_keys = true;
+                    }
+                    _ => return Err(Error::Tls),
+                },
                 ConnState::Active => {
                     match ct {
                         ContentType::ApplicationData => {
@@ -304,13 +328,13 @@ where
                             let nonce = record::build_nonce(&keys.iv, self.recv_seq);
                             self.recv_seq += 1;
                             let plain_len = keys.aead.open_in_place(
-                                &nonce, &header_bytes,
+                                &nonce,
+                                &header_bytes,
                                 &mut io.recv_buf[ps..ps + payload_len],
                                 payload_len,
                             )?;
-                            let (data_len, inner_ct) = find_inner_content_type(
-                                &io.recv_buf[ps..ps + plain_len],
-                            )?;
+                            let (data_len, inner_ct) =
+                                find_inner_content_type(&io.recv_buf[ps..ps + plain_len])?;
                             match inner_ct {
                                 ContentType::ApplicationData => {
                                     if io.app_recv_buf.len() + data_len > BUF {
@@ -318,13 +342,15 @@ where
                                             needed: io.app_recv_buf.len() + data_len,
                                         });
                                     }
-                                    let _ = io.app_recv_buf.extend_from_slice(
-                                        &io.recv_buf[ps..ps + data_len],
-                                    );
+                                    let _ = io
+                                        .app_recv_buf
+                                        .extend_from_slice(&io.recv_buf[ps..ps + data_len]);
                                     let _ = self.events.push_back(TlsEvent::AppData);
                                 }
                                 ContentType::Alert => {
-                                    if data_len < 2 { return Err(Error::Tls); }
+                                    if data_len < 2 {
+                                        return Err(Error::Tls);
+                                    }
                                     let desc = io.recv_buf[ps + 1];
                                     io.drain_recv(total);
                                     return self.handle_alert_desc(desc);
@@ -359,7 +385,12 @@ where
         }
     }
 
-    fn send_alert<const BUF: usize>(&mut self, io: &mut TlsIo<'_, BUF>, level: u8, desc: u8) -> Result<(), Error> {
+    fn send_alert<const BUF: usize>(
+        &mut self,
+        io: &mut TlsIo<'_, BUF>,
+        level: u8,
+        desc: u8,
+    ) -> Result<(), Error> {
         let alert_data = [level, desc];
         if self.state == ConnState::Active {
             self.encrypt_and_send(io, &alert_data, ContentType::Alert, false)
@@ -406,15 +437,31 @@ where
             Level::Handshake => {
                 let mut send_key_buf = [0u8; 32];
                 let mut send_iv = [0u8; 12];
-                derive_tls_record_keys(&hkdf, send_secret, &mut send_key_buf[..key_len], &mut send_iv)?;
+                derive_tls_record_keys(
+                    &hkdf,
+                    send_secret,
+                    &mut send_key_buf[..key_len],
+                    &mut send_iv,
+                )?;
                 let send_aead = self.provider.aead(&send_key_buf[..key_len])?;
-                self.hs_send = Some(DirectionalRecordKeys { aead: send_aead, iv: send_iv });
+                self.hs_send = Some(DirectionalRecordKeys {
+                    aead: send_aead,
+                    iv: send_iv,
+                });
 
                 let mut recv_key_buf = [0u8; 32];
                 let mut recv_iv = [0u8; 12];
-                derive_tls_record_keys(&hkdf, recv_secret, &mut recv_key_buf[..key_len], &mut recv_iv)?;
+                derive_tls_record_keys(
+                    &hkdf,
+                    recv_secret,
+                    &mut recv_key_buf[..key_len],
+                    &mut recv_iv,
+                )?;
                 let recv_aead = self.provider.aead(&recv_key_buf[..key_len])?;
-                self.hs_recv = Some(DirectionalRecordKeys { aead: recv_aead, iv: recv_iv });
+                self.hs_recv = Some(DirectionalRecordKeys {
+                    aead: recv_aead,
+                    iv: recv_iv,
+                });
 
                 self.hs_send_seq = 0;
                 self.hs_recv_seq = 0;
@@ -424,15 +471,31 @@ where
             Level::Application => {
                 let mut send_key_buf = [0u8; 32];
                 let mut send_iv = [0u8; 12];
-                derive_tls_record_keys(&hkdf, send_secret, &mut send_key_buf[..key_len], &mut send_iv)?;
+                derive_tls_record_keys(
+                    &hkdf,
+                    send_secret,
+                    &mut send_key_buf[..key_len],
+                    &mut send_iv,
+                )?;
                 let send_aead = self.provider.aead(&send_key_buf[..key_len])?;
-                self.app_send = Some(DirectionalRecordKeys { aead: send_aead, iv: send_iv });
+                self.app_send = Some(DirectionalRecordKeys {
+                    aead: send_aead,
+                    iv: send_iv,
+                });
 
                 let mut recv_key_buf = [0u8; 32];
                 let mut recv_iv = [0u8; 12];
-                derive_tls_record_keys(&hkdf, recv_secret, &mut recv_key_buf[..key_len], &mut recv_iv)?;
+                derive_tls_record_keys(
+                    &hkdf,
+                    recv_secret,
+                    &mut recv_key_buf[..key_len],
+                    &mut recv_iv,
+                )?;
                 let recv_aead = self.provider.aead(&recv_key_buf[..key_len])?;
-                self.app_recv = Some(DirectionalRecordKeys { aead: recv_aead, iv: recv_iv });
+                self.app_recv = Some(DirectionalRecordKeys {
+                    aead: recv_aead,
+                    iv: recv_iv,
+                });
 
                 self.engine_output_pending = true;
             }
@@ -469,7 +532,11 @@ where
                     if !self.ccs_sent {
                         let ccs = [
                             ContentType::ChangeCipherSpec as u8,
-                            0x03, 0x03, 0x00, 0x01, 0x01,
+                            0x03,
+                            0x03,
+                            0x00,
+                            0x01,
+                            0x01,
                         ];
                         let _ = io.queue_send(&ccs);
                         self.ccs_sent = true;
@@ -504,7 +571,9 @@ where
                 &keys.aead,
                 &nonce,
                 io.send_buf,
-            ).is_err() {
+            )
+            .is_err()
+            {
                 break;
             }
 
@@ -513,7 +582,12 @@ where
         }
     }
 
-    fn wrap_plaintext_record<const BUF: usize>(&mut self, io: &mut TlsIo<'_, BUF>, ct: ContentType, data: &[u8]) -> Result<(), Error> {
+    fn wrap_plaintext_record<const BUF: usize>(
+        &mut self,
+        io: &mut TlsIo<'_, BUF>,
+        ct: ContentType,
+        data: &[u8],
+    ) -> Result<(), Error> {
         let mut header = [0u8; 5];
         record::encode_record_header(ct, data.len() as u16, &mut header)?;
         io.queue_send(&header)?;
@@ -604,11 +678,11 @@ mod tests {
     extern crate std;
     use std::vec::Vec;
 
-    use super::*;
     use super::super::io::TlsIoBufs;
+    use super::*;
     use crate::crypto::rustcrypto::Aes128GcmProvider;
-    use crate::tls::handshake::{TlsConfig, ServerTlsConfig};
     use crate::tls::TransportParams;
+    use crate::tls::handshake::{ServerTlsConfig, TlsConfig};
 
     type TestConn = TlsConnection<Aes128GcmProvider>;
     type TestIo = TlsIoBufs<32768>;
@@ -642,7 +716,12 @@ mod tests {
         TestConn::new_server(Aes128GcmProvider, config, [0xCC; 32], [0xDD; 32])
     }
 
-    fn transfer(src: &mut TestConn, sio: &mut TestIo, dst: &mut TestConn, dio: &mut TestIo) -> bool {
+    fn transfer(
+        src: &mut TestConn,
+        sio: &mut TestIo,
+        dst: &mut TestConn,
+        dio: &mut TestIo,
+    ) -> bool {
         let mut any = false;
         let mut buf = [0u8; 32768];
         while let Some(data) = src.poll_output(&mut sio.as_io(), &mut buf) {
@@ -714,23 +793,31 @@ mod tests {
         drain_events(&mut client);
         drain_events(&mut server);
 
-        client.send_app_data(&mut cio.as_io(), b"Hello from client").unwrap();
+        client
+            .send_app_data(&mut cio.as_io(), b"Hello from client")
+            .unwrap();
         transfer(&mut client, &mut cio, &mut server, &mut sio);
 
         let server_events = drain_events(&mut server);
         assert!(server_events.contains(&TlsEvent::AppData));
 
         let mut recv_buf = [0u8; 256];
-        let n = server.recv_app_data(&mut sio.as_io(), &mut recv_buf).unwrap();
+        let n = server
+            .recv_app_data(&mut sio.as_io(), &mut recv_buf)
+            .unwrap();
         assert_eq!(&recv_buf[..n], b"Hello from client");
 
-        server.send_app_data(&mut sio.as_io(), b"Hello from server").unwrap();
+        server
+            .send_app_data(&mut sio.as_io(), b"Hello from server")
+            .unwrap();
         transfer(&mut server, &mut sio, &mut client, &mut cio);
 
         let client_events = drain_events(&mut client);
         assert!(client_events.contains(&TlsEvent::AppData));
 
-        let n = client.recv_app_data(&mut cio.as_io(), &mut recv_buf).unwrap();
+        let n = client
+            .recv_app_data(&mut cio.as_io(), &mut recv_buf)
+            .unwrap();
         assert_eq!(&recv_buf[..n], b"Hello from server");
     }
 
@@ -804,7 +891,9 @@ mod tests {
         transfer(&mut client, &mut cio, &mut server, &mut sio);
 
         let mut recv_buf = [0u8; 1024];
-        let n = server.recv_app_data(&mut sio.as_io(), &mut recv_buf).unwrap();
+        let n = server
+            .recv_app_data(&mut sio.as_io(), &mut recv_buf)
+            .unwrap();
         assert_eq!(n, 500);
     }
 
@@ -849,14 +938,18 @@ mod tests {
             while let Some(data) = client.poll_output(&mut cio.as_io(), &mut buf) {
                 let copy = data.to_vec();
                 for byte in &copy {
-                    server.feed_data(&mut sio.as_io(), core::slice::from_ref(byte)).unwrap();
+                    server
+                        .feed_data(&mut sio.as_io(), core::slice::from_ref(byte))
+                        .unwrap();
                 }
             }
             let mut buf2 = [0u8; 32768];
             while let Some(data) = server.poll_output(&mut sio.as_io(), &mut buf2) {
                 let copy = data.to_vec();
                 for byte in &copy {
-                    client.feed_data(&mut cio.as_io(), core::slice::from_ref(byte)).unwrap();
+                    client
+                        .feed_data(&mut cio.as_io(), core::slice::from_ref(byte))
+                        .unwrap();
                 }
             }
             if client.is_active() && server.is_active() {
@@ -864,18 +957,25 @@ mod tests {
             }
         }
 
-        assert!(client.is_active(), "handshake should complete with fragmented data");
+        assert!(
+            client.is_active(),
+            "handshake should complete with fragmented data"
+        );
         assert!(server.is_active());
 
         drain_events(&mut client);
         drain_events(&mut server);
 
-        client.send_app_data(&mut cio.as_io(), b"fragmented test").unwrap();
+        client
+            .send_app_data(&mut cio.as_io(), b"fragmented test")
+            .unwrap();
         let mut buf = [0u8; 32768];
         while let Some(data) = client.poll_output(&mut cio.as_io(), &mut buf) {
             let copy = data.to_vec();
             for byte in &copy {
-                server.feed_data(&mut sio.as_io(), core::slice::from_ref(byte)).unwrap();
+                server
+                    .feed_data(&mut sio.as_io(), core::slice::from_ref(byte))
+                    .unwrap();
             }
         }
 
@@ -996,7 +1096,9 @@ mod tests {
                 client.feed_data(&copy).unwrap();
                 any = true;
             }
-            if !any { break; }
+            if !any {
+                break;
+            }
         }
 
         assert!(client.is_active());

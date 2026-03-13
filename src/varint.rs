@@ -71,7 +71,9 @@ pub fn decode_varint(buf: &[u8]) -> Result<(u64, usize), Error> {
 /// Returns the number of bytes written.
 pub fn encode_varint(value: u64, buf: &mut [u8]) -> Result<usize, Error> {
     if value > MAX_VARINT {
-        return Err(Error::Transport(crate::error::TransportError::InternalError));
+        return Err(Error::Transport(
+            crate::error::TransportError::InternalError,
+        ));
     }
 
     let len = varint_len(value);
@@ -246,7 +248,10 @@ mod tests {
         for (v, expected_len) in boundaries.iter().zip(expected_lens.iter()) {
             let mut buf = [0u8; 8];
             let written = encode_varint(*v, &mut buf).unwrap();
-            assert_eq!(written, *expected_len, "boundary {v} should need {expected_len} bytes");
+            assert_eq!(
+                written, *expected_len,
+                "boundary {v} should need {expected_len} bytes"
+            );
             let (decoded, consumed) = decode_varint(&buf[..written]).unwrap();
             assert_eq!(decoded, *v);
             assert_eq!(consumed, *expected_len);
@@ -273,7 +278,10 @@ mod tests {
         for len in 1..8 {
             let mut buf = [0u8; 8];
             buf[0] = 0xC0;
-            assert!(decode_varint(&buf[..len]).is_err(), "should fail at len={len}");
+            assert!(
+                decode_varint(&buf[..len]).is_err(),
+                "should fail at len={len}"
+            );
         }
     }
 

@@ -6,6 +6,8 @@
 
 #![cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
 
+use milli_http::QuicStreamIoBufs;
+use milli_http::Rng;
 use milli_http::connection::Connection;
 use milli_http::connection::HandshakePool;
 use milli_http::crypto::ed25519::{build_ed25519_cert_der, ed25519_public_key_from_seed};
@@ -13,8 +15,6 @@ use milli_http::crypto::rustcrypto::Aes128GcmProvider;
 use milli_http::h3::{H3Client, H3Event, H3Server};
 use milli_http::tls::handshake::ServerTlsConfig;
 use milli_http::tls::transport_params::TransportParams;
-use milli_http::QuicStreamIoBufs;
-use milli_http::Rng;
 
 // ---------------------------------------------------------------------------
 // Test infrastructure
@@ -48,7 +48,9 @@ fn make_pool() -> Box<HandshakePool<Aes128GcmProvider, 4>> {
     Box::new(HandshakePool::new())
 }
 
-fn make_quic_client(pool: &mut HandshakePool<Aes128GcmProvider, 4>) -> Connection<Aes128GcmProvider> {
+fn make_quic_client(
+    pool: &mut HandshakePool<Aes128GcmProvider, 4>,
+) -> Connection<Aes128GcmProvider> {
     let mut rng = TestRng(0x10);
     Connection::client(
         Aes128GcmProvider,
@@ -61,7 +63,9 @@ fn make_quic_client(pool: &mut HandshakePool<Aes128GcmProvider, 4>) -> Connectio
     .unwrap()
 }
 
-fn make_quic_server(pool: &mut HandshakePool<Aes128GcmProvider, 4>) -> Connection<Aes128GcmProvider> {
+fn make_quic_server(
+    pool: &mut HandshakePool<Aes128GcmProvider, 4>,
+) -> Connection<Aes128GcmProvider> {
     let mut rng = TestRng(0x50);
     let config = ServerTlsConfig {
         cert_der: get_test_ed25519_cert_der(),
@@ -344,7 +348,10 @@ fn h3_get_request_response() {
         }
         exchange_h3_packets(&mut client, &mut server, now, &mut pool);
     }
-    assert!(got_response_headers, "client should receive response Headers");
+    assert!(
+        got_response_headers,
+        "client should receive response Headers"
+    );
 
     // Client reads response status.
     let mut status = Vec::new();
@@ -451,7 +458,10 @@ fn h3_multiple_requests() {
     client.send_body(stream2, &[], true).unwrap();
 
     // The two stream IDs must be different.
-    assert_ne!(stream1, stream2, "two requests should use different streams");
+    assert_ne!(
+        stream1, stream2,
+        "two requests should use different streams"
+    );
 
     // Exchange so server receives both requests.
     exchange_h3_packets(&mut client, &mut server, now, &mut pool);
@@ -900,10 +910,7 @@ fn h3_request_headers_round_trip() {
             "PUT",
             "/resource/42",
             "example.com",
-            &[
-                (b"accept", b"*/*"),
-                (b"user-agent", b"milli-quic/test"),
-            ],
+            &[(b"accept", b"*/*"), (b"user-agent", b"milli-quic/test")],
             false,
         )
         .unwrap();
@@ -936,16 +943,14 @@ fn h3_request_headers_round_trip() {
     let mut user_agent = Vec::new();
 
     server
-        .recv_headers(req_stream, |name, value| {
-            match name {
-                b":method" => method.extend_from_slice(value),
-                b":scheme" => scheme.extend_from_slice(value),
-                b":authority" => authority.extend_from_slice(value),
-                b":path" => path.extend_from_slice(value),
-                b"accept" => accept.extend_from_slice(value),
-                b"user-agent" => user_agent.extend_from_slice(value),
-                _ => {}
-            }
+        .recv_headers(req_stream, |name, value| match name {
+            b":method" => method.extend_from_slice(value),
+            b":scheme" => scheme.extend_from_slice(value),
+            b":authority" => authority.extend_from_slice(value),
+            b":path" => path.extend_from_slice(value),
+            b"accept" => accept.extend_from_slice(value),
+            b"user-agent" => user_agent.extend_from_slice(value),
+            _ => {}
         })
         .unwrap();
 
@@ -1028,7 +1033,8 @@ fn h3_server_responds_different_status_codes() {
             })
             .unwrap();
         assert_eq!(
-            status, expected_str,
+            status,
+            expected_str,
             "status code {code} should round-trip as {:?}",
             core::str::from_utf8(expected_str).unwrap()
         );

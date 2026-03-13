@@ -7,14 +7,14 @@
 pub mod frame;
 pub mod qpack;
 
-pub mod connection;
 pub mod client;
+pub mod connection;
 pub mod server;
 
-pub use frame::{decode_h3_frame, encode_h3_frame, H3Frame, PushPromiseFrame};
-pub use qpack::{QpackDecoder, QpackEncoder};
-pub use connection::H3Event;
 pub use client::H3Client;
+pub use connection::H3Event;
+pub use frame::{H3Frame, PushPromiseFrame, decode_h3_frame, encode_h3_frame};
+pub use qpack::{QpackDecoder, QpackEncoder};
 pub use server::H3Server;
 
 /// HTTP/3 settings (RFC 9114 §7.2.4.1).

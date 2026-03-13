@@ -4,9 +4,9 @@
 //! interop when combined with literal encoding for entries not in the
 //! static table.
 
-use crate::error::Error;
 use super::integer;
 use super::static_table::{self, LookupResult, STATIC_TABLE};
+use crate::error::Error;
 
 // ---------------------------------------------------------------------------
 // Encoder
@@ -38,16 +38,14 @@ impl HpackEncoder {
             match result {
                 LookupResult::ExactMatch(idx) => {
                     // Indexed Header Field (§6.1): 1xxxxxxx, prefix=7
-                    offset += integer::encode_integer(
-                        idx as u64, 7, 0b1000_0000, &mut buf[offset..],
-                    )?;
+                    offset +=
+                        integer::encode_integer(idx as u64, 7, 0b1000_0000, &mut buf[offset..])?;
                 }
                 LookupResult::NameMatch(idx) => {
                     // Literal Header Field without Indexing — Name Reference (§6.2.2):
                     // 0000xxxx, prefix=4
-                    offset += integer::encode_integer(
-                        idx as u64, 4, 0b0000_0000, &mut buf[offset..],
-                    )?;
+                    offset +=
+                        integer::encode_integer(idx as u64, 4, 0b0000_0000, &mut buf[offset..])?;
                     // Value: H=0, length prefix=7
                     offset += self.encode_string_literal(value, &mut buf[offset..])?;
                 }
@@ -76,7 +74,9 @@ impl HpackEncoder {
         // H=0 (bit 7 = 0), length in prefix=7
         offset += integer::encode_integer(s.len() as u64, 7, 0x00, &mut buf[offset..])?;
         if buf.len() - offset < s.len() {
-            return Err(Error::BufferTooSmall { needed: offset + s.len() });
+            return Err(Error::BufferTooSmall {
+                needed: offset + s.len(),
+            });
         }
         buf[offset..offset + s.len()].copy_from_slice(s);
         offset += s.len();
@@ -233,7 +233,9 @@ impl HpackDecoder {
         let length = length as usize;
 
         if src.len() - len_consumed < length {
-            return Err(Error::BufferTooSmall { needed: len_consumed + length });
+            return Err(Error::BufferTooSmall {
+                needed: len_consumed + length,
+            });
         }
 
         Ok((huffman, length, len_consumed))
@@ -250,7 +252,11 @@ mod tests {
     }
 
     impl Collected {
-        fn new() -> Self { Self { entries: HVec::new() } }
+        fn new() -> Self {
+            Self {
+                entries: HVec::new(),
+            }
+        }
         fn push(&mut self, name: &[u8], value: &[u8]) {
             let mut n = HVec::new();
             n.extend_from_slice(name).unwrap();
@@ -272,7 +278,9 @@ mod tests {
         assert_eq!(buf[0], 0x82);
 
         let mut c = Collected::new();
-        let consumed = decoder.decode(&buf[..n], |name, val| c.push(name, val)).unwrap();
+        let consumed = decoder
+            .decode(&buf[..n], |name, val| c.push(name, val))
+            .unwrap();
         assert_eq!(consumed, n);
         assert_eq!(c.entries.len(), 1);
         assert_eq!(c.entries[0].0.as_slice(), b":method");
@@ -288,7 +296,9 @@ mod tests {
         let n = encoder.encode(headers, &mut buf).unwrap();
 
         let mut c = Collected::new();
-        decoder.decode(&buf[..n], |name, val| c.push(name, val)).unwrap();
+        decoder
+            .decode(&buf[..n], |name, val| c.push(name, val))
+            .unwrap();
         assert_eq!(c.entries.len(), 1);
         assert_eq!(c.entries[0].0.as_slice(), b":path");
         assert_eq!(c.entries[0].1.as_slice(), b"/api/users");
@@ -303,7 +313,9 @@ mod tests {
         let n = encoder.encode(headers, &mut buf).unwrap();
 
         let mut c = Collected::new();
-        decoder.decode(&buf[..n], |name, val| c.push(name, val)).unwrap();
+        decoder
+            .decode(&buf[..n], |name, val| c.push(name, val))
+            .unwrap();
         assert_eq!(c.entries.len(), 1);
         assert_eq!(c.entries[0].0.as_slice(), b"x-custom");
         assert_eq!(c.entries[0].1.as_slice(), b"hello");
@@ -324,7 +336,9 @@ mod tests {
         let n = encoder.encode(headers, &mut buf).unwrap();
 
         let mut c = Collected::new();
-        decoder.decode(&buf[..n], |name, val| c.push(name, val)).unwrap();
+        decoder
+            .decode(&buf[..n], |name, val| c.push(name, val))
+            .unwrap();
         assert_eq!(c.entries.len(), 5);
         assert_eq!(c.entries[0].0.as_slice(), b":method");
         assert_eq!(c.entries[0].1.as_slice(), b"GET");
@@ -363,7 +377,9 @@ mod tests {
         assert_eq!(buf[0], 0x88);
 
         let mut c = Collected::new();
-        decoder.decode(&buf[..n], |name, val| c.push(name, val)).unwrap();
+        decoder
+            .decode(&buf[..n], |name, val| c.push(name, val))
+            .unwrap();
         assert_eq!(c.entries[0].0.as_slice(), b":status");
         assert_eq!(c.entries[0].1.as_slice(), b"200");
     }
@@ -380,7 +396,9 @@ mod tests {
                 let n = encoder.encode(headers, &mut buf).unwrap();
 
                 let mut c = Collected::new();
-                decoder.decode(&buf[..n], |name, val| c.push(name, val)).unwrap();
+                decoder
+                    .decode(&buf[..n], |name, val| c.push(name, val))
+                    .unwrap();
                 assert_eq!(c.entries.len(), 1, "failed at index {}", i + 1);
                 assert_eq!(c.entries[0].0.as_slice(), entry.name);
                 assert_eq!(c.entries[0].1.as_slice(), entry.value);

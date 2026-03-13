@@ -148,7 +148,9 @@ impl FlowController {
     pub fn should_send_max_streams(&self) -> Option<(bool, u64)> {
         // Check bidi: if closed streams >= 50% of our advertised limit, bump it
         if self.closed_bidi_remote > 0 {
-            let consumed = self.next_max_streams_bidi_remote.saturating_sub(self.closed_bidi_remote);
+            let consumed = self
+                .next_max_streams_bidi_remote
+                .saturating_sub(self.closed_bidi_remote);
             let remaining = self.max_streams_bidi_remote.saturating_sub(consumed);
             let _ = remaining; // remaining accounting unused in simple version
             let new_limit = self.max_streams_bidi_remote + self.closed_bidi_remote;
@@ -471,8 +473,6 @@ mod tests {
     fn zero_initial_max_data() {
         let fc = FlowController::new(0, 0, 0);
         assert_eq!(fc.send_capacity(), 0);
-        assert_eq!(
-            fc.recv_max_data, 0
-        );
+        assert_eq!(fc.recv_max_data, 0);
     }
 }

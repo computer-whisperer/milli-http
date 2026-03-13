@@ -82,8 +82,8 @@ pub fn decode_h3_frame(buf: &[u8]) -> Result<(H3Frame<'_>, usize), Error> {
         H3_FRAME_DATA => H3Frame::Data(payload),
         H3_FRAME_HEADERS => H3Frame::Headers(payload),
         H3_FRAME_CANCEL_PUSH => {
-            let (push_id, id_len) = decode_varint(payload)
-                .map_err(|_| Error::Http3(H3Error::FrameError))?;
+            let (push_id, id_len) =
+                decode_varint(payload).map_err(|_| Error::Http3(H3Error::FrameError))?;
             if id_len != payload_len {
                 return Err(Error::Http3(H3Error::FrameError));
             }
@@ -94,8 +94,8 @@ pub fn decode_h3_frame(buf: &[u8]) -> Result<(H3Frame<'_>, usize), Error> {
             H3Frame::Settings(settings)
         }
         H3_FRAME_PUSH_PROMISE => {
-            let (push_id, id_len) = decode_varint(payload)
-                .map_err(|_| Error::Http3(H3Error::FrameError))?;
+            let (push_id, id_len) =
+                decode_varint(payload).map_err(|_| Error::Http3(H3Error::FrameError))?;
             let header_block = &payload[id_len..];
             H3Frame::PushPromise(PushPromiseFrame {
                 push_id,
@@ -103,16 +103,16 @@ pub fn decode_h3_frame(buf: &[u8]) -> Result<(H3Frame<'_>, usize), Error> {
             })
         }
         H3_FRAME_GOAWAY => {
-            let (stream_id, id_len) = decode_varint(payload)
-                .map_err(|_| Error::Http3(H3Error::FrameError))?;
+            let (stream_id, id_len) =
+                decode_varint(payload).map_err(|_| Error::Http3(H3Error::FrameError))?;
             if id_len != payload_len {
                 return Err(Error::Http3(H3Error::FrameError));
             }
             H3Frame::GoAway(stream_id)
         }
         H3_FRAME_MAX_PUSH_ID => {
-            let (push_id, id_len) = decode_varint(payload)
-                .map_err(|_| Error::Http3(H3Error::FrameError))?;
+            let (push_id, id_len) =
+                decode_varint(payload).map_err(|_| Error::Http3(H3Error::FrameError))?;
             if id_len != payload_len {
                 return Err(Error::Http3(H3Error::FrameError));
             }
@@ -134,11 +134,15 @@ pub fn encode_h3_frame(frame: &H3Frame<'_>, buf: &mut [u8]) -> Result<usize, Err
     match frame {
         H3Frame::Data(data) => encode_simple_frame(H3_FRAME_DATA, data, buf),
         H3Frame::Headers(data) => encode_simple_frame(H3_FRAME_HEADERS, data, buf),
-        H3Frame::CancelPush(push_id) => encode_varint_payload_frame(H3_FRAME_CANCEL_PUSH, *push_id, buf),
+        H3Frame::CancelPush(push_id) => {
+            encode_varint_payload_frame(H3_FRAME_CANCEL_PUSH, *push_id, buf)
+        }
         H3Frame::Settings(settings) => encode_settings_frame(settings, buf),
         H3Frame::PushPromise(pp) => encode_push_promise_frame(pp, buf),
         H3Frame::GoAway(stream_id) => encode_varint_payload_frame(H3_FRAME_GOAWAY, *stream_id, buf),
-        H3Frame::MaxPushId(push_id) => encode_varint_payload_frame(H3_FRAME_MAX_PUSH_ID, *push_id, buf),
+        H3Frame::MaxPushId(push_id) => {
+            encode_varint_payload_frame(H3_FRAME_MAX_PUSH_ID, *push_id, buf)
+        }
         H3Frame::Unknown(_) => Ok(0), // Unknown frames are receive-only, nothing to encode
     }
 }
@@ -200,8 +204,7 @@ fn settings_payload_len(settings: &H3Settings) -> usize {
 /// Encode a SETTINGS frame.
 fn encode_settings_frame(settings: &H3Settings, buf: &mut [u8]) -> Result<usize, Error> {
     let payload_len = settings_payload_len(settings);
-    let needed =
-        varint_len(H3_FRAME_SETTINGS) + varint_len(payload_len as u64) + payload_len;
+    let needed = varint_len(H3_FRAME_SETTINGS) + varint_len(payload_len as u64) + payload_len;
     if buf.len() < needed {
         return Err(Error::BufferTooSmall { needed });
     }
@@ -231,8 +234,7 @@ fn encode_settings_frame(settings: &H3Settings, buf: &mut [u8]) -> Result<usize,
 fn encode_push_promise_frame(pp: &PushPromiseFrame<'_>, buf: &mut [u8]) -> Result<usize, Error> {
     let id_len = varint_len(pp.push_id);
     let payload_len = id_len + pp.header_block.len();
-    let needed =
-        varint_len(H3_FRAME_PUSH_PROMISE) + varint_len(payload_len as u64) + payload_len;
+    let needed = varint_len(H3_FRAME_PUSH_PROMISE) + varint_len(payload_len as u64) + payload_len;
     if buf.len() < needed {
         return Err(Error::BufferTooSmall { needed });
     }

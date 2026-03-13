@@ -9,15 +9,14 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
-use milli_http::http1::server::Http1Server;
 use milli_http::http1::Http1Event;
+use milli_http::http1::server::Http1Server;
 
 fn main() {
     println!("milli-http HTTP/1.1 server");
     println!("=========================");
 
-    let listener = TcpListener::bind("0.0.0.0:8080")
-        .expect("failed to bind TCP on :8080");
+    let listener = TcpListener::bind("0.0.0.0:8080").expect("failed to bind TCP on :8080");
     println!("[init] listening on 0.0.0.0:8080 (TCP)");
 
     let (mut stream, client_addr) = listener.accept().expect("accept failed");
@@ -68,18 +67,27 @@ fn main() {
                 Http1Event::Headers(stream_id) => {
                     println!("[http1] request on stream {stream_id}");
 
-                    http1.recv_headers(stream_id, |name, value| {
-                        let n = core::str::from_utf8(name).unwrap_or("<bin>");
-                        let v = core::str::from_utf8(value).unwrap_or("<bin>");
-                        println!("[http1]   {n}: {v}");
-                    }).ok();
+                    http1
+                        .recv_headers(stream_id, |name, value| {
+                            let n = core::str::from_utf8(name).unwrap_or("<bin>");
+                            let v = core::str::from_utf8(value).unwrap_or("<bin>");
+                            println!("[http1]   {n}: {v}");
+                        })
+                        .ok();
 
                     let content_length = body.len().to_string();
-                    http1.send_response(stream_id, 200, &[
-                        (b"content-type", b"text/html"),
-                        (b"content-length", content_length.as_bytes()),
-                        (b"server", b"milli-http/0.1"),
-                    ], false).ok();
+                    http1
+                        .send_response(
+                            stream_id,
+                            200,
+                            &[
+                                (b"content-type", b"text/html"),
+                                (b"content-length", content_length.as_bytes()),
+                                (b"server", b"milli-http/0.1"),
+                            ],
+                            false,
+                        )
+                        .ok();
                     http1.send_body(stream_id, body, true).ok();
                 }
                 _ => {}

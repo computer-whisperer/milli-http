@@ -18,15 +18,15 @@ use std::io::Write;
 use std::net::UdpSocket;
 use std::time;
 
+use milli_http::Rng;
 use milli_http::connection::{Connection, HandshakePool};
 use milli_http::crypto::ecdsa_p256;
 use milli_http::crypto::ed25519::{build_ed25519_cert_der, ed25519_public_key_from_seed};
 use milli_http::crypto::rustcrypto::Aes128GcmProvider;
-use milli_http::h3::server::H3Server;
 use milli_http::h3::H3Event;
+use milli_http::h3::server::H3Server;
 use milli_http::tls::handshake::ServerTlsConfig;
 use milli_http::tls::transport_params::TransportParams;
-use milli_http::Rng;
 
 // ---------------------------------------------------------------------------
 // RNG wrapper around the `rand` crate
@@ -100,16 +100,13 @@ fn load_cert_and_key() -> Option<(&'static [u8], &'static [u8])> {
         );
         // Search for the 32-byte scalar: look for OCTET STRING tag (0x04) with length 0x20
         // in the inner ECPrivateKey structure.
-        let scalar_offset = find_p256_scalar_in_pkcs8(&key_der)
-            .expect("could not find P-256 scalar in PKCS#8 key");
+        let scalar_offset =
+            find_p256_scalar_in_pkcs8(&key_der).expect("could not find P-256 scalar in PKCS#8 key");
         println!("[init] detected P-256 key (scalar at offset {scalar_offset})");
         key_der[scalar_offset..scalar_offset + 32].to_vec()
     } else {
         // Ed25519 PKCS#8: 16-byte header + 32-byte seed
-        assert!(
-            key_der.len() >= 48,
-            "key file too short for Ed25519 PKCS#8"
-        );
+        assert!(key_der.len() >= 48, "key file too short for Ed25519 PKCS#8");
         println!("[init] detected Ed25519 key");
         key_der[16..48].to_vec()
     };
@@ -131,8 +128,11 @@ fn load_cert_and_key() -> Option<(&'static [u8], &'static [u8])> {
 fn find_p256_scalar_in_pkcs8(der: &[u8]) -> Option<usize> {
     // Pattern: version INTEGER 02 01 01, then OCTET STRING 04 20, then 32 bytes
     for i in 0..der.len().saturating_sub(37) {
-        if der[i] == 0x02 && der[i + 1] == 0x01 && der[i + 2] == 0x01
-            && der[i + 3] == 0x04 && der[i + 4] == 0x20
+        if der[i] == 0x02
+            && der[i + 1] == 0x01
+            && der[i + 2] == 0x01
+            && der[i + 3] == 0x04
+            && der[i + 4] == 0x20
         {
             return Some(i + 5);
         }
@@ -156,8 +156,8 @@ fn main() {
         let seed: [u8; 32] = [0x42u8; 32];
         let pk = ed25519_public_key_from_seed(&seed);
         let mut cert_buf = [0u8; 512];
-        let cert_len = build_ed25519_cert_der(&pk, &mut cert_buf)
-            .expect("failed to build certificate DER");
+        let cert_len =
+            build_ed25519_cert_der(&pk, &mut cert_buf).expect("failed to build certificate DER");
         // Leak into 'static references required by ServerTlsConfig.
         let cert_der: &'static [u8] = Box::leak(cert_buf[..cert_len].to_vec().into_boxed_slice());
         let private_key_der: &'static [u8] = Box::leak(Box::new(seed));
@@ -200,8 +200,14 @@ fn main() {
 
     let mut rng = StdRng::new();
     let mut pool = HandshakePool::<Aes128GcmProvider, 4>::new();
-    let conn = Connection::<Aes128GcmProvider>::server(Aes128GcmProvider, tls_config, tp, &mut rng, &mut pool)
-        .expect("failed to create server Connection");
+    let conn = Connection::<Aes128GcmProvider>::server(
+        Aes128GcmProvider,
+        tls_config,
+        tp,
+        &mut rng,
+        &mut pool,
+    )
+    .expect("failed to create server Connection");
 
     let mut h3: H3Server<Aes128GcmProvider> = H3Server::new(conn);
     let mut scratch = [0u8; 2048];
@@ -227,8 +233,15 @@ fn main() {
             match h3.poll_transmit(&mut tx_buf, now, &mut pool) {
                 Some(tx) => {
                     println!("[send] sending {} bytes to {client_addr}", tx.data.len());
-                    let _ = writeln!(pkt_log, "SEND {} {}", tx.data.len(),
-                        tx.data.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                    let _ = writeln!(
+                        pkt_log,
+                        "SEND {} {}",
+                        tx.data.len(),
+                        tx.data
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>()
+                    );
                     let _ = pkt_log.flush();
                     if let Err(e) = socket.send_to(tx.data, client_addr) {
                         eprintln!("[send] error: {e}");
@@ -250,13 +263,23 @@ fn main() {
         match socket.recv_from(&mut recv_buf) {
             Ok((len, addr)) => {
                 if addr == client_addr {
-                    println!("[recv] received {len} bytes from {addr} (first_byte=0x{:02x})", recv_buf[0]);
-                    let _ = writeln!(pkt_log, "RECV {} {}", len,
-                        recv_buf[..len].iter().map(|b| format!("{b:02x}")).collect::<String>());
+                    println!(
+                        "[recv] received {len} bytes from {addr} (first_byte=0x{:02x})",
+                        recv_buf[0]
+                    );
+                    let _ = writeln!(
+                        pkt_log,
+                        "RECV {} {}",
+                        len,
+                        recv_buf[..len]
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>()
+                    );
                     let _ = pkt_log.flush();
                     let now = to_micros(epoch, time::Instant::now());
                     match h3.recv(&recv_buf[..len], &mut scratch, now, &mut pool) {
-                        Ok(()) => {},
+                        Ok(()) => {}
                         Err(e) => eprintln!("[recv] error: {e}"),
                     }
                 } else {

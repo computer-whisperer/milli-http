@@ -58,12 +58,7 @@ pub trait HttpServerConn {
     ) -> Result<(), Error>;
 
     /// Send body data on a stream. Returns bytes written.
-    fn send_body(
-        &mut self,
-        stream_id: u64,
-        data: &[u8],
-        end_stream: bool,
-    ) -> Result<usize, Error>;
+    fn send_body(&mut self, stream_id: u64, data: &[u8], end_stream: bool) -> Result<usize, Error>;
 
     /// Whether the connection is established (handshake/settings complete).
     fn is_established(&self) -> bool;

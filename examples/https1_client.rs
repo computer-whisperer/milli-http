@@ -12,19 +12,19 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 
 use milli_http::crypto::rustcrypto::Aes128GcmProvider;
-use milli_http::http1::client::Http1Client;
 use milli_http::http1::Http1Event;
+use milli_http::http1::client::Http1Client;
 use milli_http::tcp_tls::client::TlsClient;
 use milli_http::tcp_tls::connection::TlsEvent;
-use milli_http::tls::handshake::TlsConfig;
 use milli_http::tls::TransportParams;
+use milli_http::tls::handshake::TlsConfig;
 
 fn main() {
     println!("milli-http HTTPS/1.1 client");
     println!("===========================");
 
-    let mut stream = TcpStream::connect("127.0.0.1:9443")
-        .expect("failed to connect to 127.0.0.1:9443");
+    let mut stream =
+        TcpStream::connect("127.0.0.1:9443").expect("failed to connect to 127.0.0.1:9443");
     println!("[conn] connected to 127.0.0.1:9443");
 
     stream.set_nonblocking(true).expect("set_nonblocking");
@@ -141,11 +141,13 @@ fn main() {
                 }
                 Http1Event::Headers(sid) => {
                     println!("[http1] response headers:");
-                    http1.recv_headers(sid, |name, value| {
-                        let n = core::str::from_utf8(name).unwrap_or("<bin>");
-                        let v = core::str::from_utf8(value).unwrap_or("<bin>");
-                        println!("[http1]   {n}: {v}");
-                    }).ok();
+                    http1
+                        .recv_headers(sid, |name, value| {
+                            let n = core::str::from_utf8(name).unwrap_or("<bin>");
+                            let v = core::str::from_utf8(value).unwrap_or("<bin>");
+                            println!("[http1]   {n}: {v}");
+                        })
+                        .ok();
                 }
                 Http1Event::Data(sid) => {
                     let mut body = [0u8; 8192];

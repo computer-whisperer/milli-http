@@ -1,6 +1,6 @@
+use crate::Instant;
 use crate::crypto::Level;
 use crate::error::Error;
-use crate::Instant;
 
 /// Metadata for a sent packet awaiting acknowledgment.
 #[derive(Debug, Clone, Copy)]
@@ -139,7 +139,11 @@ impl<const N: usize> SentPacketTracker<N> {
     }
 
     /// Get all packets with PN less than threshold in a given space.
-    pub fn sent_below_pn(&self, level: Level, pn_threshold: u64) -> impl Iterator<Item = &SentPacket> {
+    pub fn sent_below_pn(
+        &self,
+        level: Level,
+        pn_threshold: u64,
+    ) -> impl Iterator<Item = &SentPacket> {
         self.entries.iter().filter_map(move |slot| {
             slot.as_ref()
                 .filter(|p| p.level == level && p.pn < pn_threshold)
@@ -150,7 +154,8 @@ impl<const N: usize> SentPacketTracker<N> {
     pub fn remove(&mut self, level: Level, pn: u64) -> Option<SentPacket> {
         for slot in self.entries.iter_mut() {
             if let Some(pkt) = slot
-                && pkt.level == level && pkt.pn == pn
+                && pkt.level == level
+                && pkt.pn == pn
             {
                 let p = *pkt;
                 *slot = None;
@@ -207,9 +212,15 @@ mod tests {
         let mut tracker = SentPacketTracker::<16>::new();
         assert_eq!(tracker.count(), 0);
 
-        tracker.on_packet_sent(make_pkt(0, Level::Initial, 100, 1200)).unwrap();
-        tracker.on_packet_sent(make_pkt(1, Level::Initial, 200, 1200)).unwrap();
-        tracker.on_packet_sent(make_pkt(2, Level::Initial, 300, 1200)).unwrap();
+        tracker
+            .on_packet_sent(make_pkt(0, Level::Initial, 100, 1200))
+            .unwrap();
+        tracker
+            .on_packet_sent(make_pkt(1, Level::Initial, 200, 1200))
+            .unwrap();
+        tracker
+            .on_packet_sent(make_pkt(2, Level::Initial, 300, 1200))
+            .unwrap();
         assert_eq!(tracker.count(), 3);
 
         // ACK packets 0-2
@@ -223,7 +234,9 @@ mod tests {
     fn ack_with_gaps() {
         let mut tracker = SentPacketTracker::<16>::new();
         for pn in 0..6 {
-            tracker.on_packet_sent(make_pkt(pn, Level::Application, pn * 100, 100)).unwrap();
+            tracker
+                .on_packet_sent(make_pkt(pn, Level::Application, pn * 100, 100))
+                .unwrap();
         }
         assert_eq!(tracker.count(), 6);
 
@@ -248,7 +261,9 @@ mod tests {
     fn capacity_limit() {
         let mut tracker = SentPacketTracker::<4>::new();
         for pn in 0..4 {
-            tracker.on_packet_sent(make_pkt(pn, Level::Initial, pn * 100, 100)).unwrap();
+            tracker
+                .on_packet_sent(make_pkt(pn, Level::Initial, pn * 100, 100))
+                .unwrap();
         }
         let err = tracker.on_packet_sent(make_pkt(4, Level::Initial, 400, 100));
         assert!(err.is_err());
@@ -257,9 +272,15 @@ mod tests {
     #[test]
     fn sent_before_filtering() {
         let mut tracker = SentPacketTracker::<16>::new();
-        tracker.on_packet_sent(make_pkt(0, Level::Initial, 100, 100)).unwrap();
-        tracker.on_packet_sent(make_pkt(1, Level::Initial, 200, 100)).unwrap();
-        tracker.on_packet_sent(make_pkt(2, Level::Initial, 300, 100)).unwrap();
+        tracker
+            .on_packet_sent(make_pkt(0, Level::Initial, 100, 100))
+            .unwrap();
+        tracker
+            .on_packet_sent(make_pkt(1, Level::Initial, 200, 100))
+            .unwrap();
+        tracker
+            .on_packet_sent(make_pkt(2, Level::Initial, 300, 100))
+            .unwrap();
 
         let before_250: heapless::Vec<&SentPacket, 16> =
             tracker.sent_before(Level::Initial, 250).collect();
@@ -270,9 +291,15 @@ mod tests {
     #[test]
     fn sent_below_pn_filtering() {
         let mut tracker = SentPacketTracker::<16>::new();
-        tracker.on_packet_sent(make_pkt(0, Level::Application, 100, 100)).unwrap();
-        tracker.on_packet_sent(make_pkt(1, Level::Application, 200, 100)).unwrap();
-        tracker.on_packet_sent(make_pkt(5, Level::Application, 300, 100)).unwrap();
+        tracker
+            .on_packet_sent(make_pkt(0, Level::Application, 100, 100))
+            .unwrap();
+        tracker
+            .on_packet_sent(make_pkt(1, Level::Application, 200, 100))
+            .unwrap();
+        tracker
+            .on_packet_sent(make_pkt(5, Level::Application, 300, 100))
+            .unwrap();
 
         let below_3: heapless::Vec<&SentPacket, 16> =
             tracker.sent_below_pn(Level::Application, 3).collect();
@@ -282,9 +309,15 @@ mod tests {
     #[test]
     fn drop_space_removes_all() {
         let mut tracker = SentPacketTracker::<16>::new();
-        tracker.on_packet_sent(make_pkt(0, Level::Initial, 100, 100)).unwrap();
-        tracker.on_packet_sent(make_pkt(1, Level::Handshake, 200, 100)).unwrap();
-        tracker.on_packet_sent(make_pkt(2, Level::Application, 300, 100)).unwrap();
+        tracker
+            .on_packet_sent(make_pkt(0, Level::Initial, 100, 100))
+            .unwrap();
+        tracker
+            .on_packet_sent(make_pkt(1, Level::Handshake, 200, 100))
+            .unwrap();
+        tracker
+            .on_packet_sent(make_pkt(2, Level::Application, 300, 100))
+            .unwrap();
         assert_eq!(tracker.count(), 3);
 
         tracker.drop_space(Level::Initial);
@@ -298,7 +331,9 @@ mod tests {
         let mut tracker = SentPacketTracker::<16>::new();
         assert!(!tracker.has_ack_eliciting_in_flight(Level::Initial));
 
-        tracker.on_packet_sent(make_pkt(0, Level::Initial, 100, 100)).unwrap();
+        tracker
+            .on_packet_sent(make_pkt(0, Level::Initial, 100, 100))
+            .unwrap();
         assert!(tracker.has_ack_eliciting_in_flight(Level::Initial));
         assert!(!tracker.has_ack_eliciting_in_flight(Level::Handshake));
 
@@ -312,8 +347,12 @@ mod tests {
     #[test]
     fn remove_packet() {
         let mut tracker = SentPacketTracker::<16>::new();
-        tracker.on_packet_sent(make_pkt(0, Level::Initial, 100, 100)).unwrap();
-        tracker.on_packet_sent(make_pkt(1, Level::Initial, 200, 100)).unwrap();
+        tracker
+            .on_packet_sent(make_pkt(0, Level::Initial, 100, 100))
+            .unwrap();
+        tracker
+            .on_packet_sent(make_pkt(1, Level::Initial, 200, 100))
+            .unwrap();
 
         let removed = tracker.remove(Level::Initial, 0);
         assert!(removed.is_some());
@@ -327,7 +366,9 @@ mod tests {
     #[test]
     fn ack_wrong_level_is_noop() {
         let mut tracker = SentPacketTracker::<16>::new();
-        tracker.on_packet_sent(make_pkt(0, Level::Initial, 100, 100)).unwrap();
+        tracker
+            .on_packet_sent(make_pkt(0, Level::Initial, 100, 100))
+            .unwrap();
 
         let result = tracker.on_ack_received(Level::Application, 0, 0, &[]);
         assert_eq!(result.newly_acked.len(), 0);

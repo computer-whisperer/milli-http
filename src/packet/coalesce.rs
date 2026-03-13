@@ -43,12 +43,8 @@ impl<'a> Iterator for CoalescedPackets<'a> {
                 return Some(Err(Error::BufferTooSmall { needed: 6 }));
             }
 
-            let version = u32::from_be_bytes([
-                remaining[1],
-                remaining[2],
-                remaining[3],
-                remaining[4],
-            ]);
+            let version =
+                u32::from_be_bytes([remaining[1], remaining[2], remaining[3], remaining[4]]);
 
             // Version Negotiation (version == 0) -- consume rest
             if version == 0 {
@@ -112,7 +108,9 @@ impl<'a> Iterator for CoalescedPackets<'a> {
                     let total = pos + payload_length as usize;
                     if total > remaining.len() {
                         self.offset = self.buf.len();
-                        return Some(Err(Error::BufferTooSmall { needed: self.offset + total }));
+                        return Some(Err(Error::BufferTooSmall {
+                            needed: self.offset + total,
+                        }));
                     }
                     let pkt = &self.buf[self.offset..self.offset + total];
                     self.offset += total;

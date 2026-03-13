@@ -8,11 +8,10 @@ use crate::buf::Buf;
 use crate::connection::{Connection, Event};
 use crate::crypto::CryptoProvider;
 use crate::error::Error;
-use crate::h3::frame::{decode_h3_frame, encode_h3_frame, H3Frame};
+use crate::h3::frame::{H3Frame, decode_h3_frame, encode_h3_frame};
 use crate::h3::qpack::{QpackDecoder, QpackEncoder};
 use crate::h3::{
-    H3Settings, H3_STREAM_TYPE_CONTROL, H3_STREAM_TYPE_QPACK_DECODER,
-    H3_STREAM_TYPE_QPACK_ENCODER,
+    H3_STREAM_TYPE_CONTROL, H3_STREAM_TYPE_QPACK_DECODER, H3_STREAM_TYPE_QPACK_ENCODER, H3Settings,
 };
 use crate::varint::encode_varint;
 
@@ -44,10 +43,8 @@ pub enum H3Event {
 // ---------------------------------------------------------------------------
 
 /// Per-request-stream bookkeeping.
-pub(crate) struct RequestStreamState<
-    const H3_HDR_BUF: usize = 512,
-    const H3_DATA_BUF: usize = 1024,
-> {
+pub(crate) struct RequestStreamState<const H3_HDR_BUF: usize = 512, const H3_DATA_BUF: usize = 1024>
+{
     pub stream_id: u64,
     /// Buffer for received HEADERS frame data (QPACK-encoded).
     pub headers_data: Buf<H3_HDR_BUF>,
@@ -58,7 +55,9 @@ pub(crate) struct RequestStreamState<
     pub fin_received: bool,
 }
 
-impl<const H3_HDR_BUF: usize, const H3_DATA_BUF: usize> RequestStreamState<H3_HDR_BUF, H3_DATA_BUF> {
+impl<const H3_HDR_BUF: usize, const H3_DATA_BUF: usize>
+    RequestStreamState<H3_HDR_BUF, H3_DATA_BUF>
+{
     pub fn new(stream_id: u64) -> Self {
         Self {
             stream_id,
@@ -87,7 +86,8 @@ pub struct H3Connection<
     const H3_DATA_BUF: usize = 1024,
 > {
     pub(crate) quic: Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>,
-    pub(crate) sio_bufs: crate::connection::io::QuicStreamIoBufs<MAX_STREAMS, STREAM_BUF, SEND_QUEUE>,
+    pub(crate) sio_bufs:
+        crate::connection::io::QuicStreamIoBufs<MAX_STREAMS, STREAM_BUF, SEND_QUEUE>,
 
     // Control streams
     pub(crate) local_control_stream: Option<u64>,
@@ -129,8 +129,26 @@ pub struct H3Connection<
     pub(crate) pending_uni_streams: alloc::vec::Vec<u64>,
 }
 
-impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize, const H3_HDR_BUF: usize, const H3_DATA_BUF: usize>
-    H3Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, H3_HDR_BUF, H3_DATA_BUF>
+impl<
+    C: CryptoProvider,
+    const MAX_STREAMS: usize,
+    const SENT_PER_SPACE: usize,
+    const MAX_CIDS: usize,
+    const STREAM_BUF: usize,
+    const SEND_QUEUE: usize,
+    const H3_HDR_BUF: usize,
+    const H3_DATA_BUF: usize,
+>
+    H3Connection<
+        C,
+        MAX_STREAMS,
+        SENT_PER_SPACE,
+        MAX_CIDS,
+        STREAM_BUF,
+        SEND_QUEUE,
+        H3_HDR_BUF,
+        H3_DATA_BUF,
+    >
 where
     C::Hkdf: Default,
 {
@@ -198,7 +216,8 @@ where
         let mut buf = [0u8; 8];
         let len = encode_varint(stream_type, &mut buf)?;
         let mut sio = self.sio_bufs.as_io();
-        self.quic.stream_send(&mut sio, stream_id, &buf[..len], false)?;
+        self.quic
+            .stream_send(&mut sio, stream_id, &buf[..len], false)?;
         Ok(())
     }
 
@@ -208,7 +227,8 @@ where
         let mut buf = [0u8; 128];
         let len = encode_h3_frame(&frame, &mut buf)?;
         let mut sio = self.sio_bufs.as_io();
-        self.quic.stream_send(&mut sio, stream_id, &buf[..len], false)?;
+        self.quic
+            .stream_send(&mut sio, stream_id, &buf[..len], false)?;
         Ok(())
     }
 
@@ -217,7 +237,11 @@ where
     // ------------------------------------------------------------------
 
     /// Drain all pending QUIC events and translate them into H3 state changes.
-    pub(crate) fn process_quic_events(&mut self, is_server: bool, scratch: &mut [u8]) -> Result<(), Error> {
+    pub(crate) fn process_quic_events(
+        &mut self,
+        is_server: bool,
+        scratch: &mut [u8],
+    ) -> Result<(), Error> {
         // We collect events first to avoid borrow issues.
         let mut quic_events: heapless::Vec<Event, 16> = heapless::Vec::new();
         while let Some(ev) = self.quic.poll_event() {
@@ -243,8 +267,14 @@ where
                         self.push_h3_event(H3Event::Finished(stream_id));
                     }
                 }
-                Event::StreamReset { stream_id, error_code } => {
-                    self.push_h3_event(H3Event::StreamReset { stream_id, error_code });
+                Event::StreamReset {
+                    stream_id,
+                    error_code,
+                } => {
+                    self.push_h3_event(H3Event::StreamReset {
+                        stream_id,
+                        error_code,
+                    });
                 }
                 Event::ConnectionClose { error_code, .. } => {
                     self.push_h3_event(H3Event::ConnectionClose { error_code });
@@ -263,7 +293,12 @@ where
     // ------------------------------------------------------------------
 
     /// Handle data on a stream. Routes to uni or request stream handler.
-    fn handle_stream_data(&mut self, stream_id: u64, is_server: bool, scratch: &mut [u8]) -> Result<(), Error> {
+    fn handle_stream_data(
+        &mut self,
+        stream_id: u64,
+        is_server: bool,
+        scratch: &mut [u8],
+    ) -> Result<(), Error> {
         if crate::transport::stream::is_unidirectional(stream_id) {
             self.handle_uni_stream_data(stream_id, scratch)?;
         } else {
@@ -338,7 +373,11 @@ where
     }
 
     /// Read and process frames from the peer control stream.
-    fn read_control_stream_frames(&mut self, stream_id: u64, scratch: &mut [u8]) -> Result<(), Error> {
+    fn read_control_stream_frames(
+        &mut self,
+        stream_id: u64,
+        scratch: &mut [u8],
+    ) -> Result<(), Error> {
         let mut sio = self.sio_bufs.as_io();
         let (read_len, _fin) = match self.quic.stream_recv(&mut sio, stream_id, scratch) {
             Ok(r) => r,
@@ -395,7 +434,9 @@ where
             if self.request_streams.len() >= 8 {
                 return Ok(()); // At capacity
             }
-            let _ = self.request_streams.push(RequestStreamState::new(stream_id));
+            let _ = self
+                .request_streams
+                .push(RequestStreamState::new(stream_id));
         }
 
         // Read data from QUIC.
@@ -605,8 +646,8 @@ where
 #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
 mod tests {
     use super::*;
-    use crate::connection::{Connection, HandshakePool};
     use crate::connection::io::QuicStreamIoBufs;
+    use crate::connection::{Connection, HandshakePool};
     use crate::crypto::rustcrypto::Aes128GcmProvider;
     use crate::h3::client::H3Client;
     use crate::h3::server::H3Server;
@@ -644,7 +685,9 @@ mod tests {
         HandshakePool::new()
     }
 
-    fn make_quic_client(pool: &mut HandshakePool<Aes128GcmProvider, 2>) -> Connection<Aes128GcmProvider> {
+    fn make_quic_client(
+        pool: &mut HandshakePool<Aes128GcmProvider, 2>,
+    ) -> Connection<Aes128GcmProvider> {
         let mut rng = TestRng(0x10);
         Connection::client(
             Aes128GcmProvider,
@@ -657,7 +700,9 @@ mod tests {
         .unwrap()
     }
 
-    fn make_quic_server(pool: &mut HandshakePool<Aes128GcmProvider, 2>) -> Connection<Aes128GcmProvider> {
+    fn make_quic_server(
+        pool: &mut HandshakePool<Aes128GcmProvider, 2>,
+    ) -> Connection<Aes128GcmProvider> {
         let mut rng = TestRng(0x50);
         let config = ServerTlsConfig {
             cert_der: get_test_ed25519_cert_der(),
@@ -823,7 +868,14 @@ mod tests {
         let mut quic_server = make_quic_server(&mut pool);
         let mut c_sio = SioBufs::new();
         let mut s_sio = SioBufs::new();
-        run_quic_handshake(&mut quic_client, &mut c_sio, &mut quic_server, &mut s_sio, now, &mut pool);
+        run_quic_handshake(
+            &mut quic_client,
+            &mut c_sio,
+            &mut quic_server,
+            &mut s_sio,
+            now,
+            &mut pool,
+        );
 
         // DON'T drain events -- let the H3 wrappers see them.
         let mut client: H3Client<Aes128GcmProvider> = H3Client::new(quic_client);
@@ -881,7 +933,14 @@ mod tests {
         let mut quic_server = make_quic_server(&mut pool);
         let mut c_sio = SioBufs::new();
         let mut s_sio = SioBufs::new();
-        run_quic_handshake(&mut quic_client, &mut c_sio, &mut quic_server, &mut s_sio, now, &mut pool);
+        run_quic_handshake(
+            &mut quic_client,
+            &mut c_sio,
+            &mut quic_server,
+            &mut s_sio,
+            now,
+            &mut pool,
+        );
 
         let mut client: H3Client<Aes128GcmProvider> = H3Client::new(quic_client);
         let mut server: H3Server<Aes128GcmProvider> = H3Server::new(quic_server);
@@ -895,7 +954,9 @@ mod tests {
         exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
         // Client sends GET request.
-        let stream_id = client.send_request("GET", "/", "test.local", &[], false).unwrap();
+        let stream_id = client
+            .send_request("GET", "/", "test.local", &[], false)
+            .unwrap();
 
         // Send FIN on the request stream (no body for GET).
         client.send_body(stream_id, &[], true).unwrap();
@@ -937,13 +998,16 @@ mod tests {
 
         // Server sends response.
         server
-            .send_response(header_stream_id, 200, &[(b"content-type", b"text/plain")], false)
+            .send_response(
+                header_stream_id,
+                200,
+                &[(b"content-type", b"text/plain")],
+                false,
+            )
             .unwrap();
 
         let body = b"Hello, HTTP/3!";
-        server
-            .send_body(header_stream_id, body, true)
-            .unwrap();
+        server.send_body(header_stream_id, body, true).unwrap();
 
         // Exchange packets so client receives the response.
         exchange_h3_packets(&mut client, &mut server, now, &mut pool);
@@ -1004,7 +1068,14 @@ mod tests {
         let mut quic_server = make_quic_server(&mut pool);
         let mut c_sio = SioBufs::new();
         let mut s_sio = SioBufs::new();
-        run_quic_handshake(&mut quic_client, &mut c_sio, &mut quic_server, &mut s_sio, now, &mut pool);
+        run_quic_handshake(
+            &mut quic_client,
+            &mut c_sio,
+            &mut quic_server,
+            &mut s_sio,
+            now,
+            &mut pool,
+        );
 
         let mut client: H3Client<Aes128GcmProvider> = H3Client::new(quic_client);
         let mut server: H3Server<Aes128GcmProvider> = H3Server::new(quic_server);
@@ -1016,10 +1087,14 @@ mod tests {
         exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
         // Send two requests.
-        let stream1 = client.send_request("GET", "/page1", "test.local", &[], false).unwrap();
+        let stream1 = client
+            .send_request("GET", "/page1", "test.local", &[], false)
+            .unwrap();
         client.send_body(stream1, &[], true).unwrap();
 
-        let stream2 = client.send_request("GET", "/page2", "test.local", &[], false).unwrap();
+        let stream2 = client
+            .send_request("GET", "/page2", "test.local", &[], false)
+            .unwrap();
         client.send_body(stream2, &[], true).unwrap();
 
         // Stream IDs should be different.
@@ -1117,7 +1192,14 @@ mod tests {
         let mut quic_server = make_quic_server(&mut pool);
         let mut c_sio = SioBufs::new();
         let mut s_sio = SioBufs::new();
-        run_quic_handshake(&mut quic_client, &mut c_sio, &mut quic_server, &mut s_sio, now, &mut pool);
+        run_quic_handshake(
+            &mut quic_client,
+            &mut c_sio,
+            &mut quic_server,
+            &mut s_sio,
+            now,
+            &mut pool,
+        );
 
         let mut client: H3Client<Aes128GcmProvider> = H3Client::new(quic_client);
         let mut server: H3Server<Aes128GcmProvider> = H3Server::new(quic_server);

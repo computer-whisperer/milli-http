@@ -4,8 +4,8 @@
 
 #![cfg(feature = "server")]
 
-use milli_http::crypto::rustcrypto::Aes128GcmProvider;
 use milli_http::connection::HandshakePool;
+use milli_http::crypto::rustcrypto::Aes128GcmProvider;
 use milli_http::http::server_conn::HttpEvent;
 use milli_http::server::{ServerConfig, ServerEvent, ServerManager};
 use milli_http::tls::handshake::{ServerTlsConfig, TlsConfig};
@@ -59,7 +59,6 @@ fn tcp_accept_creates_connection() {
     assert_eq!(id2.0, 1);
 }
 
-
 #[test]
 fn tcp_handshake_and_http1_request() {
     let cert: &'static [u8] = test_cert_der().leak();
@@ -111,7 +110,10 @@ fn tcp_handshake_and_http1_request() {
     }
 
     // Client should be established
-    assert!(client.is_established(), "client TLS handshake should complete");
+    assert!(
+        client.is_established(),
+        "client TLS handshake should complete"
+    );
 
     let mut scratch = [0u8; 2048];
 
@@ -141,7 +143,11 @@ fn tcp_handshake_and_http1_request() {
     let mut got_headers = false;
     let mut header_stream = 0u64;
     while let Some(ev) = manager.poll_event(&mut scratch) {
-        if let ServerEvent::Http { conn, event: HttpEvent::Headers(sid) } = ev {
+        if let ServerEvent::Http {
+            conn,
+            event: HttpEvent::Headers(sid),
+        } = ev
+        {
             if conn == conn_id {
                 got_headers = true;
                 header_stream = sid;
@@ -152,16 +158,28 @@ fn tcp_handshake_and_http1_request() {
 
     // Read headers through manager
     let mut method = Vec::new();
-    manager.recv_headers(conn_id, header_stream, &mut |name: &[u8], value: &[u8]| {
-        if name == b":method" {
-            method.extend_from_slice(value);
-        }
-    }).unwrap();
+    manager
+        .recv_headers(conn_id, header_stream, &mut |name: &[u8], value: &[u8]| {
+            if name == b":method" {
+                method.extend_from_slice(value);
+            }
+        })
+        .unwrap();
     assert_eq!(method, b"GET");
 
     // Send response through manager
-    manager.send_response(conn_id, header_stream, 200, &[(b"content-length", b"5")], false).unwrap();
-    manager.send_body(conn_id, header_stream, b"Hello", true).unwrap();
+    manager
+        .send_response(
+            conn_id,
+            header_stream,
+            200,
+            &[(b"content-length", b"5")],
+            false,
+        )
+        .unwrap();
+    manager
+        .send_body(conn_id, header_stream, b"Hello", true)
+        .unwrap();
 
     // Transfer response: manager → client
     let mut buf2 = [0u8; 32768];
@@ -183,11 +201,13 @@ fn tcp_handshake_and_http1_request() {
 
     // Read status
     let mut status = Vec::new();
-    client.recv_headers(stream_id, |name, value| {
-        if name == b":status" {
-            status.extend_from_slice(value);
-        }
-    }).unwrap();
+    client
+        .recv_headers(stream_id, |name, value| {
+            if name == b":status" {
+                status.extend_from_slice(value);
+            }
+        })
+        .unwrap();
     assert_eq!(status, b"200");
 
     // Read body
@@ -336,7 +356,8 @@ fn udp_quic_handshake_and_h3_request() {
         TransportParams::default_params(),
         &mut rng,
         &mut pool,
-    ).unwrap();
+    )
+    .unwrap();
     let mut client = milli_http::h3::client::H3Client::new(client_conn);
 
     let peer_addr: u32 = 42;
@@ -349,11 +370,22 @@ fn udp_quic_handshake_and_h3_request() {
     let mut client_connected = false;
     let mut conn_id = None;
     for _ in 0..20 {
-        exchange_udp(&mut client, &mut manager, peer_addr, now, &mut rng, &mut pool);
+        exchange_udp(
+            &mut client,
+            &mut manager,
+            peer_addr,
+            now,
+            &mut rng,
+            &mut pool,
+        );
 
         // Poll manager events (triggers H3 setup when QUIC handshake completes)
         while let Some(ev) = manager.poll_event(&mut scratch) {
-            if let ServerEvent::Http { conn, event: HttpEvent::Connected } = ev {
+            if let ServerEvent::Http {
+                conn,
+                event: HttpEvent::Connected,
+            } = ev
+            {
                 conn_id = Some(conn);
             }
         }
@@ -379,66 +411,131 @@ fn udp_quic_handshake_and_h3_request() {
     client.send_body(stream_id, &[], true).unwrap();
 
     // Exchange so manager receives request
-    exchange_udp(&mut client, &mut manager, peer_addr, now, &mut rng, &mut pool);
+    exchange_udp(
+        &mut client,
+        &mut manager,
+        peer_addr,
+        now,
+        &mut rng,
+        &mut pool,
+    );
 
     // Manager should have Headers event
     let mut got_headers = false;
     let mut header_stream = 0u64;
     for _ in 0..10 {
         while let Some(ev) = manager.poll_event(&mut scratch) {
-            if let ServerEvent::Http { conn, event: HttpEvent::Headers(sid) } = ev {
+            if let ServerEvent::Http {
+                conn,
+                event: HttpEvent::Headers(sid),
+            } = ev
+            {
                 if conn == conn_id {
                     got_headers = true;
                     header_stream = sid;
                 }
             }
         }
-        if got_headers { break; }
-        exchange_udp(&mut client, &mut manager, peer_addr, now, &mut rng, &mut pool);
+        if got_headers {
+            break;
+        }
+        exchange_udp(
+            &mut client,
+            &mut manager,
+            peer_addr,
+            now,
+            &mut rng,
+            &mut pool,
+        );
     }
     assert!(got_headers, "manager should receive H3 request headers");
 
     // Read request headers through manager
     let mut method = Vec::new();
     let mut path = Vec::new();
-    manager.recv_headers(conn_id, header_stream, &mut |name: &[u8], value: &[u8]| {
-        if name == b":method" { method.extend_from_slice(value); }
-        if name == b":path" { path.extend_from_slice(value); }
-    }).unwrap();
+    manager
+        .recv_headers(conn_id, header_stream, &mut |name: &[u8], value: &[u8]| {
+            if name == b":method" {
+                method.extend_from_slice(value);
+            }
+            if name == b":path" {
+                path.extend_from_slice(value);
+            }
+        })
+        .unwrap();
     assert_eq!(method, b"GET");
     assert_eq!(path, b"/hello");
 
     // Send response through manager
-    manager.send_response(conn_id, header_stream, 200, &[(b"content-length", b"5")], false).unwrap();
-    manager.send_body(conn_id, header_stream, b"Hello", true).unwrap();
+    manager
+        .send_response(
+            conn_id,
+            header_stream,
+            200,
+            &[(b"content-length", b"5")],
+            false,
+        )
+        .unwrap();
+    manager
+        .send_body(conn_id, header_stream, b"Hello", true)
+        .unwrap();
 
     // Exchange so client receives response
-    exchange_udp(&mut client, &mut manager, peer_addr, now, &mut rng, &mut pool);
+    exchange_udp(
+        &mut client,
+        &mut manager,
+        peer_addr,
+        now,
+        &mut rng,
+        &mut pool,
+    );
 
     // Client reads response
     let mut got_resp = false;
     for _ in 0..10 {
         while let Some(ev) = client.poll_event(&mut scratch) {
             if let milli_http::h3::H3Event::Headers(sid) = ev {
-                if sid == stream_id { got_resp = true; }
+                if sid == stream_id {
+                    got_resp = true;
+                }
             }
         }
-        if got_resp { break; }
-        exchange_udp(&mut client, &mut manager, peer_addr, now, &mut rng, &mut pool);
+        if got_resp {
+            break;
+        }
+        exchange_udp(
+            &mut client,
+            &mut manager,
+            peer_addr,
+            now,
+            &mut rng,
+            &mut pool,
+        );
     }
     assert!(got_resp, "client should receive response headers");
 
     // Read status
     let mut status = Vec::new();
-    client.recv_headers(stream_id, |name, value| {
-        if name == b":status" { status.extend_from_slice(value); }
-    }).unwrap();
+    client
+        .recv_headers(stream_id, |name, value| {
+            if name == b":status" {
+                status.extend_from_slice(value);
+            }
+        })
+        .unwrap();
     assert_eq!(status, b"200");
 
     // Read body
     let mut body = [0u8; 64];
     // May need another exchange for Data frame
-    exchange_udp(&mut client, &mut manager, peer_addr, now, &mut rng, &mut pool);
+    exchange_udp(
+        &mut client,
+        &mut manager,
+        peer_addr,
+        now,
+        &mut rng,
+        &mut pool,
+    );
     while let Some(_) = client.poll_event(&mut scratch) {} // drain events
     let (n, _fin) = client.recv_body(stream_id, &mut body).unwrap();
     assert_eq!(&body[..n], b"Hello");

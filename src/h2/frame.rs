@@ -37,10 +37,10 @@ pub const FLAG_PRIORITY: u8 = 0x20;
 /// HTTP/2 frame header (9 bytes on wire).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct H2FrameHeader {
-    pub length: u32,     // 24-bit payload length
+    pub length: u32, // 24-bit payload length
     pub frame_type: u8,
     pub flags: u8,
-    pub stream_id: u64,  // 31-bit on wire (MSB reserved), u64 for API consistency with H3
+    pub stream_id: u64, // 31-bit on wire (MSB reserved), u64 for API consistency with H3
 }
 
 /// HTTP/2 stream priority weight/dependency.
@@ -120,7 +120,12 @@ pub fn decode_frame_header(buf: &[u8]) -> Result<H2FrameHeader, Error> {
     let frame_type = buf[3];
     let flags = buf[4];
     let stream_id = u32::from_be_bytes([buf[5] & 0x7f, buf[6], buf[7], buf[8]]) as u64;
-    Ok(H2FrameHeader { length, frame_type, flags, stream_id })
+    Ok(H2FrameHeader {
+        length,
+        frame_type,
+        flags,
+        stream_id,
+    })
 }
 
 /// Encode a 9-byte frame header into `buf`.
@@ -174,7 +179,14 @@ pub fn decode_frame(buf: &[u8]) -> Result<(H2Frame<'_>, usize), Error> {
                 let exclusive = data[0] & 0x80 != 0;
                 let dependency = u32::from_be_bytes([data[0] & 0x7f, data[1], data[2], data[3]]);
                 let weight = data[4];
-                (Some(H2Priority { exclusive, dependency, weight }), &data[5..])
+                (
+                    Some(H2Priority {
+                        exclusive,
+                        dependency,
+                        weight,
+                    }),
+                    &data[5..],
+                )
             } else {
                 (None, data)
             };
@@ -195,11 +207,16 @@ pub fn decode_frame(buf: &[u8]) -> Result<(H2Frame<'_>, usize), Error> {
                 return Err(Error::InvalidState);
             }
             let exclusive = payload[0] & 0x80 != 0;
-            let dependency = u32::from_be_bytes([payload[0] & 0x7f, payload[1], payload[2], payload[3]]);
+            let dependency =
+                u32::from_be_bytes([payload[0] & 0x7f, payload[1], payload[2], payload[3]]);
             let weight = payload[4];
             H2Frame::Priority {
                 stream_id: hdr.stream_id,
-                priority: H2Priority { exclusive, dependency, weight },
+                priority: H2Priority {
+                    exclusive,
+                    dependency,
+                    weight,
+                },
             }
         }
         FRAME_RST_STREAM => {
@@ -231,7 +248,8 @@ pub fn decode_frame(buf: &[u8]) -> Result<(H2Frame<'_>, usize), Error> {
             if data.len() < 4 {
                 return Err(Error::BufferTooSmall { needed: 4 });
             }
-            let promised_id = u32::from_be_bytes([data[0] & 0x7f, data[1], data[2], data[3]]) as u64;
+            let promised_id =
+                u32::from_be_bytes([data[0] & 0x7f, data[1], data[2], data[3]]) as u64;
             H2Frame::PushPromise {
                 stream_id: hdr.stream_id,
                 promised_id,
@@ -262,12 +280,9 @@ pub fn decode_frame(buf: &[u8]) -> Result<(H2Frame<'_>, usize), Error> {
             if payload.len() < 8 {
                 return Err(Error::BufferTooSmall { needed: 8 });
             }
-            let last_stream_id = u32::from_be_bytes([
-                payload[0] & 0x7f, payload[1], payload[2], payload[3],
-            ]) as u64;
-            let error_code = u32::from_be_bytes([
-                payload[4], payload[5], payload[6], payload[7],
-            ]);
+            let last_stream_id =
+                u32::from_be_bytes([payload[0] & 0x7f, payload[1], payload[2], payload[3]]) as u64;
+            let error_code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
             H2Frame::GoAway {
                 last_stream_id,
                 error_code,
@@ -278,29 +293,24 @@ pub fn decode_frame(buf: &[u8]) -> Result<(H2Frame<'_>, usize), Error> {
             if payload.len() != 4 {
                 return Err(Error::InvalidState);
             }
-            let increment = u32::from_be_bytes([
-                payload[0] & 0x7f, payload[1], payload[2], payload[3],
-            ]);
+            let increment =
+                u32::from_be_bytes([payload[0] & 0x7f, payload[1], payload[2], payload[3]]);
             H2Frame::WindowUpdate {
                 stream_id: hdr.stream_id,
                 increment,
             }
         }
-        FRAME_CONTINUATION => {
-            H2Frame::Continuation {
-                stream_id: hdr.stream_id,
-                fragment: payload,
-                end_headers: hdr.flags & FLAG_END_HEADERS != 0,
-            }
-        }
-        _ => {
-            H2Frame::Unknown {
-                frame_type: hdr.frame_type,
-                stream_id: hdr.stream_id,
-                flags: hdr.flags,
-                payload,
-            }
-        }
+        FRAME_CONTINUATION => H2Frame::Continuation {
+            stream_id: hdr.stream_id,
+            fragment: payload,
+            end_headers: hdr.flags & FLAG_END_HEADERS != 0,
+        },
+        _ => H2Frame::Unknown {
+            frame_type: hdr.frame_type,
+            stream_id: hdr.stream_id,
+            flags: hdr.flags,
+            payload,
+        },
     };
 
     Ok((frame, total))
@@ -311,7 +321,11 @@ pub fn decode_frame(buf: &[u8]) -> Result<(H2Frame<'_>, usize), Error> {
 /// Returns the total number of bytes written (header + payload).
 pub fn encode_frame(frame: &H2Frame<'_>, buf: &mut [u8]) -> Result<usize, Error> {
     match frame {
-        H2Frame::Data { stream_id, payload, end_stream } => {
+        H2Frame::Data {
+            stream_id,
+            payload,
+            end_stream,
+        } => {
             let flags = if *end_stream { FLAG_END_STREAM } else { 0 };
             let hdr = H2FrameHeader {
                 length: payload.len() as u32,
@@ -327,11 +341,26 @@ pub fn encode_frame(frame: &H2Frame<'_>, buf: &mut [u8]) -> Result<usize, Error>
             buf[9..9 + payload.len()].copy_from_slice(payload);
             Ok(total)
         }
-        H2Frame::Headers { stream_id, fragment, end_stream, end_headers, priority } => {
+        H2Frame::Headers {
+            stream_id,
+            fragment,
+            end_stream,
+            end_headers,
+            priority,
+        } => {
             let mut flags = 0u8;
-            if *end_stream { flags |= FLAG_END_STREAM; }
-            if *end_headers { flags |= FLAG_END_HEADERS; }
-            let priority_len = if priority.is_some() { flags |= FLAG_PRIORITY; 5 } else { 0 };
+            if *end_stream {
+                flags |= FLAG_END_STREAM;
+            }
+            if *end_headers {
+                flags |= FLAG_END_HEADERS;
+            }
+            let priority_len = if priority.is_some() {
+                flags |= FLAG_PRIORITY;
+                5
+            } else {
+                0
+            };
             let payload_len = priority_len + fragment.len();
             let hdr = H2FrameHeader {
                 length: payload_len as u32,
@@ -346,7 +375,11 @@ pub fn encode_frame(frame: &H2Frame<'_>, buf: &mut [u8]) -> Result<usize, Error>
             encode_frame_header(&hdr, buf)?;
             let mut off = 9;
             if let Some(p) = priority {
-                let dep = if p.exclusive { p.dependency | 0x8000_0000 } else { p.dependency };
+                let dep = if p.exclusive {
+                    p.dependency | 0x8000_0000
+                } else {
+                    p.dependency
+                };
                 let dep_bytes = dep.to_be_bytes();
                 buf[off..off + 4].copy_from_slice(&dep_bytes);
                 buf[off + 4] = p.weight;
@@ -355,7 +388,10 @@ pub fn encode_frame(frame: &H2Frame<'_>, buf: &mut [u8]) -> Result<usize, Error>
             buf[off..off + fragment.len()].copy_from_slice(fragment);
             Ok(total)
         }
-        H2Frame::Priority { stream_id, priority } => {
+        H2Frame::Priority {
+            stream_id,
+            priority,
+        } => {
             let hdr = H2FrameHeader {
                 length: 5,
                 frame_type: FRAME_PRIORITY,
@@ -367,12 +403,19 @@ pub fn encode_frame(frame: &H2Frame<'_>, buf: &mut [u8]) -> Result<usize, Error>
                 return Err(Error::BufferTooSmall { needed: total });
             }
             encode_frame_header(&hdr, buf)?;
-            let dep = if priority.exclusive { priority.dependency | 0x8000_0000 } else { priority.dependency };
+            let dep = if priority.exclusive {
+                priority.dependency | 0x8000_0000
+            } else {
+                priority.dependency
+            };
             buf[9..13].copy_from_slice(&dep.to_be_bytes());
             buf[13] = priority.weight;
             Ok(total)
         }
-        H2Frame::RstStream { stream_id, error_code } => {
+        H2Frame::RstStream {
+            stream_id,
+            error_code,
+        } => {
             let hdr = H2FrameHeader {
                 length: 4,
                 frame_type: FRAME_RST_STREAM,
@@ -402,7 +445,12 @@ pub fn encode_frame(frame: &H2Frame<'_>, buf: &mut [u8]) -> Result<usize, Error>
             buf[9..total].copy_from_slice(params);
             Ok(total)
         }
-        H2Frame::PushPromise { stream_id, promised_id, fragment, end_headers } => {
+        H2Frame::PushPromise {
+            stream_id,
+            promised_id,
+            fragment,
+            end_headers,
+        } => {
             let flags = if *end_headers { FLAG_END_HEADERS } else { 0 };
             let payload_len = 4 + fragment.len();
             let hdr = H2FrameHeader {
@@ -435,7 +483,11 @@ pub fn encode_frame(frame: &H2Frame<'_>, buf: &mut [u8]) -> Result<usize, Error>
             buf[9..17].copy_from_slice(data);
             Ok(17)
         }
-        H2Frame::GoAway { last_stream_id, error_code, debug } => {
+        H2Frame::GoAway {
+            last_stream_id,
+            error_code,
+            debug,
+        } => {
             let payload_len = 8 + debug.len();
             let hdr = H2FrameHeader {
                 length: payload_len as u32,
@@ -453,7 +505,10 @@ pub fn encode_frame(frame: &H2Frame<'_>, buf: &mut [u8]) -> Result<usize, Error>
             buf[17..total].copy_from_slice(debug);
             Ok(total)
         }
-        H2Frame::WindowUpdate { stream_id, increment } => {
+        H2Frame::WindowUpdate {
+            stream_id,
+            increment,
+        } => {
             let hdr = H2FrameHeader {
                 length: 4,
                 frame_type: FRAME_WINDOW_UPDATE,
@@ -467,7 +522,11 @@ pub fn encode_frame(frame: &H2Frame<'_>, buf: &mut [u8]) -> Result<usize, Error>
             buf[9..13].copy_from_slice(&(*increment & 0x7fff_ffff).to_be_bytes());
             Ok(13)
         }
-        H2Frame::Continuation { stream_id, fragment, end_headers } => {
+        H2Frame::Continuation {
+            stream_id,
+            fragment,
+            end_headers,
+        } => {
             let flags = if *end_headers { FLAG_END_HEADERS } else { 0 };
             let hdr = H2FrameHeader {
                 length: fragment.len() as u32,
@@ -538,7 +597,12 @@ where
     let mut pos = 0;
     while pos + 6 <= payload.len() {
         let id = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
-        let value = u32::from_be_bytes([payload[pos + 2], payload[pos + 3], payload[pos + 4], payload[pos + 5]]);
+        let value = u32::from_be_bytes([
+            payload[pos + 2],
+            payload[pos + 3],
+            payload[pos + 4],
+            payload[pos + 5],
+        ]);
         emit(id, value)?;
         pos += 6;
     }
@@ -748,7 +812,12 @@ mod tests {
         let (frame, consumed) = decode_frame(&buf).unwrap();
         assert_eq!(consumed, 12);
         match frame {
-            H2Frame::Unknown { frame_type, stream_id, flags, payload } => {
+            H2Frame::Unknown {
+                frame_type,
+                stream_id,
+                flags,
+                payload,
+            } => {
                 assert_eq!(frame_type, 0xfe);
                 assert_eq!(stream_id, 5);
                 assert_eq!(flags, 0x42);
@@ -819,7 +888,8 @@ mod tests {
         decode_settings_params(&buf[..off], |id, val| {
             let _ = params.push((id, val));
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
         assert_eq!(params.len(), 3);
         assert_eq!(params[0], (SETTINGS_HEADER_TABLE_SIZE, 4096));
@@ -872,8 +942,15 @@ mod tests {
 
     #[test]
     fn multiple_frames_in_buffer() {
-        let f1 = H2Frame::Data { stream_id: 1, payload: b"hi", end_stream: false };
-        let f2 = H2Frame::Ping { data: [0; 8], ack: true };
+        let f1 = H2Frame::Data {
+            stream_id: 1,
+            payload: b"hi",
+            end_stream: false,
+        };
+        let f2 = H2Frame::Ping {
+            data: [0; 8],
+            ack: true,
+        };
         let mut buf = [0u8; 64];
         let w1 = encode_frame(&f1, &mut buf).unwrap();
         let w2 = encode_frame(&f2, &mut buf[w1..]).unwrap();
@@ -916,7 +993,13 @@ mod tests {
         let wire: &[u8] = &[0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
         let (frame, consumed) = decode_frame(wire).unwrap();
         assert_eq!(consumed, 9);
-        assert_eq!(frame, H2Frame::Settings { ack: false, params: &[] });
+        assert_eq!(
+            frame,
+            H2Frame::Settings {
+                ack: false,
+                params: &[]
+            }
+        );
     }
 
     #[test]
@@ -925,7 +1008,13 @@ mod tests {
         let wire: &[u8] = &[0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00];
         let (frame, consumed) = decode_frame(wire).unwrap();
         assert_eq!(consumed, 9);
-        assert_eq!(frame, H2Frame::Settings { ack: true, params: &[] });
+        assert_eq!(
+            frame,
+            H2Frame::Settings {
+                ack: true,
+                params: &[]
+            }
+        );
     }
 
     #[test]

@@ -15,8 +15,8 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
-use milli_http::h2::server::H2Server;
 use milli_http::h2::H2Event;
+use milli_http::h2::server::H2Server;
 
 fn main() {
     println!("milli-http HTTP/2 server (h2c)");
@@ -28,9 +28,7 @@ fn main() {
     let (mut stream, client_addr) = listener.accept().expect("accept failed");
     println!("[conn] accepted connection from {client_addr}");
 
-    stream
-        .set_nonblocking(true)
-        .expect("set_nonblocking");
+    stream.set_nonblocking(true).expect("set_nonblocking");
 
     let mut h2 = H2Server::<32, 65536>::new();
 

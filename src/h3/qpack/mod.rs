@@ -49,9 +49,7 @@ impl QpackEncoder {
         // -- Delta Base: 0 with sign bit = 0 (prefix-7 integer) --
         // Sign bit (bit 7) = 0, delta base = 0.
         offset += integer::encode_integer(0, 7, 0x00, &mut buf[offset..])
-            .map_err(|_| Error::BufferTooSmall {
-                needed: offset + 1,
-            })?;
+            .map_err(|_| Error::BufferTooSmall { needed: offset + 1 })?;
 
         for &(name, value) in headers {
             let result = static_table::lookup(name, value);
@@ -98,8 +96,7 @@ impl QpackEncoder {
         offset += integer::encode_integer(name_index as u64, 4, 0b0111_0000, buf)?;
 
         // Value: H=0 (no Huffman) + length (prefix=7)
-        offset +=
-            integer::encode_integer(value.len() as u64, 7, 0x00, &mut buf[offset..])?;
+        offset += integer::encode_integer(value.len() as u64, 7, 0x00, &mut buf[offset..])?;
 
         // Value bytes
         if buf.len() - offset < value.len() {
@@ -132,8 +129,7 @@ impl QpackEncoder {
         offset += name.len();
 
         // Value: H=0 (no Huffman) + length (prefix=7)
-        offset +=
-            integer::encode_integer(value.len() as u64, 7, 0x00, &mut buf[offset..])?;
+        offset += integer::encode_integer(value.len() as u64, 7, 0x00, &mut buf[offset..])?;
 
         // Value bytes
         if buf.len() - offset < value.len() {
@@ -659,7 +655,10 @@ mod tests {
         assert_eq!(collected.entries[3].1.as_slice(), b"no-cache");
         assert_eq!(collected.entries[4].0.as_slice(), b"server");
         assert_eq!(collected.entries[4].1.as_slice(), b"milli-quic");
-        assert_eq!(collected.entries[5].0.as_slice(), b"strict-transport-security");
+        assert_eq!(
+            collected.entries[5].0.as_slice(),
+            b"strict-transport-security"
+        );
         assert_eq!(collected.entries[5].1.as_slice(), b"max-age=31536000");
     }
 
@@ -766,7 +765,9 @@ mod tests {
         let encoder = QpackEncoder::new();
         let decoder = QpackDecoder::new();
 
-        let methods: &[&[u8]] = &[b"CONNECT", b"DELETE", b"GET", b"HEAD", b"OPTIONS", b"POST", b"PUT"];
+        let methods: &[&[u8]] = &[
+            b"CONNECT", b"DELETE", b"GET", b"HEAD", b"OPTIONS", b"POST", b"PUT",
+        ];
 
         for method in methods {
             let headers: &[(&[u8], &[u8])] = &[(b":method", method)];
@@ -789,8 +790,8 @@ mod tests {
         let decoder = QpackDecoder::new();
 
         let statuses: &[&[u8]] = &[
-            b"100", b"103", b"200", b"204", b"206", b"302", b"304",
-            b"400", b"403", b"404", b"421", b"425", b"500", b"503",
+            b"100", b"103", b"200", b"204", b"206", b"302", b"304", b"400", b"403", b"404", b"421",
+            b"425", b"500", b"503",
         ];
 
         for status in statuses {
@@ -837,7 +838,8 @@ mod tests {
             // Exact match: encode a single header matching this entry
             let headers: &[(&[u8], &[u8])] = &[(entry.name, entry.value)];
             let mut buf = [0u8; 512];
-            let n = encoder.encode_field_section(headers, &mut buf)
+            let n = encoder
+                .encode_field_section(headers, &mut buf)
                 .unwrap_or_else(|e| panic!("encode failed for index {idx}: {e:?}"));
 
             let mut collected = CollectedHeaders::new();
@@ -846,7 +848,11 @@ mod tests {
                 .unwrap_or_else(|e| panic!("decode failed for index {idx}: {e:?}"));
 
             assert_eq!(consumed, n, "consumed mismatch for index {idx}");
-            assert_eq!(collected.entries.len(), 1, "expected 1 header for index {idx}");
+            assert_eq!(
+                collected.entries.len(),
+                1,
+                "expected 1 header for index {idx}"
+            );
             assert_eq!(
                 collected.entries[0].0.as_slice(),
                 entry.name,
@@ -908,8 +914,8 @@ mod tests {
         let prefixes: &[u8] = &[3, 4, 5, 6, 7, 8];
         for &prefix in prefixes {
             let max_prefix_val = (1u64 << prefix) - 2; // just below multi-byte threshold
-            let threshold = (1u64 << prefix) - 1;      // exactly at threshold
-            let above = threshold + 1;                   // just above
+            let threshold = (1u64 << prefix) - 1; // exactly at threshold
+            let above = threshold + 1; // just above
 
             for val in [max_prefix_val, threshold, above] {
                 let mut buf = [0u8; 16];

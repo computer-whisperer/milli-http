@@ -78,12 +78,18 @@ impl<const HDRBUF: usize, const DATABUF: usize> H2Stream<HDRBUF, DATABUF> {
 
     /// Whether the stream can receive data.
     pub fn can_recv(&self) -> bool {
-        matches!(self.state, H2StreamState::Open | H2StreamState::HalfClosedLocal)
+        matches!(
+            self.state,
+            H2StreamState::Open | H2StreamState::HalfClosedLocal
+        )
     }
 
     /// Whether the stream can send data.
     pub fn can_send(&self) -> bool {
-        matches!(self.state, H2StreamState::Open | H2StreamState::HalfClosedRemote)
+        matches!(
+            self.state,
+            H2StreamState::Open | H2StreamState::HalfClosedRemote
+        )
     }
 
     /// Reset this stream to Closed.

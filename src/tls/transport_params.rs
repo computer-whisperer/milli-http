@@ -267,12 +267,8 @@ impl TransportParams {
                         PARAM_INITIAL_MAX_STREAM_DATA_UNI => {
                             params.initial_max_stream_data_uni = value
                         }
-                        PARAM_INITIAL_MAX_STREAMS_BIDI => {
-                            params.initial_max_streams_bidi = value
-                        }
-                        PARAM_INITIAL_MAX_STREAMS_UNI => {
-                            params.initial_max_streams_uni = value
-                        }
+                        PARAM_INITIAL_MAX_STREAMS_BIDI => params.initial_max_streams_bidi = value,
+                        PARAM_INITIAL_MAX_STREAMS_UNI => params.initial_max_streams_uni = value,
                         PARAM_ACK_DELAY_EXPONENT => params.ack_delay_exponent = value,
                         PARAM_MAX_ACK_DELAY => params.max_ack_delay = value,
                         PARAM_ACTIVE_CONNECTION_ID_LIMIT => {
@@ -359,7 +355,8 @@ mod tests {
     fn roundtrip_with_cid_params() {
         let mut params = TransportParams::default_params();
         // Set original_dcid
-        params.original_dcid[..8].copy_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        params.original_dcid[..8]
+            .copy_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
         params.original_dcid_len = 8;
         // Set initial_scid
         params.initial_scid[..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
@@ -370,7 +367,10 @@ mod tests {
         let decoded = TransportParams::decode(&buf[..len]).unwrap();
         assert_eq!(params, decoded);
         assert_eq!(decoded.original_dcid_len, 8);
-        assert_eq!(&decoded.original_dcid[..8], &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        assert_eq!(
+            &decoded.original_dcid[..8],
+            &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+        );
         assert_eq!(decoded.initial_scid_len, 4);
         assert_eq!(&decoded.initial_scid[..4], &[0xAA, 0xBB, 0xCC, 0xDD]);
     }

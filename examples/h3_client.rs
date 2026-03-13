@@ -11,16 +11,18 @@
 use std::net::UdpSocket;
 use std::time;
 
+use milli_http::Rng;
 use milli_http::connection::{Connection, HandshakePool};
 use milli_http::crypto::rustcrypto::Aes128GcmProvider;
-use milli_http::h3::client::H3Client;
 use milli_http::h3::H3Event;
+use milli_http::h3::client::H3Client;
 use milli_http::tls::transport_params::TransportParams;
-use milli_http::Rng;
 
 struct StdRng(rand::rngs::ThreadRng);
 impl StdRng {
-    fn new() -> Self { Self(rand::rng()) }
+    fn new() -> Self {
+        Self(rand::rng())
+    }
 }
 impl Rng for StdRng {
     fn fill(&mut self, buf: &mut [u8]) {
@@ -38,7 +40,9 @@ fn main() {
     println!("========================");
 
     let socket = UdpSocket::bind("0.0.0.0:0").expect("failed to bind UDP socket");
-    socket.connect("127.0.0.1:4433").expect("failed to connect to server");
+    socket
+        .connect("127.0.0.1:4433")
+        .expect("failed to connect to server");
     socket
         .set_read_timeout(Some(std::time::Duration::from_millis(5)))
         .expect("set_read_timeout");

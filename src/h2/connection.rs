@@ -3,12 +3,14 @@
 //! Pure codec following the milli-http pattern:
 //! `feed_data()` → `poll_output()` → `poll_event()`
 
-use crate::error::Error;
-use crate::hpack::codec::{HpackDecoder, HpackEncoder};
+use super::flow_control::{
+    DEFAULT_CONNECTION_WINDOW_SIZE, DEFAULT_INITIAL_WINDOW_SIZE, FlowController,
+};
 use super::frame::{self, *};
 use super::io::H2Io;
 use super::stream::{H2Stream, H2StreamState};
-use super::flow_control::{FlowController, DEFAULT_INITIAL_WINDOW_SIZE, DEFAULT_CONNECTION_WINDOW_SIZE};
+use crate::error::Error;
+use crate::hpack::codec::{HpackDecoder, HpackEncoder};
 
 /// HTTP/2 connection preface (RFC 9113 §3.4).
 pub const CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -67,14 +69,34 @@ impl H2Settings {
     /// Encode settings as SETTINGS frame payload (6 bytes per param).
     pub fn encode_params(&self, buf: &mut [u8]) -> Result<usize, Error> {
         let mut off = 0;
-        off += frame::encode_setting(SETTINGS_HEADER_TABLE_SIZE, self.header_table_size, &mut buf[off..])?;
+        off += frame::encode_setting(
+            SETTINGS_HEADER_TABLE_SIZE,
+            self.header_table_size,
+            &mut buf[off..],
+        )?;
         if !self.enable_push {
             off += frame::encode_setting(SETTINGS_ENABLE_PUSH, 0, &mut buf[off..])?;
         }
-        off += frame::encode_setting(SETTINGS_MAX_CONCURRENT_STREAMS, self.max_concurrent_streams, &mut buf[off..])?;
-        off += frame::encode_setting(SETTINGS_INITIAL_WINDOW_SIZE, self.initial_window_size, &mut buf[off..])?;
-        off += frame::encode_setting(SETTINGS_MAX_FRAME_SIZE, self.max_frame_size, &mut buf[off..])?;
-        off += frame::encode_setting(SETTINGS_MAX_HEADER_LIST_SIZE, self.max_header_list_size, &mut buf[off..])?;
+        off += frame::encode_setting(
+            SETTINGS_MAX_CONCURRENT_STREAMS,
+            self.max_concurrent_streams,
+            &mut buf[off..],
+        )?;
+        off += frame::encode_setting(
+            SETTINGS_INITIAL_WINDOW_SIZE,
+            self.initial_window_size,
+            &mut buf[off..],
+        )?;
+        off += frame::encode_setting(
+            SETTINGS_MAX_FRAME_SIZE,
+            self.max_frame_size,
+            &mut buf[off..],
+        )?;
+        off += frame::encode_setting(
+            SETTINGS_MAX_HEADER_LIST_SIZE,
+            self.max_header_list_size,
+            &mut buf[off..],
+        )?;
         Ok(off)
     }
 
@@ -229,11 +251,17 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
     }
 
     /// Feed received TCP data into the connection.
-    pub fn feed_data<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>, data: &[u8]) -> Result<(), Error> {
+    pub fn feed_data<const BUF: usize>(
+        &mut self,
+        io: &mut H2Io<'_, BUF>,
+        data: &[u8],
+    ) -> Result<(), Error> {
         self.generate_output(io);
 
         if io.recv_buf.len() + data.len() > BUF {
-            return Err(Error::BufferTooSmall { needed: io.recv_buf.len() + data.len() });
+            return Err(Error::BufferTooSmall {
+                needed: io.recv_buf.len() + data.len(),
+            });
         }
         let _ = io.recv_buf.extend_from_slice(data);
 
@@ -241,7 +269,11 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
     }
 
     /// Pull the next chunk of outgoing data.
-    pub fn poll_output<'a, const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+    pub fn poll_output<'a, const BUF: usize>(
+        &mut self,
+        io: &mut H2Io<'_, BUF>,
+        buf: &'a mut [u8],
+    ) -> Option<&'a [u8]> {
         self.generate_output(io);
 
         if self.send_offset >= io.send_buf.len() {
@@ -292,20 +324,29 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
     ) -> Result<(), Error> {
         let hdr_start = io.send_buf.len();
         if hdr_start + 9 > BUF {
-            return Err(Error::BufferTooSmall { needed: hdr_start + 9 });
+            return Err(Error::BufferTooSmall {
+                needed: hdr_start + 9,
+            });
         }
-        for _ in 0..9 { let _ = io.send_buf.push(0); }
+        for _ in 0..9 {
+            let _ = io.send_buf.push(0);
+        }
 
         let encode_start = io.send_buf.len();
         let max_hpack = BUF - encode_start;
         while io.send_buf.len() < BUF {
             let _ = io.send_buf.push(0);
         }
-        let hpack_len = self.encoder.encode(headers, &mut io.send_buf[encode_start..encode_start + max_hpack])?;
+        let hpack_len = self.encoder.encode(
+            headers,
+            &mut io.send_buf[encode_start..encode_start + max_hpack],
+        )?;
         io.send_buf.truncate(encode_start + hpack_len);
 
         let mut flags = 0u8;
-        if end_stream { flags |= FLAG_END_STREAM; }
+        if end_stream {
+            flags |= FLAG_END_STREAM;
+        }
         flags |= FLAG_END_HEADERS;
         let hdr = frame::H2FrameHeader {
             length: hpack_len as u32,
@@ -352,26 +393,39 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         data: &[u8],
         end_stream: bool,
     ) -> Result<usize, Error> {
-        if let Some(stream) = self.get_stream(stream_id) && !stream.can_send() {
+        if let Some(stream) = self.get_stream(stream_id)
+            && !stream.can_send()
+        {
             return Err(Error::InvalidState);
         }
         let max_by_conn = self.conn_send_fc.window().max(0) as usize;
-        let max_by_stream = self.get_stream(stream_id)
+        let max_by_stream = self
+            .get_stream(stream_id)
             .map(|s| s.send_window.max(0) as usize)
             .unwrap_or(0);
         let max_frame = self.peer_settings.max_frame_size as usize;
-        let can_send = data.len().min(max_by_conn).min(max_by_stream).min(max_frame);
+        let can_send = data
+            .len()
+            .min(max_by_conn)
+            .min(max_by_stream)
+            .min(max_frame);
 
         if can_send == 0 && !data.is_empty() {
             return Err(Error::WouldBlock);
         }
 
-        let to_send = if data.is_empty() { data } else { &data[..can_send] };
+        let to_send = if data.is_empty() {
+            data
+        } else {
+            &data[..can_send]
+        };
         let actual_end = end_stream && (to_send.len() == data.len());
 
         let total_needed = 9 + to_send.len();
         if io.send_buf.len() + total_needed > BUF {
-            return Err(Error::BufferTooSmall { needed: io.send_buf.len() + total_needed });
+            return Err(Error::BufferTooSmall {
+                needed: io.send_buf.len() + total_needed,
+            });
         }
         let flags = if actual_end { FLAG_END_STREAM } else { 0 };
         let hdr = frame::H2FrameHeader {
@@ -381,7 +435,9 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
             stream_id,
         };
         let hdr_start = io.send_buf.len();
-        for _ in 0..9 { let _ = io.send_buf.push(0); }
+        for _ in 0..9 {
+            let _ = io.send_buf.push(0);
+        }
         frame::encode_frame_header(&hdr, &mut io.send_buf[hdr_start..hdr_start + 9])?;
         let _ = io.send_buf.extend_from_slice(to_send);
 
@@ -452,7 +508,11 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
     }
 
     /// Send a GOAWAY frame.
-    pub fn send_goaway<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>, error_code: u32) -> Result<(), Error> {
+    pub fn send_goaway<const BUF: usize>(
+        &mut self,
+        io: &mut H2Io<'_, BUF>,
+        error_code: u32,
+    ) -> Result<(), Error> {
         let frame = H2Frame::GoAway {
             last_stream_id: self.last_peer_stream_id,
             error_code,
@@ -485,10 +545,16 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         }
     }
 
-    fn send_initial_settings<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>) -> Result<(), Error> {
+    fn send_initial_settings<const BUF: usize>(
+        &mut self,
+        io: &mut H2Io<'_, BUF>,
+    ) -> Result<(), Error> {
         let mut params = [0u8; 64];
         let params_len = self.local_settings.encode_params(&mut params)?;
-        let frame = H2Frame::Settings { ack: false, params: &params[..params_len] };
+        let frame = H2Frame::Settings {
+            ack: false,
+            params: &params[..params_len],
+        };
         let mut buf = [0u8; 128];
         let n = frame::encode_frame(&frame, &mut buf)?;
         io.queue_send(&buf[..n])?;
@@ -497,24 +563,39 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
     }
 
     fn send_settings_ack<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>) -> Result<(), Error> {
-        let frame = H2Frame::Settings { ack: true, params: &[] };
+        let frame = H2Frame::Settings {
+            ack: true,
+            params: &[],
+        };
         let mut buf = [0u8; 16];
         let n = frame::encode_frame(&frame, &mut buf)?;
         io.queue_send(&buf[..n])
     }
 
-    fn send_ping_ack<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>, data: [u8; 8]) -> Result<(), Error> {
+    fn send_ping_ack<const BUF: usize>(
+        &mut self,
+        io: &mut H2Io<'_, BUF>,
+        data: [u8; 8],
+    ) -> Result<(), Error> {
         let frame = H2Frame::Ping { data, ack: true };
         let mut buf = [0u8; 32];
         let n = frame::encode_frame(&frame, &mut buf)?;
         io.queue_send(&buf[..n])
     }
 
-    fn send_window_update<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>, stream_id: u64, increment: u32) {
+    fn send_window_update<const BUF: usize>(
+        &mut self,
+        io: &mut H2Io<'_, BUF>,
+        stream_id: u64,
+        increment: u32,
+    ) {
         if increment == 0 {
             return;
         }
-        let frame = H2Frame::WindowUpdate { stream_id, increment };
+        let frame = H2Frame::WindowUpdate {
+            stream_id,
+            increment,
+        };
         let mut buf = [0u8; 16];
         if let Ok(n) = frame::encode_frame(&frame, &mut buf) {
             let _ = io.queue_send(&buf[..n]);
@@ -561,8 +642,10 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
             let frame_type = io.recv_buf[3];
             let flags = io.recv_buf[4];
             let stream_id = u32::from_be_bytes([
-                io.recv_buf[5] & 0x7f, io.recv_buf[6],
-                io.recv_buf[7], io.recv_buf[8],
+                io.recv_buf[5] & 0x7f,
+                io.recv_buf[6],
+                io.recv_buf[7],
+                io.recv_buf[8],
             ]) as u64;
             let ps = 9;
             let pe = total;
@@ -596,7 +679,9 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                     self.conn_recv_fc.consume(data_len as u32)?;
 
                     if let Some(stream) = self.streams.iter_mut().find(|s| s.id == stream_id) {
-                        let _ = stream.data_buf.extend_from_slice(&io.recv_buf[data_start..data_end]);
+                        let _ = stream
+                            .data_buf
+                            .extend_from_slice(&io.recv_buf[data_start..data_end]);
                         stream.data_available = true;
                         stream.recv_window -= data_len as i32;
                         if end_stream {
@@ -642,7 +727,9 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                             stream.open();
                         }
                         stream.headers_data.clear();
-                        let _ = stream.headers_data.extend_from_slice(&io.recv_buf[frag_start..data_end]);
+                        let _ = stream
+                            .headers_data
+                            .extend_from_slice(&io.recv_buf[frag_start..data_end]);
                         if end_headers {
                             stream.headers_received = true;
                         }
@@ -669,7 +756,8 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                             return Err(Error::Http2(crate::error::H2Error::FrameSizeError));
                         }
                         self.settings_ack_received = true;
-                        if self.peer_settings_received && self.state == H2ConnState::WaitingSettings {
+                        if self.peer_settings_received && self.state == H2ConnState::WaitingSettings
+                        {
                             self.state = H2ConnState::Active;
                             self.headers_phase_complete = true;
                             self.push_event(H2Event::Connected);
@@ -703,8 +791,10 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                         return Err(Error::InvalidState);
                     }
                     let increment = u32::from_be_bytes([
-                        io.recv_buf[ps] & 0x7f, io.recv_buf[ps + 1],
-                        io.recv_buf[ps + 2], io.recv_buf[ps + 3],
+                        io.recv_buf[ps] & 0x7f,
+                        io.recv_buf[ps + 1],
+                        io.recv_buf[ps + 2],
+                        io.recv_buf[ps + 3],
                     ]);
                     if increment == 0 {
                         return Err(Error::Http2(crate::error::H2Error::ProtocolError));
@@ -740,12 +830,16 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                         return Err(Error::BufferTooSmall { needed: 8 });
                     }
                     let last_stream_id = u32::from_be_bytes([
-                        io.recv_buf[ps] & 0x7f, io.recv_buf[ps + 1],
-                        io.recv_buf[ps + 2], io.recv_buf[ps + 3],
+                        io.recv_buf[ps] & 0x7f,
+                        io.recv_buf[ps + 1],
+                        io.recv_buf[ps + 2],
+                        io.recv_buf[ps + 3],
                     ]) as u64;
                     let error_code = u32::from_be_bytes([
-                        io.recv_buf[ps + 4], io.recv_buf[ps + 5],
-                        io.recv_buf[ps + 6], io.recv_buf[ps + 7],
+                        io.recv_buf[ps + 4],
+                        io.recv_buf[ps + 5],
+                        io.recv_buf[ps + 6],
+                        io.recv_buf[ps + 7],
                     ]);
                     self.state = H2ConnState::Closing;
                     self.push_event(H2Event::GoAway(last_stream_id, error_code));
@@ -758,8 +852,10 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                         return Err(Error::InvalidState);
                     }
                     let error_code = u32::from_be_bytes([
-                        io.recv_buf[ps], io.recv_buf[ps + 1],
-                        io.recv_buf[ps + 2], io.recv_buf[ps + 3],
+                        io.recv_buf[ps],
+                        io.recv_buf[ps + 1],
+                        io.recv_buf[ps + 2],
+                        io.recv_buf[ps + 3],
                     ]);
                     if let Some(stream) = self.get_stream_mut(stream_id) {
                         stream.reset();
@@ -788,12 +884,16 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
             io.drain_recv(total);
         }
 
-        self.streams.retain(|s| s.state != H2StreamState::Closed || s.data_available);
+        self.streams
+            .retain(|s| s.state != H2StreamState::Closed || s.data_available);
 
         Ok(())
     }
 
-    fn validate_client_preface<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>) -> Result<(), Error> {
+    fn validate_client_preface<const BUF: usize>(
+        &mut self,
+        io: &mut H2Io<'_, BUF>,
+    ) -> Result<(), Error> {
         let expected = CONNECTION_PREFACE;
         let remaining_preface = &expected[self.preface_bytes_seen..];
         let check_len = remaining_preface.len().min(io.recv_buf.len());
@@ -827,7 +927,9 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
             }
             let initial_send = self.peer_settings.initial_window_size as i32;
             let initial_recv = self.local_settings.initial_window_size as i32;
-            let _ = self.streams.push(H2Stream::new(stream_id, initial_send, initial_recv));
+            let _ = self
+                .streams
+                .push(H2Stream::new(stream_id, initial_send, initial_recv));
         }
     }
 
@@ -907,7 +1009,12 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
     }
 
     /// Feed data with timestamp tracking. Updates `last_activity` then calls `feed_data`.
-    pub fn feed_data_timed<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>, data: &[u8], now: u64) -> Result<(), Error> {
+    pub fn feed_data_timed<const BUF: usize>(
+        &mut self,
+        io: &mut H2Io<'_, BUF>,
+        data: &[u8],
+        now: u64,
+    ) -> Result<(), Error> {
         self.last_activity = now;
         self.feed_data(io, data)
     }
@@ -929,8 +1036,8 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::io::H2IoBufs;
+    use super::*;
 
     #[test]
     fn client_generates_preface() {
@@ -1024,16 +1131,18 @@ mod tests {
         run_handshake(&mut client, &mut cio, &mut server, &mut sio);
 
         // Client sends request
-        let stream_id = client.open_stream(
-            &mut cio.as_io(),
-            &[
-                (b":method", b"GET"),
-                (b":path", b"/"),
-                (b":scheme", b"https"),
-                (b":authority", b"example.com"),
-            ],
-            true,
-        ).unwrap();
+        let stream_id = client
+            .open_stream(
+                &mut cio.as_io(),
+                &[
+                    (b":method", b"GET"),
+                    (b":path", b"/"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"example.com"),
+                ],
+                true,
+            )
+            .unwrap();
         assert_eq!(stream_id, 1);
 
         exchange(&mut client, &mut cio, &mut server, &mut sio);
@@ -1051,21 +1160,27 @@ mod tests {
 
         // Server reads headers
         let mut method = heapless::Vec::<u8, 64>::new();
-        server.recv_headers(header_stream, |name, value| {
-            if name == b":method" {
-                let _ = method.extend_from_slice(value);
-            }
-        }).unwrap();
+        server
+            .recv_headers(header_stream, |name, value| {
+                if name == b":method" {
+                    let _ = method.extend_from_slice(value);
+                }
+            })
+            .unwrap();
         assert_eq!(method.as_slice(), b"GET");
 
         // Server sends response
-        server.send_headers(
-            &mut sio.as_io(),
-            header_stream,
-            &[(b":status", b"200"), (b"content-type", b"text/plain")],
-            false,
-        ).unwrap();
-        server.send_data(&mut sio.as_io(), header_stream, b"Hello!", true).unwrap();
+        server
+            .send_headers(
+                &mut sio.as_io(),
+                header_stream,
+                &[(b":status", b"200"), (b"content-type", b"text/plain")],
+                false,
+            )
+            .unwrap();
+        server
+            .send_data(&mut sio.as_io(), header_stream, b"Hello!", true)
+            .unwrap();
 
         exchange(&mut server, &mut sio, &mut client, &mut cio);
 
@@ -1084,7 +1199,9 @@ mod tests {
 
         // Client reads response body
         let mut body = [0u8; 256];
-        let (n, fin) = client.recv_body(&mut cio.as_io(), stream_id, &mut body).unwrap();
+        let (n, fin) = client
+            .recv_body(&mut cio.as_io(), stream_id, &mut body)
+            .unwrap();
         assert_eq!(&body[..n], b"Hello!");
         assert!(fin);
     }
@@ -1099,7 +1216,10 @@ mod tests {
 
         // Client sends PING by injecting raw frame into send_buf
         let ping_data = [1, 2, 3, 4, 5, 6, 7, 8];
-        let frame = H2Frame::Ping { data: ping_data, ack: false };
+        let frame = H2Frame::Ping {
+            data: ping_data,
+            ack: false,
+        };
         let mut buf = [0u8; 32];
         let n = frame::encode_frame(&frame, &mut buf).unwrap();
         cio.as_io().queue_send(&buf[..n]).unwrap();
@@ -1235,7 +1355,9 @@ mod tests {
         run_handshake(&mut client, &mut cio, &mut server, &mut sio);
 
         // Activity at t=800ms
-        server.feed_data_timed(&mut sio.as_io(), b"", 800_000).unwrap();
+        server
+            .feed_data_timed(&mut sio.as_io(), b"", 800_000)
+            .unwrap();
 
         // Check at t=1.5s — should NOT timeout
         server.handle_timeout(&mut sio.as_io(), 1_500_000);
@@ -1298,21 +1420,25 @@ mod tests {
 
         run_handshake(&mut client, &mut cio, &mut server, &mut sio);
 
-        let stream_id = client.open_stream(
-            &mut cio.as_io(),
-            &[
-                (b":method", b"GET"),
-                (b":path", b"/"),
-                (b":scheme", b"https"),
-                (b":authority", b"example.com"),
-            ],
-            true,
-        ).unwrap();
+        let stream_id = client
+            .open_stream(
+                &mut cio.as_io(),
+                &[
+                    (b":method", b"GET"),
+                    (b":path", b"/"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"example.com"),
+                ],
+                true,
+            )
+            .unwrap();
         exchange(&mut client, &mut cio, &mut server, &mut sio);
 
         while let Some(_) = server.poll_event() {}
 
-        server.send_headers(&mut sio.as_io(), stream_id, &[(b":status", b"200")], true).unwrap();
+        server
+            .send_headers(&mut sio.as_io(), stream_id, &[(b":status", b"200")], true)
+            .unwrap();
         exchange(&mut server, &mut sio, &mut client, &mut cio);
 
         while let Some(_) = client.poll_event() {}
@@ -1362,16 +1488,18 @@ mod tests {
         let mut sio = H2IoBufs::<32768>::new();
         run_handshake(&mut client, &mut cio, &mut server, &mut sio);
 
-        let stream_id = client.open_stream(
-            &mut cio.as_io(),
-            &[
-                (b":method", b"POST"),
-                (b":path", b"/"),
-                (b":scheme", b"https"),
-                (b":authority", b"example.com"),
-            ],
-            false,
-        ).unwrap();
+        let stream_id = client
+            .open_stream(
+                &mut cio.as_io(),
+                &[
+                    (b":method", b"POST"),
+                    (b":path", b"/"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"example.com"),
+                ],
+                false,
+            )
+            .unwrap();
         exchange(&mut client, &mut cio, &mut server, &mut sio);
         while let Some(_) = server.poll_event() {}
 
@@ -1380,7 +1508,9 @@ mod tests {
         while total_sent < 65535 {
             let remaining = 65535 - total_sent;
             let to_send = remaining.min(16384);
-            let n = client.send_data(&mut cio.as_io(), stream_id, &chunk[..to_send], false).unwrap();
+            let n = client
+                .send_data(&mut cio.as_io(), stream_id, &chunk[..to_send], false)
+                .unwrap();
             total_sent += n;
             exchange(&mut client, &mut cio, &mut server, &mut sio);
         }
@@ -1398,16 +1528,18 @@ mod tests {
         let mut sio = H2IoBufs::<32768>::new();
         run_handshake(&mut client, &mut cio, &mut server, &mut sio);
 
-        let stream_id = client.open_stream(
-            &mut cio.as_io(),
-            &[
-                (b":method", b"POST"),
-                (b":path", b"/"),
-                (b":scheme", b"https"),
-                (b":authority", b"example.com"),
-            ],
-            false,
-        ).unwrap();
+        let stream_id = client
+            .open_stream(
+                &mut cio.as_io(),
+                &[
+                    (b":method", b"POST"),
+                    (b":path", b"/"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"example.com"),
+                ],
+                false,
+            )
+            .unwrap();
         exchange(&mut client, &mut cio, &mut server, &mut sio);
         while let Some(_) = server.poll_event() {}
 
@@ -1416,15 +1548,26 @@ mod tests {
         while total_sent < 65535 {
             let remaining = 65535 - total_sent;
             let to_send = remaining.min(16384);
-            let n = client.send_data(&mut cio.as_io(), stream_id, &chunk[..to_send], false).unwrap();
+            let n = client
+                .send_data(&mut cio.as_io(), stream_id, &chunk[..to_send], false)
+                .unwrap();
             total_sent += n;
             exchange(&mut client, &mut cio, &mut server, &mut sio);
         }
-        assert_eq!(client.send_data(&mut cio.as_io(), stream_id, &[0u8; 1], false), Err(Error::WouldBlock));
+        assert_eq!(
+            client.send_data(&mut cio.as_io(), stream_id, &[0u8; 1], false),
+            Err(Error::WouldBlock)
+        );
 
         // Inject WINDOW_UPDATE frames
-        let wu_stream = H2Frame::WindowUpdate { stream_id, increment: 1024 };
-        let wu_conn = H2Frame::WindowUpdate { stream_id: 0, increment: 1024 };
+        let wu_stream = H2Frame::WindowUpdate {
+            stream_id,
+            increment: 1024,
+        };
+        let wu_conn = H2Frame::WindowUpdate {
+            stream_id: 0,
+            increment: 1024,
+        };
         let mut buf = [0u8; 16];
 
         let n = frame::encode_frame(&wu_stream, &mut buf).unwrap();
@@ -1447,20 +1590,25 @@ mod tests {
         let mut sio = H2IoBufs::<8192>::new();
         run_handshake(&mut client, &mut cio, &mut server, &mut sio);
 
-        let stream_id = client.open_stream(
-            &mut cio.as_io(),
-            &[
-                (b":method", b"GET"),
-                (b":path", b"/"),
-                (b":scheme", b"https"),
-                (b":authority", b"example.com"),
-            ],
-            true,
-        ).unwrap();
+        let stream_id = client
+            .open_stream(
+                &mut cio.as_io(),
+                &[
+                    (b":method", b"GET"),
+                    (b":path", b"/"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"example.com"),
+                ],
+                true,
+            )
+            .unwrap();
         exchange(&mut client, &mut cio, &mut server, &mut sio);
         while let Some(_) = client.poll_event() {}
 
-        let rst = H2Frame::RstStream { stream_id, error_code: 0x8 };
+        let rst = H2Frame::RstStream {
+            stream_id,
+            error_code: 0x8,
+        };
         let mut buf = [0u8; 32];
         let n = frame::encode_frame(&rst, &mut buf).unwrap();
         client.feed_data(&mut cio.as_io(), &buf[..n]).unwrap();
@@ -1471,7 +1619,10 @@ mod tests {
                 got_reset = true;
             }
         }
-        assert!(got_reset, "client should emit StreamReset(stream_id, CANCEL)");
+        assert!(
+            got_reset,
+            "client should emit StreamReset(stream_id, CANCEL)"
+        );
     }
 
     // ====== Item 4: Invalid SETTINGS Rejection ======
@@ -1483,14 +1634,14 @@ mod tests {
             let mut conn = H2Connection::<16>::new_client();
             let mut io = H2IoBufs::<8192>::new();
             let frame: &[u8] = &[
-                0x00, 0x00, 0x06,
-                0x04, 0x00,
-                0x00, 0x00, 0x00, 0x00,
-                0x00, 0x02,
-                0x00, 0x00, 0x00, 0x02,
+                0x00, 0x00, 0x06, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+                0x02,
             ];
             let result = conn.feed_data(&mut io.as_io(), frame);
-            assert_eq!(result, Err(Error::Http2(crate::error::H2Error::ProtocolError)));
+            assert_eq!(
+                result,
+                Err(Error::Http2(crate::error::H2Error::ProtocolError))
+            );
         }
 
         // Sub-check 2: INITIAL_WINDOW_SIZE = 0x8000_0000 → FlowControlError
@@ -1498,14 +1649,14 @@ mod tests {
             let mut conn = H2Connection::<16>::new_client();
             let mut io = H2IoBufs::<8192>::new();
             let frame: &[u8] = &[
-                0x00, 0x00, 0x06,
-                0x04, 0x00,
-                0x00, 0x00, 0x00, 0x00,
-                0x00, 0x04,
-                0x80, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x06, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x80, 0x00, 0x00,
+                0x00,
             ];
             let result = conn.feed_data(&mut io.as_io(), frame);
-            assert_eq!(result, Err(Error::Http2(crate::error::H2Error::FlowControlError)));
+            assert_eq!(
+                result,
+                Err(Error::Http2(crate::error::H2Error::FlowControlError))
+            );
         }
 
         // Sub-check 3: MAX_FRAME_SIZE = 100 → ProtocolError
@@ -1513,14 +1664,14 @@ mod tests {
             let mut conn = H2Connection::<16>::new_client();
             let mut io = H2IoBufs::<8192>::new();
             let frame: &[u8] = &[
-                0x00, 0x00, 0x06,
-                0x04, 0x00,
-                0x00, 0x00, 0x00, 0x00,
-                0x00, 0x05,
-                0x00, 0x00, 0x00, 0x64,
+                0x00, 0x00, 0x06, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+                0x64,
             ];
             let result = conn.feed_data(&mut io.as_io(), frame);
-            assert_eq!(result, Err(Error::Http2(crate::error::H2Error::ProtocolError)));
+            assert_eq!(
+                result,
+                Err(Error::Http2(crate::error::H2Error::ProtocolError))
+            );
         }
     }
 

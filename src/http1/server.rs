@@ -1,8 +1,8 @@
 //! HTTP/1.1 server wrapper.
 
-use crate::error::Error;
 use super::connection::{Http1Connection, Http1Event};
 use super::io::Http1IoBufs;
+use crate::error::Error;
 
 /// HTTP/1.1 server — owns both the connection state and I/O buffers.
 pub struct Http1Server<
@@ -50,11 +50,7 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     }
 
     /// Read request body.
-    pub fn recv_body(
-        &mut self,
-        stream_id: u64,
-        buf: &mut [u8],
-    ) -> Result<(usize, bool), Error> {
+    pub fn recv_body(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
         self.inner.recv_body(stream_id, buf)
     }
 
@@ -79,7 +75,8 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         for &(name, value) in headers {
             let _ = all_headers.push((name, value));
         }
-        self.inner.send_headers(&mut self.io.as_io(), stream_id, &all_headers, end_stream)
+        self.inner
+            .send_headers(&mut self.io.as_io(), stream_id, &all_headers, end_stream)
     }
 
     /// Send response body data.
@@ -89,7 +86,8 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         data: &[u8],
         end_stream: bool,
     ) -> Result<usize, Error> {
-        self.inner.send_data(&mut self.io.as_io(), stream_id, data, end_stream)
+        self.inner
+            .send_data(&mut self.io.as_io(), stream_id, data, end_stream)
     }
 
     /// Configure timeouts. `now` is the current timestamp in microseconds.
@@ -123,8 +121,8 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     }
 }
 
-impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
-    Default for Http1Server<BUF, HDRBUF, DATABUF>
+impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize> Default
+    for Http1Server<BUF, HDRBUF, DATABUF>
 {
     fn default() -> Self {
         Self::new()
@@ -143,16 +141,32 @@ mod tests {
     #[test]
     fn server_max_headers_succeeds() {
         let mut server = Http1Server::<8192, 1024, 1024>::new();
-        server.feed_data(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").unwrap();
+        server
+            .feed_data(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .unwrap();
         while server.poll_event().is_some() {}
         server.recv_headers(1, |_, _| {}).unwrap();
         // 1 pseudo + 19 user = 20, at the limit
         let hdrs: [(&[u8], &[u8]); 19] = [
-            (b"h1", b"v"), (b"h2", b"v"), (b"h3", b"v"), (b"h4", b"v"),
-            (b"h5", b"v"), (b"h6", b"v"), (b"h7", b"v"), (b"h8", b"v"),
-            (b"h9", b"v"), (b"h10", b"v"), (b"h11", b"v"), (b"h12", b"v"),
-            (b"h13", b"v"), (b"h14", b"v"), (b"h15", b"v"), (b"h16", b"v"),
-            (b"h17", b"v"), (b"h18", b"v"), (b"h19", b"v"),
+            (b"h1", b"v"),
+            (b"h2", b"v"),
+            (b"h3", b"v"),
+            (b"h4", b"v"),
+            (b"h5", b"v"),
+            (b"h6", b"v"),
+            (b"h7", b"v"),
+            (b"h8", b"v"),
+            (b"h9", b"v"),
+            (b"h10", b"v"),
+            (b"h11", b"v"),
+            (b"h12", b"v"),
+            (b"h13", b"v"),
+            (b"h14", b"v"),
+            (b"h15", b"v"),
+            (b"h16", b"v"),
+            (b"h17", b"v"),
+            (b"h18", b"v"),
+            (b"h19", b"v"),
         ];
         let result = server.send_response(1, 200, &hdrs, true);
         assert!(result.is_ok());
@@ -161,16 +175,33 @@ mod tests {
     #[test]
     fn server_too_many_headers() {
         let mut server = Http1Server::<8192, 1024, 1024>::new();
-        server.feed_data(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").unwrap();
+        server
+            .feed_data(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .unwrap();
         while server.poll_event().is_some() {}
         server.recv_headers(1, |_, _| {}).unwrap();
         // 1 pseudo + 20 user = 21, over the limit
         let hdrs: [(&[u8], &[u8]); 20] = [
-            (b"h1", b"v"), (b"h2", b"v"), (b"h3", b"v"), (b"h4", b"v"),
-            (b"h5", b"v"), (b"h6", b"v"), (b"h7", b"v"), (b"h8", b"v"),
-            (b"h9", b"v"), (b"h10", b"v"), (b"h11", b"v"), (b"h12", b"v"),
-            (b"h13", b"v"), (b"h14", b"v"), (b"h15", b"v"), (b"h16", b"v"),
-            (b"h17", b"v"), (b"h18", b"v"), (b"h19", b"v"), (b"h20", b"v"),
+            (b"h1", b"v"),
+            (b"h2", b"v"),
+            (b"h3", b"v"),
+            (b"h4", b"v"),
+            (b"h5", b"v"),
+            (b"h6", b"v"),
+            (b"h7", b"v"),
+            (b"h8", b"v"),
+            (b"h9", b"v"),
+            (b"h10", b"v"),
+            (b"h11", b"v"),
+            (b"h12", b"v"),
+            (b"h13", b"v"),
+            (b"h14", b"v"),
+            (b"h15", b"v"),
+            (b"h16", b"v"),
+            (b"h17", b"v"),
+            (b"h18", b"v"),
+            (b"h19", b"v"),
+            (b"h20", b"v"),
         ];
         let result = server.send_response(1, 200, &hdrs, true);
         assert_eq!(result, Err(crate::error::Error::TooManyHeaders));
