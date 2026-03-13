@@ -282,6 +282,11 @@ impl RecvPnTracker {
         }
     }
 
+    /// Returns `true` if `pn` has already been recorded.
+    pub fn contains(&self, pn: u64) -> bool {
+        self.ranges.iter().any(|&(start, end)| pn >= start && pn <= end)
+    }
+
     /// Insert a `(start, end)` range maintaining ascending order by `start`.
     fn insert_range(&mut self, start: u64, end: u64) {
         let pos = self
@@ -1321,6 +1326,7 @@ mod tests {
 
             let mut c_sio = SioBufs::new();
             let mut s_sio = SioBufs::new();
+            let mut scratch = [0u8; 2048];
             let now = 1_000_000u64;
             for _round in 0..20 {
                 loop {
@@ -1332,7 +1338,7 @@ mod tests {
                                 let _ = v.extend_from_slice(tx.data);
                                 v
                             };
-                            let _ = server.recv(&mut s_sio.as_io(), &data, now, &mut pool);
+                            let _ = server.recv(&mut s_sio.as_io(), &data, &mut scratch, now, &mut pool);
                         }
                         None => break,
                     }
@@ -1346,7 +1352,7 @@ mod tests {
                                 let _ = v.extend_from_slice(tx.data);
                                 v
                             };
-                            let _ = client.recv(&mut c_sio.as_io(), &data, now, &mut pool);
+                            let _ = client.recv(&mut c_sio.as_io(), &data, &mut scratch, now, &mut pool);
                         }
                         None => break,
                     }
@@ -1460,6 +1466,7 @@ mod tests {
             let mut pool = make_pool();
             let (mut client, mut c_sio) = make_client(&mut pool);
             let (mut server, mut s_sio) = make_server(&mut pool);
+            let mut scratch = [0u8; 2048];
             let now = 1_000_000u64;
 
             run_handshake_to_completion(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
@@ -1483,7 +1490,7 @@ mod tests {
                 v
             };
 
-            server.recv(&mut s_sio.as_io(), &pkt_data, now, &mut pool).unwrap();
+            server.recv(&mut s_sio.as_io(), &pkt_data, &mut scratch, now, &mut pool).unwrap();
 
             let mut found_readable = false;
             while let Some(ev) = server.poll_event() {
@@ -1505,6 +1512,7 @@ mod tests {
             let mut pool = make_pool();
             let (mut client, mut c_sio) = make_client(&mut pool);
             let (mut server, mut s_sio) = make_server(&mut pool);
+            let mut scratch = [0u8; 2048];
             let now = 1_000_000u64;
 
             run_handshake_to_completion(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
@@ -1522,7 +1530,7 @@ mod tests {
 
             assert!(client.is_closed());
 
-            server.recv(&mut s_sio.as_io(), &close_pkt, now, &mut pool).unwrap();
+            server.recv(&mut s_sio.as_io(), &close_pkt, &mut scratch, now, &mut pool).unwrap();
             assert_eq!(server.state(), ConnectionState::Draining);
 
             let mut found_close = false;
@@ -1542,6 +1550,7 @@ mod tests {
             now: Instant,
             pool: &mut HandshakePool<Aes128GcmProvider, 4>,
         ) {
+            let mut scratch = [0u8; 2048];
             for _round in 0..20 {
                 loop {
                     let mut buf = [0u8; 4096];
@@ -1552,7 +1561,7 @@ mod tests {
                                 let _ = v.extend_from_slice(tx.data);
                                 v
                             };
-                            let _ = server.recv(&mut s_sio.as_io(), &data, now, pool);
+                            let _ = server.recv(&mut s_sio.as_io(), &data, &mut scratch, now, pool);
                         }
                         None => break,
                     }
@@ -1566,7 +1575,7 @@ mod tests {
                                 let _ = v.extend_from_slice(tx.data);
                                 v
                             };
-                            let _ = client.recv(&mut c_sio.as_io(), &data, now, pool);
+                            let _ = client.recv(&mut c_sio.as_io(), &data, &mut scratch, now, pool);
                         }
                         None => break,
                     }
@@ -1615,6 +1624,7 @@ mod tests {
             let mut pool = make_pool();
             let (mut client, mut c_sio) = make_client(&mut pool);
             let (mut server, mut s_sio) = make_server(&mut pool);
+            let mut scratch = [0u8; 2048];
             let now = 1_000_000u64;
 
             run_handshake_to_completion(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
@@ -1633,7 +1643,7 @@ mod tests {
                 v
             };
 
-            server.recv(&mut s_sio.as_io(), &pkt, now, &mut pool).unwrap();
+            server.recv(&mut s_sio.as_io(), &pkt, &mut scratch, now, &mut pool).unwrap();
 
             let mut recv_buf = [0u8; 256];
             let (len, fin) = server.stream_recv(&mut s_sio.as_io(), stream_id, &mut recv_buf).unwrap();
@@ -1719,6 +1729,7 @@ mod tests {
             let mut pool = make_pool();
             let (mut client, mut c_sio) = make_client(&mut pool);
             let (mut server, mut s_sio) = make_server(&mut pool);
+            let mut scratch = [0u8; 2048];
             let now = 1_000_000u64;
             run_handshake_to_completion(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
@@ -1756,7 +1767,7 @@ mod tests {
                 let _ = v.extend_from_slice(tx.unwrap().data);
                 v
             };
-            let result = client.recv(&mut c_sio.as_io(), &pkt, now, &mut pool);
+            let result = client.recv(&mut c_sio.as_io(), &pkt, &mut scratch, now, &mut pool);
             assert!(result.is_ok(), "client should process PATH_RESPONSE without error");
         }
 
@@ -1862,6 +1873,7 @@ mod tests {
             let mut pool = make_pool();
             let (mut client, mut c_sio) = make_client(&mut pool);
             let (mut server, mut s_sio) = make_server(&mut pool);
+            let mut scratch = [0u8; 2048];
             let now = 1_000_000u64;
             run_handshake_to_completion(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
@@ -1889,7 +1901,7 @@ mod tests {
                 let _ = v.extend_from_slice(tx.data);
                 v
             };
-            server.recv(&mut s_sio.as_io(), &pkt, now, &mut pool).unwrap();
+            server.recv(&mut s_sio.as_io(), &pkt, &mut scratch, now, &mut pool).unwrap();
 
             let mut recv_buf = [0u8; 256];
             let (len, _fin) = server.stream_recv(&mut s_sio.as_io(), stream_id, &mut recv_buf).unwrap();
@@ -1912,7 +1924,7 @@ mod tests {
 
             // Server receives: should detect key_phase change and update keys
             assert_eq!(server.key_phase(), 0);
-            server.recv(&mut s_sio.as_io(), &pkt, now, &mut pool).unwrap();
+            server.recv(&mut s_sio.as_io(), &pkt, &mut scratch, now, &mut pool).unwrap();
             // After processing, server should have updated its key phase
             assert_eq!(server.key_phase(), 1);
 
@@ -1927,6 +1939,7 @@ mod tests {
             let mut pool = make_pool();
             let (mut client, mut c_sio) = make_client(&mut pool);
             let (mut server, mut s_sio) = make_server(&mut pool);
+            let mut scratch = [0u8; 2048];
             let now = 1_000_000u64;
             run_handshake_to_completion(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
@@ -1954,7 +1967,7 @@ mod tests {
                 let _ = v.extend_from_slice(tx.data);
                 v
             };
-            server.recv(&mut s_sio.as_io(), &pkt, now, &mut pool).unwrap();
+            server.recv(&mut s_sio.as_io(), &pkt, &mut scratch, now, &mut pool).unwrap();
             assert_eq!(server.key_phase(), 1);
 
             // Now server responds with new keys as well
@@ -1967,7 +1980,7 @@ mod tests {
                 let _ = v.extend_from_slice(tx.data);
                 v
             };
-            client.recv(&mut c_sio.as_io(), &pkt, now, &mut pool).unwrap();
+            client.recv(&mut c_sio.as_io(), &pkt, &mut scratch, now, &mut pool).unwrap();
 
             // Both sides should still be on key_phase 1
             assert_eq!(client.key_phase(), 1);
@@ -1987,6 +2000,7 @@ mod tests {
             let mut pool = make_pool();
             let (mut client, mut c_sio) = make_client(&mut pool);
             let (mut server, mut s_sio) = make_server(&mut pool);
+            let mut scratch = [0u8; 2048];
             let now = 1_000_000u64;
             run_handshake_to_completion(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
@@ -2008,7 +2022,7 @@ mod tests {
                 let _ = v.extend_from_slice(tx.data);
                 v
             };
-            server.recv(&mut s_sio.as_io(), &pkt, now, &mut pool).unwrap();
+            server.recv(&mut s_sio.as_io(), &pkt, &mut scratch, now, &mut pool).unwrap();
 
             // Drain server transmits and have client receive them (ACK with new phase)
             loop {
@@ -2020,7 +2034,7 @@ mod tests {
                             let _ = v.extend_from_slice(tx.data);
                             v
                         };
-                        let _ = client.recv(&mut c_sio.as_io(), &data, now, &mut pool);
+                        let _ = client.recv(&mut c_sio.as_io(), &data, &mut scratch, now, &mut pool);
                     }
                     None => break,
                 }
@@ -2321,8 +2335,9 @@ mod tests {
 
             // Process the curl Initial packet
             let mut sio_bufs = SioBufs::new();
+            let mut scratch = [0u8; 2048];
             let now = 1_000_000u64;
-            let result = server.recv(&mut sio_bufs.as_io(), &data, now, &mut pool);
+            let result = server.recv(&mut sio_bufs.as_io(), &data, &mut scratch, now, &mut pool);
             std::eprintln!("recv result: {:?}", result);
             assert!(result.is_ok(), "recv should succeed: {:?}", result);
 

@@ -85,6 +85,7 @@ fn main() {
     let mut h3_server: Option<H3Server<AesP>> = None;
     let mut h3_client_addr = None;
     let mut pool = HandshakePool::<Aes128GcmProvider, 4>::new();
+    let mut scratch = [0u8; 2048];
 
     type AesP = Aes128GcmProvider;
 
@@ -145,7 +146,7 @@ fn main() {
                     println!("[h3] new connection from {addr}");
                 }
                 if let Some(ref mut h3) = h3_server {
-                    let _ = h3.recv(&recv_buf[..len], now, &mut pool);
+                    let _ = h3.recv(&recv_buf[..len], &mut scratch, now, &mut pool);
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -155,7 +156,7 @@ fn main() {
 
         // Process H3 events.
         if let Some(ref mut h3) = h3_server {
-            while let Some(event) = h3.poll_event() {
+            while let Some(event) = h3.poll_event(&mut scratch) {
                 match event {
                     H3Event::Connected => println!("[h3] connected"),
                     H3Event::Headers(sid) => {

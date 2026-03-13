@@ -216,6 +216,7 @@ fn run_quic_handshake(
 ) {
     let mut client_sio = QuicStreamIoBufs::<32, 1024, 16>::new();
     let mut server_sio = QuicStreamIoBufs::<32, 1024, 16>::new();
+    let mut scratch = [0u8; 2048];
 
     for _ in 0..20 {
         loop {
@@ -225,7 +226,7 @@ fn run_quic_handshake(
                 Some(tx) => {
                     let data = tx.data.to_vec();
                     let mut sio = server_sio.as_io();
-                    let _ = server.recv(&mut sio, &data, now, pool);
+                    let _ = server.recv(&mut sio, &data, &mut scratch, now, pool);
                 }
                 None => break,
             }
@@ -237,7 +238,7 @@ fn run_quic_handshake(
                 Some(tx) => {
                     let data = tx.data.to_vec();
                     let mut cio = client_sio.as_io();
-                    let _ = client.recv(&mut cio, &data, now, pool);
+                    let _ = client.recv(&mut cio, &data, &mut scratch, now, pool);
                 }
                 None => break,
             }
@@ -255,6 +256,7 @@ fn exchange_h3(
     now: u64,
     pool: &mut HandshakePool<C, 4>,
 ) {
+    let mut scratch = [0u8; 2048];
     for _ in 0..10 {
         let mut any = false;
         loop {
@@ -262,7 +264,7 @@ fn exchange_h3(
             match client.poll_transmit(&mut buf, now, pool) {
                 Some(tx) => {
                     let data = tx.data.to_vec();
-                    let _ = server.recv(&data, now, pool);
+                    let _ = server.recv(&data, &mut scratch, now, pool);
                     any = true;
                 }
                 None => break,
@@ -273,7 +275,7 @@ fn exchange_h3(
             match server.poll_transmit(&mut buf, now, pool) {
                 Some(tx) => {
                     let data = tx.data.to_vec();
-                    let _ = client.recv(&data, now, pool);
+                    let _ = client.recv(&data, &mut scratch, now, pool);
                     any = true;
                 }
                 None => break,
@@ -294,15 +296,16 @@ fn setup_h3_pair() -> (H3Client<C>, H3Server<C>, u64, Box<HandshakePool<C, 4>>) 
 
     let mut client = H3Client::new(qc);
     let mut server = H3Server::new(qs);
+    let mut scratch = [0u8; 2048];
 
-    let _ = client.poll_event();
-    let _ = server.poll_event();
+    let _ = client.poll_event(&mut scratch);
+    let _ = server.poll_event(&mut scratch);
     exchange_h3(&mut client, &mut server, now, &mut pool);
 
     // Drain until both see H3Event::Connected.
     for _ in 0..10 {
-        while let Some(_) = client.poll_event() {}
-        while let Some(_) = server.poll_event() {}
+        while let Some(_) = client.poll_event(&mut scratch) {}
+        while let Some(_) = server.poll_event(&mut scratch) {}
         exchange_h3(&mut client, &mut server, now, &mut pool);
     }
 
@@ -497,8 +500,9 @@ fn measure_h3_handshake_and_data() {
     exchange_h3(&mut client, &mut server, now, &mut pool);
 
     // Server receives and responds
+    let mut scratch = [0u8; 2048];
     for _ in 0..5 {
-        while let Some(ev) = server.poll_event() {
+        while let Some(ev) = server.poll_event(&mut scratch) {
             if let H3Event::Headers(sid) = ev {
                 server.recv_headers(sid, |_, _| {}).unwrap();
                 server.send_response(sid, 200, &[], false).unwrap();
@@ -509,7 +513,7 @@ fn measure_h3_handshake_and_data() {
     }
 
     // Client reads response
-    while let Some(ev) = client.poll_event() {
+    while let Some(ev) = client.poll_event(&mut scratch) {
         if let H3Event::Headers(sid) = ev {
             client.recv_headers(sid, |_, _| {}).unwrap();
         }
@@ -762,12 +766,13 @@ fn measure_target_config() {
     run_quic_handshake(&mut qc1, &mut qs1, now, &mut pool);
     let mut h3c1 = H3Client::new(qc1);
     let mut h3s1 = H3Server::new(qs1);
-    let _ = h3c1.poll_event();
-    let _ = h3s1.poll_event();
+    let mut h3_scratch = [0u8; 2048];
+    let _ = h3c1.poll_event(&mut h3_scratch);
+    let _ = h3s1.poll_event(&mut h3_scratch);
     exchange_h3(&mut h3c1, &mut h3s1, now, &mut pool);
     for _ in 0..5 {
-        while let Some(_) = h3c1.poll_event() {}
-        while let Some(_) = h3s1.poll_event() {}
+        while let Some(_) = h3c1.poll_event(&mut h3_scratch) {}
+        while let Some(_) = h3s1.poll_event(&mut h3_scratch) {}
         exchange_h3(&mut h3c1, &mut h3s1, now, &mut pool);
     }
 
@@ -777,12 +782,12 @@ fn measure_target_config() {
     run_quic_handshake(&mut qc2, &mut qs2, now, &mut pool);
     let mut h3c2 = H3Client::new(qc2);
     let mut h3s2 = H3Server::new(qs2);
-    let _ = h3c2.poll_event();
-    let _ = h3s2.poll_event();
+    let _ = h3c2.poll_event(&mut h3_scratch);
+    let _ = h3s2.poll_event(&mut h3_scratch);
     exchange_h3(&mut h3c2, &mut h3s2, now, &mut pool);
     for _ in 0..5 {
-        while let Some(_) = h3c2.poll_event() {}
-        while let Some(_) = h3s2.poll_event() {}
+        while let Some(_) = h3c2.poll_event(&mut h3_scratch) {}
+        while let Some(_) = h3s2.poll_event(&mut h3_scratch) {}
         exchange_h3(&mut h3c2, &mut h3s2, now, &mut pool);
     }
 
@@ -811,32 +816,33 @@ fn measure_target_config() {
     let mut sio4s = QuicStreamIoBufs::<32, 1024, 16>::new();
 
     // Do a few rounds of handshake to get crypto state allocated
+    let mut scratch = [0u8; 2048];
     for _ in 0..5 {
         let mut buf = [0u8; 4096];
         let mut io3 = sio3.as_io();
         if let Some(tx) = qc3.poll_transmit(&mut io3, &mut buf, now, &mut *pool) {
             let data = tx.data.to_vec();
             let mut io3s = sio3s.as_io();
-            let _ = qs3.recv(&mut io3s, &data, now, &mut *pool);
+            let _ = qs3.recv(&mut io3s, &data, &mut scratch, now, &mut *pool);
         }
         let mut io3s = sio3s.as_io();
         if let Some(tx) = qs3.poll_transmit(&mut io3s, &mut buf, now, &mut *pool) {
             let data = tx.data.to_vec();
             let mut io3 = sio3.as_io();
-            let _ = qc3.recv(&mut io3, &data, now, &mut *pool);
+            let _ = qc3.recv(&mut io3, &data, &mut scratch, now, &mut *pool);
         }
 
         let mut io4 = sio4.as_io();
         if let Some(tx) = qc4.poll_transmit(&mut io4, &mut buf, now, &mut *pool) {
             let data = tx.data.to_vec();
             let mut io4s = sio4s.as_io();
-            let _ = qs4.recv(&mut io4s, &data, now, &mut *pool);
+            let _ = qs4.recv(&mut io4s, &data, &mut scratch, now, &mut *pool);
         }
         let mut io4s = sio4s.as_io();
         if let Some(tx) = qs4.poll_transmit(&mut io4s, &mut buf, now, &mut *pool) {
             let data = tx.data.to_vec();
             let mut io4 = sio4.as_io();
-            let _ = qc4.recv(&mut io4, &data, now, &mut *pool);
+            let _ = qc4.recv(&mut io4, &data, &mut scratch, now, &mut *pool);
         }
     }
 

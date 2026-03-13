@@ -492,7 +492,7 @@ impl<C: CryptoProvider, const BUF: usize, const MAX_STREAMS: usize, const HDRBUF
 where
     C::Hkdf: Default,
 {
-    fn poll_event(&mut self) -> Option<crate::http::server_conn::HttpEvent> {
+    fn poll_event(&mut self, _scratch: &mut [u8]) -> Option<crate::http::server_conn::HttpEvent> {
         H2TlsServer::poll_event(self).map(map_h2_event)
     }
 
@@ -557,7 +557,7 @@ impl<C: CryptoProvider, const BUF: usize, const MAX_STREAMS: usize, const HDRBUF
 where
     C::Hkdf: Default,
 {
-    fn poll_event(&mut self) -> Option<crate::http::server_conn::HttpEvent> {
+    fn poll_event(&mut self, _scratch: &mut [u8]) -> Option<crate::http::server_conn::HttpEvent> {
         H2TlsClient::poll_event(self).map(map_h2_event)
     }
 

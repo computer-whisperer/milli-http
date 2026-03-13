@@ -25,12 +25,21 @@
 use crate::crypto::Hkdf;
 use crate::crypto::key_schedule::hkdf_expand_label;
 use crate::error::Error;
+use zeroize::Zeroize;
 
 /// TLS 1.3 key schedule state.
 pub struct TlsKeySchedule {
-    pub early_secret: [u8; 32],
-    pub handshake_secret: [u8; 32],
-    pub master_secret: [u8; 32],
+    early_secret: [u8; 32],
+    handshake_secret: [u8; 32],
+    master_secret: [u8; 32],
+}
+
+impl Drop for TlsKeySchedule {
+    fn drop(&mut self) {
+        self.early_secret.zeroize();
+        self.handshake_secret.zeroize();
+        self.master_secret.zeroize();
+    }
 }
 
 impl TlsKeySchedule {

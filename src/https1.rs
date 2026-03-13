@@ -471,7 +471,7 @@ impl<C: CryptoProvider, const BUF: usize, const HDRBUF: usize, const DATABUF: us
 where
     C::Hkdf: Default,
 {
-    fn poll_event(&mut self) -> Option<crate::http::server_conn::HttpEvent> {
+    fn poll_event(&mut self, _scratch: &mut [u8]) -> Option<crate::http::server_conn::HttpEvent> {
         self.poll_event().map(map_http1_event)
     }
 
@@ -536,7 +536,7 @@ impl<C: CryptoProvider, const BUF: usize, const HDRBUF: usize, const DATABUF: us
 where
     C::Hkdf: Default,
 {
-    fn poll_event(&mut self) -> Option<crate::http::server_conn::HttpEvent> {
+    fn poll_event(&mut self, _scratch: &mut [u8]) -> Option<crate::http::server_conn::HttpEvent> {
         self.poll_event().map(map_http1_event)
     }
 

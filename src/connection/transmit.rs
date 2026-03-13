@@ -11,6 +11,63 @@ use crate::transport::recovery::SentPacket;
 use super::recv::level_index;
 use super::{Connection, ConnectionState, Transmit};
 
+/// Encrypt the payload already at `out[payload_start..]` and apply header protection.
+///
+/// Assumes:
+/// - Header is written at `out[0..pn_offset]`
+/// - PN is written at `out[pn_offset..payload_start]`
+/// - Plaintext frames (+ PADDING) are at `out[payload_start..payload_start + padded_frame_len]`
+///
+/// Returns the total packet length (header + encrypted payload + tag).
+fn encrypt_and_protect<A: Aead, HP: HeaderProtection>(
+    out: &mut [u8],
+    pn_offset: usize,
+    payload_start: usize,
+    padded_frame_len: usize,
+    pn: u64,
+    pn_len: usize,
+    is_long: bool,
+    send: &crate::crypto::DirectionalKeys<A, HP>,
+) -> Result<usize, Error> {
+    let total_pkt_len = payload_start + padded_frame_len + 16; // 16 = AEAD tag
+
+    if total_pkt_len > out.len() {
+        return Err(Error::BufferTooSmall {
+            needed: total_pkt_len,
+        });
+    }
+
+    // Encrypt: AAD = header+PN, payload starts right after.
+    // Use split_at_mut to avoid a separate aad_buf copy.
+    let nonce = send.nonce(pn);
+    let ct_len = {
+        let (aad, payload_area) = out[..total_pkt_len].split_at_mut(payload_start);
+        send.aead
+            .seal_in_place(&nonce, aad, payload_area, padded_frame_len)?
+    };
+
+    // Apply header protection
+    let sample_offset = pn_offset + 4;
+    let actual_total = payload_start + ct_len;
+    if sample_offset + 16 > actual_total {
+        return Err(Error::Crypto);
+    }
+    let mut sample = [0u8; 16];
+    sample.copy_from_slice(&out[sample_offset..sample_offset + 16]);
+    let mask = send.header_protection.mask(&sample);
+
+    if is_long {
+        out[0] ^= mask[0] & 0x0f;
+    } else {
+        out[0] ^= mask[0] & 0x1f;
+    }
+    for i in 0..pn_len {
+        out[pn_offset + i] ^= mask[1 + i];
+    }
+
+    Ok(actual_total)
+}
+
 impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize>
     Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS>
 where
@@ -38,12 +95,23 @@ where
             return None;
         }
 
+        // RFC 9001 §6.6: automatic key update before AEAD confidentiality limit.
+        // If the key update fails, we must not continue sending with exhausted keys.
+        #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+        if self.keys.needs_key_update() {
+            if self.keys.perform_key_update(&self.crypto).is_err() {
+                self.state = ConnectionState::Closed;
+                return None;
+            }
+        }
+
         let mut total_written = 0;
 
         // Try to send at each level, coalescing into one datagram.
 
         // 1. CONNECTION_CLOSE (if closing)
-        if let Some((error_code, ref reason)) = self.close_frame.clone() {
+        if let Some((error_code, reason)) = self.close_frame.as_ref() {
+            let error_code = *error_code;
             // Send CONNECTION_CLOSE at the highest available level
             let level = if self.keys.has_send_keys(Level::Application) {
                 Level::Application
@@ -158,50 +226,114 @@ where
     }
 
     /// Build an Initial packet if there's something to send at this level.
+    ///
+    /// Writes frames directly into the output buffer at a reserved offset,
+    /// then shifts them into place after computing the exact header size.
+    /// This avoids a separate 2 KiB frame buffer on the stack.
     fn build_initial_packet<const CRYPTO_BUF: usize>(&mut self, buf: &mut [u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Option<usize> {
         let level = Level::Initial;
+        let idx = level_index(level);
+        let pn = self.next_pn[idx];
+        let largest_acked = self.largest_recv_pn[idx].unwrap_or(0);
+        let pn_len = packet::pn_length(pn, largest_acked);
 
-        // Collect frames to send
-        let mut frame_buf = [0u8; 2048];
+        let dcid_len = self.remote_cid.len as usize;
+        let scid_len = if self.local_cids.is_empty() { 0 } else { self.local_cids[0].len as usize };
+
+        // Max header: first_byte(1) + version(4) + dcid_len(1) + dcid + scid_len(1) + scid
+        //             + token_len_varint(1) + length_varint(max 8)
+        let max_header = 1 + 4 + 1 + dcid_len + 1 + scid_len + 1 + 8;
+        let reserve = max_header + pn_len;
+
+        if buf.len() < reserve + 32 {
+            return None;
+        }
+
+        // Write frames at the reserved offset (past any possible header)
         let mut frame_len = 0;
 
         // ACK frame if needed
-        if self.ack_eliciting_received[level_index(level)]
-            && let Some(written) = self.build_ack_frame(level, &mut frame_buf[frame_len..])
+        if self.ack_eliciting_received[idx]
+            && let Some(written) = self.build_ack_frame(level, &mut buf[reserve + frame_len..])
         {
             frame_len += written;
-            self.ack_eliciting_received[level_index(level)] = false;
+            self.ack_eliciting_received[idx] = false;
         }
 
         // CRYPTO frame from TLS engine
-        let crypto_written = self.write_tls_crypto_data(level, &mut frame_buf[frame_len..], pool);
+        let crypto_written = self.write_tls_crypto_data(level, &mut buf[reserve + frame_len..], pool);
         frame_len += crypto_written;
 
         if frame_len == 0 {
             return None;
         }
 
-        // RFC 9000 §14.1: Both client and server MUST pad datagrams carrying
-        // ack-eliciting Initial packets to at least 1200 bytes.
-        // For server: only pad when there's CRYPTO data (ack-eliciting).
+        // RFC 9000 §14.1: pad ack-eliciting Initial datagrams to 1200 bytes.
         let has_crypto = crypto_written > 0;
         let pad_to_min = self.role == crate::tls::handshake::Role::Client || has_crypto;
 
-        // Get initial send keys (concrete AES type) and build the packet.
+        // Compute padding. The Length field varint size can change with padding,
+        // so iterate once to stabilize.
+        let tag_len = 16;
+        let token: &[u8] = &[];
+        let token_vi_len = crate::varint::varint_len(token.len() as u64);
+        let base_header = 1 + 4 + 1 + dcid_len + 1 + scid_len + token_vi_len;
+
+        let base_payload_length = pn_len + frame_len + tag_len;
+        let mut length_vi_len = crate::varint::varint_len(base_payload_length as u64);
+        let mut header_len = base_header + length_vi_len;
+        let total_no_pad = header_len + base_payload_length;
+
+        let mut padding_needed = if pad_to_min && total_no_pad < MIN_INITIAL_PACKET_SIZE {
+            MIN_INITIAL_PACKET_SIZE - total_no_pad
+        } else {
+            0
+        };
+
+        // Re-check: padding may grow the Length varint from 1→2 bytes
+        let payload_with_pad = pn_len + frame_len + padding_needed + tag_len;
+        let new_vi_len = crate::varint::varint_len(payload_with_pad as u64);
+        if new_vi_len != length_vi_len {
+            length_vi_len = new_vi_len;
+            header_len = base_header + length_vi_len;
+            let total = header_len + pn_len + frame_len + padding_needed + tag_len;
+            if pad_to_min && total < MIN_INITIAL_PACKET_SIZE {
+                padding_needed += MIN_INITIAL_PACKET_SIZE - total;
+            }
+        }
+
+        let padded_frame_len = frame_len + padding_needed;
+        let payload_length = pn_len + padded_frame_len + tag_len;
+
+        // Write header directly into buf (dcid/scid borrows scoped to this block)
+        let actual_header_len = {
+            let dcid = self.remote_cid.as_slice();
+            let scid = if self.local_cids.is_empty() { &[] as &[u8] } else { self.local_cids[0].as_slice() };
+            packet::encode_initial_header(dcid, scid, token, pn_len, payload_length, buf).ok()?
+        };
+        let pn_offset = actual_header_len;
+        packet::encode_pn(pn, largest_acked, &mut buf[pn_offset..]).ok()?;
+        let payload_start = pn_offset + pn_len;
+
+        // Shift frames from reserved position to actual payload position
+        if payload_start != reserve {
+            buf.copy_within(reserve..reserve + frame_len, payload_start);
+        }
+
+        // Fill padding after frames
+        for i in 0..padding_needed {
+            buf[payload_start + frame_len + i] = 0x00;
+        }
+
+        // Encrypt with Initial keys (concrete AES type).
         // Take keys out temporarily to avoid borrow conflict with &mut self.
         #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
         let result = {
             let send = self.keys.initial_send.take();
             let r = if let Some(k) = send.as_ref() {
-                self.build_and_encrypt_initial_packet(
-                    &frame_buf[..frame_len],
-                    pad_to_min,
-                    buf,
-                    now,
-                    k,
-                )
+                encrypt_and_protect(buf, pn_offset, payload_start, padded_frame_len, pn, pn_len, true, k)
             } else {
-                return None;
+                Err(Error::Crypto)
             };
             self.keys.initial_send = send;
             r
@@ -210,9 +342,16 @@ where
         let result: Result<usize, Error> = Err(Error::Crypto);
 
         match result {
-            Ok(pkt_len) => {
-                // Server: once we've sent the ServerHello (Initial-level),
-                // we can drop Initial keys if Handshake keys are already installed.
+            Ok(total) => {
+                self.next_pn[idx] = pn + 1;
+                let _ = self.sent_tracker.on_packet_sent(SentPacket {
+                    pn, level, time_sent: now, size: total as u16,
+                    ack_eliciting: true, in_flight: true,
+                });
+                self.loss_detector.on_ack_eliciting_sent(level, now);
+                self.congestion.on_packet_sent(total as u64);
+
+                // Server: drop Initial keys once Handshake keys are installed
                 if self.role == crate::tls::handshake::Role::Server
                     && self.keys.has_send_keys(Level::Handshake)
                 {
@@ -220,52 +359,116 @@ where
                     self.sent_tracker.drop_space(Level::Initial);
                     self.loss_detector.drop_space(Level::Initial);
                 }
-                Some(pkt_len)
+                Some(total)
             }
             Err(_) => None,
         }
     }
 
     /// Build a Handshake packet if there's something to send at this level.
+    ///
+    /// Writes frames into the output buffer at a reserved offset, then
+    /// shifts them into place after computing the exact header size.
     fn build_handshake_packet<const CRYPTO_BUF: usize>(&mut self, buf: &mut [u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Option<usize> {
         let level = Level::Handshake;
+        let idx = level_index(level);
+        let pn = self.next_pn[idx];
+        let largest_acked = self.largest_recv_pn[idx].unwrap_or(0);
+        let pn_len = packet::pn_length(pn, largest_acked);
 
-        let mut frame_buf = [0u8; 2048];
+        let dcid_len = self.remote_cid.len as usize;
+        let scid_len = if self.local_cids.is_empty() { 0 } else { self.local_cids[0].len as usize };
+
+        // Max header: first_byte(1) + version(4) + dcid_len(1) + dcid + scid_len(1) + scid
+        //             + length_varint(max 8)
+        let max_header = 1 + 4 + 1 + dcid_len + 1 + scid_len + 8;
+        let reserve = max_header + pn_len;
+
+        if buf.len() < reserve + 32 {
+            return None;
+        }
+
+        // Write frames at the reserved offset
         let mut frame_len = 0;
 
         // ACK frame if needed
-        if self.ack_eliciting_received[level_index(level)]
-            && let Some(written) = self.build_ack_frame(level, &mut frame_buf[frame_len..])
+        if self.ack_eliciting_received[idx]
+            && let Some(written) = self.build_ack_frame(level, &mut buf[reserve + frame_len..])
         {
             frame_len += written;
-            self.ack_eliciting_received[level_index(level)] = false;
+            self.ack_eliciting_received[idx] = false;
         }
 
         // CRYPTO frame from TLS engine
-        let crypto_written = self.write_tls_crypto_data(level, &mut frame_buf[frame_len..], pool);
+        let crypto_written = self.write_tls_crypto_data(level, &mut buf[reserve + frame_len..], pool);
         frame_len += crypto_written;
 
         if frame_len == 0 {
             return None;
         }
 
-        self.build_and_encrypt_packet(level, &frame_buf[..frame_len], false, buf, now).ok()
+        // Compute actual header
+        let tag_len = 16;
+        let payload_length = pn_len + frame_len + tag_len;
+
+        let header_len = {
+            let dcid = self.remote_cid.as_slice();
+            let scid = if self.local_cids.is_empty() { &[] as &[u8] } else { self.local_cids[0].as_slice() };
+            packet::encode_handshake_header(dcid, scid, pn_len, payload_length, buf).ok()?
+        };
+        let pn_offset = header_len;
+        packet::encode_pn(pn, largest_acked, &mut buf[pn_offset..]).ok()?;
+        let payload_start = pn_offset + pn_len;
+
+        // Shift frames from reserved position to actual payload position
+        if payload_start != reserve {
+            buf.copy_within(reserve..reserve + frame_len, payload_start);
+        }
+
+        let send = self.keys.send_keys(level)?;
+        match encrypt_and_protect(buf, pn_offset, payload_start, frame_len, pn, pn_len, true, send) {
+            Ok(total) => {
+                self.next_pn[idx] = pn + 1;
+                let _ = self.sent_tracker.on_packet_sent(SentPacket {
+                    pn, level, time_sent: now, size: total as u16,
+                    ack_eliciting: true, in_flight: true,
+                });
+                self.loss_detector.on_ack_eliciting_sent(level, now);
+                self.congestion.on_packet_sent(total as u64);
+                Some(total)
+            }
+            Err(_) => None,
+        }
     }
 
     /// Build a short (1-RTT) packet if there's something to send.
+    ///
+    /// Writes frames directly into the output buffer at the pre-computed
+    /// payload offset (short header size is deterministic). No intermediate
+    /// frame buffer is needed.
     fn build_short_packet<const STREAM_BUF: usize, const SEND_QUEUE: usize>(&mut self, sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>, buf: &mut [u8], now: Instant) -> Option<usize> {
         let level = Level::Application;
+        let idx = level_index(level);
+        let pn = self.next_pn[idx];
+        let largest_acked = self.largest_recv_pn[idx].unwrap_or(0);
+        let pn_len = packet::pn_length(pn, largest_acked);
+        let dcid_len = self.remote_cid.len as usize;
 
-        let mut frame_buf = [0u8; 2048];
+        // Short header is deterministic: first_byte(1) + dcid, then PN
+        let pn_offset = 1 + dcid_len;
+        let payload_start = pn_offset + pn_len;
+
+        if buf.len() < payload_start + 32 {
+            return None;
+        }
+
+        // Write frames directly into buf[payload_start..]
         let mut frame_len = 0;
-
-        // Track whether we're attempting to send HANDSHAKE_DONE so we can
-        // revert the flag if the packet fails to build.
         let mut sending_handshake_done = false;
 
         // HANDSHAKE_DONE (server, once after handshake completes)
         if self.role == crate::tls::handshake::Role::Server && self.need_handshake_done
-            && let Ok(written) = frame::encode(&Frame::HandshakeDone, &mut frame_buf[frame_len..])
+            && let Ok(written) = frame::encode(&Frame::HandshakeDone, &mut buf[payload_start + frame_len..])
         {
             frame_len += written;
             sending_handshake_done = true;
@@ -274,7 +477,7 @@ where
         // PATH_RESPONSE: echo challenge data back (RFC 9000 §8.2.2)
         if let Some(challenge_data) = self.pending_path_response.take() {
             let path_resp = Frame::PathResponse(challenge_data);
-            if let Ok(written) = frame::encode(&path_resp, &mut frame_buf[frame_len..]) {
+            if let Ok(written) = frame::encode(&path_resp, &mut buf[payload_start + frame_len..]) {
                 frame_len += written;
             } else {
                 // Put it back if encoding failed (buffer too small)
@@ -283,27 +486,62 @@ where
         }
 
         // ACK frame if needed
-        if self.ack_eliciting_received[level_index(level)]
-            && let Some(written) = self.build_ack_frame(level, &mut frame_buf[frame_len..])
+        if self.ack_eliciting_received[idx]
+            && let Some(written) = self.build_ack_frame(level, &mut buf[payload_start + frame_len..])
         {
             frame_len += written;
-            self.ack_eliciting_received[level_index(level)] = false;
+            self.ack_eliciting_received[idx] = false;
         }
 
         // STREAM frames from pending send buffers
-        let stream_written = self.build_stream_frames(sio, &mut frame_buf[frame_len..]);
+        let stream_written = self.build_stream_frames(sio, &mut buf[payload_start + frame_len..]);
         frame_len += stream_written;
 
         if frame_len == 0 {
             return None;
         }
 
-        match self.build_and_encrypt_packet(level, &frame_buf[..frame_len], false, buf, now) {
-            Ok(pkt_len) => {
+        // Compute padding for header protection sample (RFC 9001 §5.4.2)
+        let tag_len = 16;
+        let min_encrypted = 20usize.saturating_sub(pn_len);
+        let padding_needed = if frame_len + tag_len < min_encrypted {
+            min_encrypted - frame_len - tag_len
+        } else {
+            0
+        };
+        let padded_frame_len = frame_len + padding_needed;
+        for i in 0..padding_needed {
+            buf[payload_start + frame_len + i] = 0x00;
+        }
+
+        // Write header at buf[0..] (dcid borrow scoped)
+        {
+            let dcid = self.remote_cid.as_slice();
+            let key_phase_bit = (self.keys.key_phase() & 1) << 2;
+            let first_byte = 0x40 | key_phase_bit | ((pn_len as u8) - 1);
+            packet::encode_short_header(dcid, first_byte, buf).ok()?;
+        }
+        packet::encode_pn(pn, largest_acked, &mut buf[pn_offset..]).ok()?;
+
+        // Encrypt
+        let send = self.keys.send_keys(level)?;
+        match encrypt_and_protect(buf, pn_offset, payload_start, padded_frame_len, pn, pn_len, false, send) {
+            Ok(total) => {
                 if sending_handshake_done {
                     self.need_handshake_done = false;
                 }
-                Some(pkt_len)
+                self.next_pn[idx] = pn + 1;
+                // Track AEAD usage for confidentiality limit (RFC 9001 §6.6)
+                if level == Level::Application {
+                    self.keys.key_update.packets_encrypted += 1;
+                }
+                let _ = self.sent_tracker.on_packet_sent(SentPacket {
+                    pn, level, time_sent: now, size: total as u16,
+                    ack_eliciting: true, in_flight: true,
+                });
+                self.loss_detector.on_ack_eliciting_sent(level, now);
+                self.congestion.on_packet_sent(total as u64);
+                Some(total)
             }
             Err(_) => None,
         }
@@ -335,7 +573,7 @@ where
 
         // Build the raw ACK range bytes (gap, ack_range varint pairs) for
         // all ranges below the highest, from next-highest down to lowest.
-        let mut range_buf = [0u8; 512];
+        let mut range_buf = [0u8; 256];
         let mut range_pos = 0;
 
         if range_count > 1 {
@@ -411,19 +649,22 @@ where
             if ctx.pending_crypto[idx].is_empty() {
                 return 0;
             }
-            let pending_data = ctx.pending_crypto[idx].clone();
-            ctx.pending_crypto[idx].clear();
-
             let offset = ctx.crypto_send_offset[idx];
+            let data_len = ctx.pending_crypto[idx].len();
             #[cfg(feature = "std")]
-            eprintln!("[debug] sending pending CRYPTO {:?} offset={} len={}", target_level, offset, pending_data.len());
-            let crypto = Frame::Crypto(CryptoFrame {
-                offset,
-                data: &pending_data,
-            });
-            match frame::encode(&crypto, buf) {
+            eprintln!("[debug] sending pending CRYPTO {:?} offset={} len={}", target_level, offset, data_len);
+            let encode_result = {
+                let crypto = Frame::Crypto(CryptoFrame {
+                    offset,
+                    data: &ctx.pending_crypto[idx],
+                });
+                frame::encode(&crypto, buf)
+            };
+            match encode_result {
                 Ok(written) => {
-                    pool.get_mut(slot).crypto_send_offset[idx] += pending_data.len() as u64;
+                    let ctx = pool.get_mut(slot);
+                    ctx.pending_crypto[idx].clear();
+                    ctx.crypto_send_offset[idx] += data_len as u64;
                     return written;
                 }
                 Err(_) => return 0,
@@ -494,8 +735,8 @@ where
 
     /// Build and encrypt an Initial packet with proper padding.
     ///
-    /// Generic over AEAD and HeaderProtection types so that Initial keys
-    /// (concrete AES-128-GCM per RFC 9001) can be passed directly.
+    /// Used only for CONNECTION_CLOSE at Initial level. Normal Initial
+    /// packets are built in-place by `build_initial_packet`.
     fn build_and_encrypt_initial_packet<A: Aead, HP: HeaderProtection>(
         &mut self,
         payload_frames: &[u8],
@@ -505,12 +746,13 @@ where
         send: &crate::crypto::DirectionalKeys<A, HP>,
     ) -> Result<usize, Error> {
         let level = Level::Initial;
-        let pn = self.next_pn[level_index(level)];
-        let largest_acked = self.largest_recv_pn[level_index(level)].unwrap_or(0);
+        let idx = level_index(level);
+        let pn = self.next_pn[idx];
+        let largest_acked = self.largest_recv_pn[idx].unwrap_or(0);
         let pn_len = packet::pn_length(pn, largest_acked);
-        let tag_len = 16; // AEAD tag
+        let tag_len = 16;
 
-        let dcid = &self.remote_cid.as_slice();
+        let dcid = self.remote_cid.as_slice();
         let scid = if self.local_cids.is_empty() {
             &[]
         } else {
@@ -518,102 +760,64 @@ where
         };
         let token: &[u8] = &[];
 
-        // Calculate minimum payload needed for Initial packet
         let frame_len = payload_frames.len();
-        let encrypted_payload_len = frame_len + tag_len;
-        let payload_length = pn_len + encrypted_payload_len; // for Length field
 
-        // Build header into a temp buffer to compute header length
-        let mut header_buf = [0u8; 256];
-        let header_len = packet::encode_initial_header(
-            dcid,
-            scid,
-            token,
-            pn_len,
-            payload_length,
-            &mut header_buf,
-        )?;
+        // Compute header size analytically to determine padding
+        let token_vi_len = crate::varint::varint_len(token.len() as u64);
+        let base_header = 1 + 4 + 1 + dcid.len() + 1 + scid.len() + token_vi_len + token.len();
 
-        // Check if we need padding for minimum Initial packet size
-        let total_size = header_len + payload_length;
-        let padding_needed = if pad_to_min && total_size < MIN_INITIAL_PACKET_SIZE {
-            MIN_INITIAL_PACKET_SIZE - total_size
+        let base_payload_length = pn_len + frame_len + tag_len;
+        let mut length_vi_len = crate::varint::varint_len(base_payload_length as u64);
+        let mut header_len = base_header + length_vi_len;
+        let total_no_pad = header_len + base_payload_length;
+
+        let mut padding_needed = if pad_to_min && total_no_pad < MIN_INITIAL_PACKET_SIZE {
+            MIN_INITIAL_PACKET_SIZE - total_no_pad
         } else {
             0
         };
 
-        // Recalculate with padding
+        // Re-check: padding may grow the Length varint from 1→2 bytes
+        let payload_with_pad = pn_len + frame_len + padding_needed + tag_len;
+        let new_vi_len = crate::varint::varint_len(payload_with_pad as u64);
+        if new_vi_len != length_vi_len {
+            length_vi_len = new_vi_len;
+            header_len = base_header + length_vi_len;
+            let total = header_len + pn_len + frame_len + padding_needed + tag_len;
+            if pad_to_min && total < MIN_INITIAL_PACKET_SIZE {
+                padding_needed += MIN_INITIAL_PACKET_SIZE - total;
+            }
+        }
+
         let padded_frame_len = frame_len + padding_needed;
-        let padded_encrypted_payload_len = padded_frame_len + tag_len;
-        let padded_payload_length = pn_len + padded_encrypted_payload_len;
+        let payload_length = pn_len + padded_frame_len + tag_len;
 
-        // Rebuild header with correct Length
-        let header_len = packet::encode_initial_header(
-            dcid,
-            scid,
-            token,
-            pn_len,
-            padded_payload_length,
-            &mut out[..],
+        // Write header with final Length directly into out
+        let actual_header_len = packet::encode_initial_header(
+            dcid, scid, token, pn_len, payload_length, out,
         )?;
-
-        // Encode packet number
-        let pn_offset = header_len;
+        let pn_offset = actual_header_len;
         let pn_written = packet::encode_pn(pn, largest_acked, &mut out[pn_offset..])?;
-
-        // Copy frames after PN
         let payload_start = pn_offset + pn_written;
+
         if payload_start + padded_frame_len + tag_len > out.len() {
             return Err(Error::BufferTooSmall {
                 needed: payload_start + padded_frame_len + tag_len,
             });
         }
         out[payload_start..payload_start + frame_len].copy_from_slice(payload_frames);
-
-        // Add PADDING frames
         for i in 0..padding_needed {
-            out[payload_start + frame_len + i] = 0x00; // PADDING
+            out[payload_start + frame_len + i] = 0x00;
         }
 
-        // Encrypt: AAD is header up to (not including) payload
-        let aad_len = payload_start; // header + PN
-        let mut aad_buf = [0u8; 256];
-        aad_buf[..aad_len].copy_from_slice(&out[..aad_len]);
-
-        let nonce = send.nonce(pn);
-        let ct_len = send.aead.seal_in_place(
-            &nonce,
-            &aad_buf[..aad_len],
-            &mut out[payload_start..],
-            padded_frame_len,
+        let total_pkt_len = encrypt_and_protect(
+            out, pn_offset, payload_start, padded_frame_len, pn, pn_len, true, send,
         )?;
 
-        // Apply header protection
-        let sample_offset = pn_offset + 4;
-        let total_pkt_len = payload_start + ct_len;
-        if sample_offset + 16 > total_pkt_len {
-            return Err(Error::Crypto);
-        }
-        let mut sample = [0u8; 16];
-        sample.copy_from_slice(&out[sample_offset..sample_offset + 16]);
-        let mask = send.header_protection.mask(&sample);
-
-        // Long header: mask lower 4 bits of first byte
-        out[0] ^= mask[0] & 0x0f;
-        for i in 0..pn_len {
-            out[pn_offset + i] ^= mask[1 + i];
-        }
-
-        self.next_pn[level_index(level)] = pn + 1;
-
-        // Record sent packet
+        self.next_pn[idx] = pn + 1;
         let _ = self.sent_tracker.on_packet_sent(SentPacket {
-            pn,
-            level,
-            time_sent: now,
-            size: total_pkt_len as u16,
-            ack_eliciting: true,
-            in_flight: true,
+            pn, level, time_sent: now, size: total_pkt_len as u16,
+            ack_eliciting: true, in_flight: true,
         });
         self.loss_detector.on_ack_eliciting_sent(level, now);
         self.congestion.on_packet_sent(total_pkt_len as u64);
@@ -622,6 +826,9 @@ where
     }
 
     /// Build, encrypt, and apply header protection for a Handshake or Short packet.
+    ///
+    /// Used only for CONNECTION_CLOSE. Normal packets are built in-place
+    /// by `build_handshake_packet` / `build_short_packet`.
     fn build_and_encrypt_packet(
         &mut self,
         level: Level,
@@ -637,10 +844,6 @@ where
         let tag_len = 16;
 
         let frame_len = payload_frames.len();
-
-        // RFC 9001 Section 5.4.2: packets must be padded so that
-        // pn_len + encrypted_payload_len >= 4 + sample_len (16).
-        // i.e., frame_len + tag_len >= 20 - pn_len.
         let min_encrypted = 20usize.saturating_sub(pn_len);
         let padding_needed = if frame_len + tag_len < min_encrypted {
             min_encrypted - frame_len - tag_len
@@ -661,92 +864,47 @@ where
             Level::Handshake => {
                 let payload_length = pn_len + encrypted_payload_len;
                 let hl = packet::encode_handshake_header(
-                    dcid,
-                    scid,
-                    pn_len,
-                    payload_length,
-                    out,
+                    dcid, scid, pn_len, payload_length, out,
                 )?;
                 (hl, true)
             }
             Level::Application => {
-                // Short header: first_byte = 0_1_S_RR_K_PP
-                //   bit 7 = 0 (short header), bit 6 = 1 (fixed),
-                //   bit 5 = spin (0), bits 4-3 = reserved (00),
-                //   bit 2 = key_phase, bits 1-0 = pn_len - 1
                 let key_phase_bit = (self.keys.key_phase() & 1) << 2;
                 let first_byte = 0x40 | key_phase_bit | ((pn_len as u8) - 1);
                 let hl = packet::encode_short_header(dcid, first_byte, out)?;
                 (hl, false)
             }
             Level::Initial => {
-                // Should use build_and_encrypt_initial_packet instead
                 return Err(Error::InvalidState);
             }
         };
 
         let pn_offset = header_len;
         let pn_written = packet::encode_pn(pn, largest_acked, &mut out[pn_offset..])?;
-
-        // Copy frames and add PADDING if needed for header protection sample
         let payload_start = pn_offset + pn_written;
+
         if payload_start + padded_frame_len + tag_len > out.len() {
             return Err(Error::BufferTooSmall {
                 needed: payload_start + padded_frame_len + tag_len,
             });
         }
         out[payload_start..payload_start + frame_len].copy_from_slice(payload_frames);
-        // Fill padding bytes with 0x00 (PADDING frame)
         for i in 0..padding_needed {
             out[payload_start + frame_len + i] = 0x00;
         }
 
-        // Encrypt
-        let aad_len = payload_start;
-        let mut aad_buf = [0u8; 256];
-        if aad_len > aad_buf.len() {
-            return Err(Error::BufferTooSmall { needed: aad_len });
-        }
-        aad_buf[..aad_len].copy_from_slice(&out[..aad_len]);
-
         let send = self.keys.send_keys(level).ok_or(Error::Crypto)?;
-        let nonce = send.nonce(pn);
-        let ct_len = send.aead.seal_in_place(
-            &nonce,
-            &aad_buf[..aad_len],
-            &mut out[payload_start..],
-            padded_frame_len,
+        let total_pkt_len = encrypt_and_protect(
+            out, pn_offset, payload_start, padded_frame_len, pn, pn_len, is_long, send,
         )?;
 
-        // Apply header protection
-        let sample_offset = pn_offset + 4;
-        let total_pkt_len = payload_start + ct_len;
-        if sample_offset + 16 > total_pkt_len {
-            return Err(Error::Crypto);
-        }
-        let mut sample = [0u8; 16];
-        sample.copy_from_slice(&out[sample_offset..sample_offset + 16]);
-        let mask = send.header_protection.mask(&sample);
-
-        if is_long {
-            out[0] ^= mask[0] & 0x0f;
-        } else {
-            out[0] ^= mask[0] & 0x1f;
-        }
-        for i in 0..pn_len {
-            out[pn_offset + i] ^= mask[1 + i];
-        }
-
         self.next_pn[idx] = pn + 1;
-
-        // Record sent packet
+        if level == Level::Application {
+            self.keys.key_update.packets_encrypted += 1;
+        }
         let _ = self.sent_tracker.on_packet_sent(SentPacket {
-            pn,
-            level,
-            time_sent: now,
-            size: total_pkt_len as u16,
-            ack_eliciting: true,
-            in_flight: true,
+            pn, level, time_sent: now, size: total_pkt_len as u16,
+            ack_eliciting: true, in_flight: true,
         });
         self.loss_detector.on_ack_eliciting_sent(level, now);
         self.congestion.on_packet_sent(total_pkt_len as u64);
@@ -854,6 +1012,7 @@ mod tests {
         now: crate::transport::Instant,
         pool: &mut HandshakePool<Aes128GcmProvider, 4>,
     ) {
+        let mut scratch = [0u8; 2048];
         for _round in 0..20 {
             loop {
                 let mut buf = [0u8; 4096];
@@ -864,7 +1023,7 @@ mod tests {
                             let _ = v.extend_from_slice(tx.data);
                             v
                         };
-                        let _ = server.recv(&mut s_sio.as_io(), &data, now, pool);
+                        let _ = server.recv(&mut s_sio.as_io(), &data, &mut scratch, now, pool);
                     }
                     None => break,
                 }
@@ -878,7 +1037,7 @@ mod tests {
                             let _ = v.extend_from_slice(tx.data);
                             v
                         };
-                        let _ = client.recv(&mut c_sio.as_io(), &data, now, pool);
+                        let _ = client.recv(&mut c_sio.as_io(), &data, &mut scratch, now, pool);
                     }
                     None => break,
                 }
@@ -974,6 +1133,7 @@ mod tests {
         let (mut client, mut c_sio) = make_client(&mut pool);
         let (mut server, mut s_sio) = make_server(&mut pool);
         let now = 1_000_000u64;
+        let mut scratch = [0u8; 2048];
 
         // Client sends Initial.
         let mut buf = [0u8; 2048];
@@ -985,7 +1145,7 @@ mod tests {
         };
 
         // Server receives it.
-        server.recv(&mut s_sio.as_io(), &initial, now, &mut pool).unwrap();
+        server.recv(&mut s_sio.as_io(), &initial, &mut scratch, now, &mut pool).unwrap();
 
         // Server should now have something to send back (ServerHello).
         let mut srv_buf = [0u8; 4096];
@@ -1040,6 +1200,7 @@ mod tests {
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
     #[test]
     fn stream_data_received_and_readable() {
+        let mut scratch = [0u8; 2048];
         let mut pool = make_pool();
         let (mut client, mut c_sio) = make_client(&mut pool);
         let (mut server, mut s_sio) = make_server(&mut pool);
@@ -1058,7 +1219,7 @@ mod tests {
             v
         };
 
-        server.recv(&mut s_sio.as_io(), &pkt, now, &mut pool).unwrap();
+        server.recv(&mut s_sio.as_io(), &pkt, &mut scratch, now, &mut pool).unwrap();
 
         let mut recv_buf = [0u8; 256];
         let (len, fin) = server.stream_recv(&mut s_sio.as_io(), stream_id, &mut recv_buf).unwrap();
@@ -1328,6 +1489,7 @@ mod tests {
         let (mut client, mut c_sio) = make_client(&mut pool);
         let (mut server, mut s_sio) = make_server(&mut pool);
         let now = 1_000_000u64;
+        let mut scratch = [0u8; 2048];
         run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
         drain_transmits(&mut client, &mut c_sio, now, &mut pool);
         drain_transmits(&mut server, &mut s_sio, now, &mut pool);
@@ -1345,7 +1507,7 @@ mod tests {
             let _ = v.extend_from_slice(tx.data);
             v
         };
-        server.recv(&mut s_sio.as_io(), &pkt, now, &mut pool).unwrap();
+        server.recv(&mut s_sio.as_io(), &pkt, &mut scratch, now, &mut pool).unwrap();
 
         // Server reads the request.
         let mut recv_buf = [0u8; 256];
@@ -1365,7 +1527,7 @@ mod tests {
             let _ = v.extend_from_slice(tx.data);
             v
         };
-        client.recv(&mut c_sio.as_io(), &pkt, now, &mut pool).unwrap();
+        client.recv(&mut c_sio.as_io(), &pkt, &mut scratch, now, &mut pool).unwrap();
 
         // Client reads the response.
         let mut recv_buf = [0u8; 256];
@@ -1461,6 +1623,7 @@ mod tests {
         let (mut client, mut c_sio) = make_client(&mut pool);
         let (mut server, mut s_sio) = make_server(&mut pool);
         let now = 1_000_000u64;
+        let mut scratch = [0u8; 2048];
         run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
         drain_transmits(&mut client, &mut c_sio, now, &mut pool);
         drain_transmits(&mut server, &mut s_sio, now, &mut pool);
@@ -1476,7 +1639,7 @@ mod tests {
         };
 
         // Server receives the CONNECTION_CLOSE.
-        server.recv(&mut s_sio.as_io(), &pkt, now, &mut pool).unwrap();
+        server.recv(&mut s_sio.as_io(), &pkt, &mut scratch, now, &mut pool).unwrap();
         assert_eq!(
             server.state(),
             ConnectionState::Draining,
@@ -1526,6 +1689,7 @@ mod tests {
         let (mut client, mut c_sio) = make_client(&mut pool);
         let (mut server, mut s_sio) = make_server(&mut pool);
         let now = 1_000_000u64;
+        let mut scratch = [0u8; 2048];
         run_handshake(&mut client, &mut c_sio, &mut server, &mut s_sio, now, &mut pool);
 
         let stream_id = client.open_stream().unwrap();
@@ -1539,7 +1703,7 @@ mod tests {
             v
         };
 
-        server.recv(&mut s_sio.as_io(), &pkt, now, &mut pool).unwrap();
+        server.recv(&mut s_sio.as_io(), &pkt, &mut scratch, now, &mut pool).unwrap();
 
         let mut recv_buf = [0u8; 256];
         let (len, fin) = server.stream_recv(&mut s_sio.as_io(), stream_id, &mut recv_buf).unwrap();

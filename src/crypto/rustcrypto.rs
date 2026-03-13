@@ -194,6 +194,14 @@ pub struct ChaChaHeaderProtection {
 }
 
 #[cfg(feature = "rustcrypto-chacha")]
+impl Drop for ChaChaHeaderProtection {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.key.zeroize();
+    }
+}
+
+#[cfg(feature = "rustcrypto-chacha")]
 impl HeaderProtection for ChaChaHeaderProtection {
     fn mask(&self, sample: &[u8]) -> [u8; 5] {
         use chacha20::cipher::{KeyIvInit, StreamCipher};

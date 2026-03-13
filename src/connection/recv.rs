@@ -182,11 +182,11 @@ where
 {
     /// Process an incoming UDP datagram. May contain coalesced packets.
     ///
-    /// The `pool` parameter provides access to the shared handshake state.
-    /// For post-handshake connections (handshake_slot is None), handshake
-    /// processing is skipped but the pool parameter is still required
-    /// for the type signature.
-    pub fn recv<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(&mut self, sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>, datagram: &[u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<(), Error> {
+    /// `scratch` is a caller-provided mutable buffer used for in-place
+    /// decryption, avoiding internal stack allocations. It must be at
+    /// least as large as the biggest packet in the datagram (typically
+    /// MTU-sized, e.g. 1500 bytes).
+    pub fn recv<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(&mut self, sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>, datagram: &[u8], scratch: &mut [u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<(), Error> {
         if matches!(self.state, ConnectionState::Closed) {
             return Err(Error::Closed);
         }
@@ -217,15 +217,15 @@ where
             let result = if is_long {
                 let pkt_type = (first_byte & 0x30) >> 4;
                 match pkt_type {
-                    0b00 => self.recv_initial(sio, pkt_data, now, pool),
-                    0b10 => self.recv_handshake(sio, pkt_data, now, pool),
+                    0b00 => self.recv_initial(sio, pkt_data, scratch, now, pool),
+                    0b10 => self.recv_handshake(sio, pkt_data, scratch, now, pool),
                     _ => {
                         // 0-RTT, Retry, Version Negotiation: skip for now
                         continue;
                     }
                 }
             } else {
-                self.recv_short(sio, pkt_data, now, pool)
+                self.recv_short(sio, pkt_data, scratch, now, pool)
             };
 
             match result {
@@ -265,7 +265,7 @@ where
     }
 
     /// Process an Initial packet.
-    fn recv_initial<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(&mut self, sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>, pkt_data: &[u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<PacketResult, Error> {
+    fn recv_initial<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(&mut self, sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>, pkt_data: &[u8], scratch: &mut [u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<PacketResult, Error> {
         let (hdr, _consumed) = packet::parse_initial_header(pkt_data)?;
 
         // If we are server and this is the first Initial, derive Initial keys from DCID
@@ -311,14 +311,18 @@ where
         #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
         {
             let level = Level::Initial;
-            let (decrypted, pn) = {
+            let (payload_offset, pt_len, pn) = {
                 let largest_pn = self.largest_recv_pn[level_index(level)].unwrap_or(0);
                 let recv = self.keys.initial_recv_keys().ok_or(Error::Crypto)?;
                 decrypt_long_packet(
-                    pkt_data, hdr.pn_offset, hdr.payload_length, largest_pn, recv,
+                    pkt_data, hdr.pn_offset, hdr.payload_length, largest_pn, recv, scratch,
                 )?
             };
-            let ack_eliciting = self.dispatch_frames(sio, &decrypted, level, now, pool)?;
+            // RFC 9000 §12.3: discard duplicate packet numbers
+            if self.recv_pn_tracker[level_index(level)].contains(pn) {
+                return Ok(PacketResult { ack_eliciting: false, level, pn });
+            }
+            let ack_eliciting = self.dispatch_frames(sio, &scratch[payload_offset..payload_offset + pt_len], level, now, pool)?;
             Ok(PacketResult { ack_eliciting, level, pn })
         }
         #[cfg(not(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes")))]
@@ -329,23 +333,27 @@ where
     }
 
     /// Process a Handshake packet.
-    fn recv_handshake<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(&mut self, sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>, pkt_data: &[u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<PacketResult, Error> {
+    fn recv_handshake<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(&mut self, sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>, pkt_data: &[u8], scratch: &mut [u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<PacketResult, Error> {
         let (hdr, _consumed) = packet::parse_handshake_header(pkt_data)?;
 
         let level = Level::Handshake;
-        let (decrypted, pn) = {
+        let (payload_offset, pt_len, pn) = {
             let largest_pn = self.largest_recv_pn[level_index(level)].unwrap_or(0);
             let recv = self.keys.recv_keys(Level::Handshake).ok_or(Error::Crypto)?;
             decrypt_long_packet(
-                pkt_data, hdr.pn_offset, hdr.payload_length, largest_pn, recv,
+                pkt_data, hdr.pn_offset, hdr.payload_length, largest_pn, recv, scratch,
             )?
         };
-        let ack_eliciting = self.dispatch_frames(sio, &decrypted, level, now, pool)?;
+        // RFC 9000 §12.3: discard duplicate packet numbers
+        if self.recv_pn_tracker[level_index(level)].contains(pn) {
+            return Ok(PacketResult { ack_eliciting: false, level, pn });
+        }
+        let ack_eliciting = self.dispatch_frames(sio, &scratch[payload_offset..payload_offset + pt_len], level, now, pool)?;
         Ok(PacketResult { ack_eliciting, level, pn })
     }
 
     /// Process a short (1-RTT) packet with key phase handling (RFC 9001 section 6).
-    fn recv_short<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(&mut self, sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>, pkt_data: &[u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<PacketResult, Error> {
+    fn recv_short<const CRYPTO_BUF: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>(&mut self, sio: &mut super::io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>, pkt_data: &[u8], scratch: &mut [u8], now: Instant, pool: &mut dyn super::HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<PacketResult, Error> {
         let dcid_len = if self.local_cids.is_empty() {
             0
         } else {
@@ -360,13 +368,12 @@ where
         // Need recv keys for Application level (for header protection removal)
         let recv = self.keys.recv_keys(Level::Application).ok_or(Error::Crypto)?;
 
-        // We need to work on a mutable copy for decryption
-        let mut buf = [0u8; 2048];
+        // Copy packet data into caller-provided scratch for in-place decryption
         let pkt_len = pkt_data.len();
-        if pkt_len > buf.len() {
+        if pkt_len > scratch.len() {
             return Err(Error::BufferTooSmall { needed: pkt_len });
         }
-        buf[..pkt_len].copy_from_slice(pkt_data);
+        scratch[..pkt_len].copy_from_slice(pkt_data);
 
         // Remove header protection
         let sample_offset = pn_offset + 4;
@@ -374,25 +381,25 @@ where
             return Err(Error::Crypto);
         }
         let mut sample = [0u8; 16];
-        sample.copy_from_slice(&buf[sample_offset..sample_offset + 16]);
+        sample.copy_from_slice(&scratch[sample_offset..sample_offset + 16]);
         let mask = recv.header_protection.mask(&sample);
 
         // For short headers: first_byte ^= mask[0] & 0x1f
-        buf[0] ^= mask[0] & 0x1f;
-        let pn_len = ((buf[0] & 0x03) + 1) as usize;
+        scratch[0] ^= mask[0] & 0x1f;
+        let pn_len = ((scratch[0] & 0x03) + 1) as usize;
 
         // Extract key_phase bit from the unprotected first byte (bit 2 = 0x04)
-        let received_key_phase = (buf[0] >> 2) & 1;
+        let received_key_phase = (scratch[0] >> 2) & 1;
 
         // Unmask PN bytes
         for i in 0..pn_len {
-            buf[pn_offset + i] ^= mask[1 + i];
+            scratch[pn_offset + i] ^= mask[1 + i];
         }
 
         // Decode packet number
         let mut truncated_pn: u32 = 0;
         for i in 0..pn_len {
-            truncated_pn = (truncated_pn << 8) | buf[pn_offset + i] as u32;
+            truncated_pn = (truncated_pn << 8) | scratch[pn_offset + i] as u32;
         }
         let largest_pn = self.largest_recv_pn[level_index(Level::Application)].unwrap_or(0);
         let pn = packet::decode_pn(truncated_pn, pn_len, largest_pn);
@@ -402,18 +409,14 @@ where
             return Err(Error::Transport(crate::error::TransportError::ProtocolViolation));
         }
 
+        // RFC 9000 §12.3: discard duplicate packet numbers (saves AEAD cost)
+        if self.recv_pn_tracker[level_index(Level::Application)].contains(pn) {
+            return Ok(PacketResult { ack_eliciting: false, level: Level::Application, pn });
+        }
+
         // Decrypt payload — key phase aware (RFC 9001 section 6)
         let payload_offset = pn_offset + pn_len;
         let payload_len = pkt_len - payload_offset;
-
-        let aad = &buf[..payload_offset]; // header up to and including PN is the AAD
-        let mut aad_buf = [0u8; 128];
-        if payload_offset > aad_buf.len() {
-            return Err(Error::BufferTooSmall {
-                needed: payload_offset,
-            });
-        }
-        aad_buf[..payload_offset].copy_from_slice(aad);
 
         let current_key_phase = self.keys.key_phase();
 
@@ -421,13 +424,18 @@ where
             // Key phase matches: decrypt with current key
             let recv = self.keys.recv_keys(Level::Application).ok_or(Error::Crypto)?;
             let nonce = recv.nonce(pn);
-            match recv.aead.open_in_place(
-                &nonce,
-                &aad_buf[..payload_offset],
-                &mut buf[payload_offset..],
-                payload_len,
-            ) {
+
+            // Use split_at_mut for zero-copy AAD
+            let pt_result = {
+                let (aad, payload_area) = scratch[..pkt_len].split_at_mut(payload_offset);
+                recv.aead.open_in_place(&nonce, &*aad, payload_area, payload_len)
+            };
+
+            match pt_result {
                 Ok(pt_len) => {
+                    // Track AEAD usage for confidentiality limit (RFC 9001 §6.6)
+                    self.keys.key_update.packets_decrypted += 1;
+
                     // If we initiated a key update and peer responds with our new phase,
                     // that confirms our key update.
                     if !self.keys.key_update.update_confirmed {
@@ -435,7 +443,7 @@ where
                     }
 
                     let ack_eliciting = self.dispatch_frames(sio,
-                        &buf[payload_offset..payload_offset + pt_len],
+                        &scratch[payload_offset..payload_offset + pt_len],
                         Level::Application,
                         now,
                         pool,
@@ -449,24 +457,19 @@ where
                 Err(_) => {
                     // Decryption with current key failed. Try previous key
                     // (for delayed packets from before a key update we initiated).
-                    buf[..pkt_len].copy_from_slice(pkt_data);
-                    // Re-apply header unprotection
-                    buf[0] ^= mask[0] & 0x1f;
-                    for i in 0..pn_len {
-                        buf[pn_offset + i] ^= mask[1 + i];
-                    }
+                    // Header (AAD) at scratch[..payload_offset] is still intact;
+                    // only restore the payload portion from the original packet.
+                    scratch[payload_offset..pkt_len].copy_from_slice(&pkt_data[payload_offset..pkt_len]);
 
                     if let Some(prev) = self.keys.prev_recv_keys() {
                         let nonce = prev.nonce(pn);
-                        let pt_len = prev.aead.open_in_place(
-                            &nonce,
-                            &aad_buf[..payload_offset],
-                            &mut buf[payload_offset..],
-                            payload_len,
-                        )?;
+                        let pt_len = {
+                            let (aad, payload_area) = scratch[..pkt_len].split_at_mut(payload_offset);
+                            prev.aead.open_in_place(&nonce, &*aad, payload_area, payload_len)?
+                        };
 
                         let ack_eliciting = self.dispatch_frames(sio,
-                            &buf[payload_offset..payload_offset + pt_len],
+                            &scratch[payload_offset..payload_offset + pt_len],
                             Level::Application,
                             now,
                             pool,
@@ -488,18 +491,16 @@ where
             {
                 let next_recv_keys = self.keys.derive_next_recv_keys(&self.crypto)?;
                 let nonce = next_recv_keys.nonce(pn);
-                let pt_len = next_recv_keys.aead.open_in_place(
-                    &nonce,
-                    &aad_buf[..payload_offset],
-                    &mut buf[payload_offset..],
-                    payload_len,
-                )?;
+                let pt_len = {
+                    let (aad, payload_area) = scratch[..pkt_len].split_at_mut(payload_offset);
+                    next_recv_keys.aead.open_in_place(&nonce, &*aad, payload_area, payload_len)?
+                };
 
                 // Decryption succeeded: confirm the peer key update and rotate keys.
                 self.keys.confirm_peer_key_update(&self.crypto, next_recv_keys)?;
 
                 let ack_eliciting = self.dispatch_frames(sio,
-                    &buf[payload_offset..payload_offset + pt_len],
+                    &scratch[payload_offset..payload_offset + pt_len],
                     Level::Application,
                     now,
                     pool,
@@ -964,72 +965,56 @@ fn decrypt_long_packet<A: Aead, HP: HeaderProtection>(
     payload_length: usize,
     largest_pn: u64,
     recv: &crate::crypto::DirectionalKeys<A, HP>,
-) -> Result<(heapless::Vec<u8, 2048>, u64), Error> {
-    // Copy packet data to mutable buffer for in-place decryption
+    scratch: &mut [u8],
+) -> Result<(usize, usize, u64), Error> {
+    // Copy packet data to caller-provided scratch for in-place decryption
     let total_len = pn_offset + payload_length;
-    let mut buf = [0u8; 2048];
-    if total_len > buf.len() {
+    if total_len > scratch.len() {
         return Err(Error::BufferTooSmall { needed: total_len });
     }
-    buf[..total_len].copy_from_slice(&pkt_data[..total_len]);
+    scratch[..total_len].copy_from_slice(&pkt_data[..total_len]);
 
     // Remove header protection (RFC 9001 Section 5.4.2)
-    // Sample starts at pn_offset + 4
     let sample_offset = pn_offset + 4;
     if sample_offset + 16 > total_len {
         return Err(Error::Crypto);
     }
     let mut sample = [0u8; 16];
-    sample.copy_from_slice(&buf[sample_offset..sample_offset + 16]);
+    sample.copy_from_slice(&scratch[sample_offset..sample_offset + 16]);
     let mask = recv.header_protection.mask(&sample);
 
     // For long headers: first_byte ^= mask[0] & 0x0f
-    buf[0] ^= mask[0] & 0x0f;
-    let pn_len = ((buf[0] & 0x03) + 1) as usize;
+    scratch[0] ^= mask[0] & 0x0f;
+    let pn_len = ((scratch[0] & 0x03) + 1) as usize;
 
     // Unmask PN bytes
     for i in 0..pn_len {
-        buf[pn_offset + i] ^= mask[1 + i];
+        scratch[pn_offset + i] ^= mask[1 + i];
     }
 
     // Decode packet number
     let mut truncated_pn: u32 = 0;
     for i in 0..pn_len {
-        truncated_pn = (truncated_pn << 8) | buf[pn_offset + i] as u32;
+        truncated_pn = (truncated_pn << 8) | scratch[pn_offset + i] as u32;
     }
     let pn = packet::decode_pn(truncated_pn, pn_len, largest_pn);
 
-    // Reject unreasonably large packet numbers (> 2^62)
     if pn > crate::varint::MAX_VARINT {
         return Err(Error::Transport(crate::error::TransportError::ProtocolViolation));
     }
 
-    // Decrypt payload
+    // Decrypt payload using split_at_mut for zero-copy AAD
     let payload_offset = pn_offset + pn_len;
-    let encrypted_len = payload_length - pn_len; // payload_length includes PN
-
-    // AAD is the entire header up to and including PN
-    let mut aad_buf = [0u8; 256];
-    if payload_offset > aad_buf.len() {
-        return Err(Error::BufferTooSmall {
-            needed: payload_offset,
-        });
-    }
-    aad_buf[..payload_offset].copy_from_slice(&buf[..payload_offset]);
+    let encrypted_len = payload_length - pn_len;
 
     let nonce = recv.nonce(pn);
-    let pt_len = recv.aead.open_in_place(
-        &nonce,
-        &aad_buf[..payload_offset],
-        &mut buf[payload_offset..],
-        encrypted_len,
-    )?;
+    let pt_len = {
+        let (aad, payload_area) = scratch[..payload_offset + encrypted_len].split_at_mut(payload_offset);
+        recv.aead.open_in_place(&nonce, &*aad, payload_area, encrypted_len)?
+    };
 
-    // Copy decrypted payload into a heapless Vec to return
-    let mut result = heapless::Vec::new();
-    let _ = result.extend_from_slice(&buf[payload_offset..payload_offset + pt_len]);
-
-    Ok((result, pn))
+    // Decrypted payload is now at scratch[payload_offset..payload_offset + pt_len]
+    Ok((payload_offset, pt_len, pn))
 }
 
 use super::ConnectionId;

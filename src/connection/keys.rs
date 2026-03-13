@@ -11,6 +11,7 @@
 use crate::crypto::{Aead, CryptoProvider, DirectionalKeys, HeaderProtection, Level};
 use crate::error::Error;
 use crate::tls::DerivedKeys;
+use zeroize::Zeroize;
 
 #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
 use crate::crypto::rustcrypto::{Aes128GcmAead, AesHeaderProtection};
@@ -79,6 +80,11 @@ impl<A: Aead, H: HeaderProtection> OptKeys<A, H> {
 /// key updates. Only the AEAD key and IV are rotated. We store the
 /// original HP key material so we can reconstruct the HP objects for
 /// new `DirectionalKeys` instances.
+/// Conservative AEAD confidentiality limit: 2^23 packets for AES-128-GCM
+/// (RFC 9001 §6.6). Safe for all QUIC cipher suites — ChaCha20-Poly1305
+/// has no practical confidentiality limit but uses this for uniformity.
+pub const AEAD_CONFIDENTIALITY_LIMIT: u64 = 1 << 23;
+
 pub struct KeyUpdateState<C: CryptoProvider> {
     /// Current key phase bit (0 or 1). Flips on each key update.
     pub key_phase: u8,
@@ -101,6 +107,20 @@ pub struct KeyUpdateState<C: CryptoProvider> {
     /// (i.e., the current key update is confirmed). A new key update MUST NOT
     /// be initiated until this is true.
     pub update_confirmed: bool,
+    /// Number of packets encrypted with the current send key (RFC 9001 §6.6).
+    pub packets_encrypted: u64,
+    /// Number of packets decrypted with the current recv key (RFC 9001 §6.6).
+    pub packets_decrypted: u64,
+}
+
+impl<C: CryptoProvider> Drop for KeyUpdateState<C> {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.send_secret.zeroize();
+        self.recv_secret.zeroize();
+        self.send_hp_key.zeroize();
+        self.recv_hp_key.zeroize();
+    }
 }
 
 impl<C: CryptoProvider> Default for KeyUpdateState<C> {
@@ -122,6 +142,8 @@ impl<C: CryptoProvider> KeyUpdateState<C> {
             hp_key_len: 0,
             prev_recv_key: OptKeys::none(),
             update_confirmed: true, // No pending update initially
+            packets_encrypted: 0,
+            packets_decrypted: 0,
         }
     }
 }
@@ -200,6 +222,8 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
             crate::crypto::key_schedule::derive_directional_keys(&aes_provider, &hkdf, &client_secret)?;
         let server_keys =
             crate::crypto::key_schedule::derive_directional_keys(&aes_provider, &hkdf, &server_secret)?;
+        client_secret.zeroize();
+        server_secret.zeroize();
 
         if is_client {
             self.initial_send = OptKeys::some(client_keys);
@@ -377,6 +401,14 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
             && self.key_update.secret_len > 0
     }
 
+    /// Returns true if the AEAD confidentiality limit is approaching and
+    /// a key update should be initiated (RFC 9001 §6.6).
+    pub fn needs_key_update(&self) -> bool {
+        self.can_initiate_key_update()
+            && (self.key_update.packets_encrypted >= AEAD_CONFIDENTIALITY_LIMIT
+                || self.key_update.packets_decrypted >= AEAD_CONFIDENTIALITY_LIMIT)
+    }
+
     /// Derive a `DirectionalKeys` for key update, keeping the original HP key.
     ///
     /// Per RFC 9001 section 6, header protection keys do NOT change during key
@@ -481,6 +513,10 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
         // Mark as not yet confirmed (waiting for peer acknowledgment)
         self.key_update.update_confirmed = false;
 
+        // Reset AEAD usage counters for the new key generation
+        self.key_update.packets_encrypted = 0;
+        self.key_update.packets_decrypted = 0;
+
         Ok(())
     }
 
@@ -578,6 +614,12 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
 
         // Peer-initiated key update is immediately confirmed
         self.key_update.update_confirmed = true;
+
+        // Reset AEAD usage counters for the new key generation.
+        // packets_decrypted starts at 1 because the packet that triggered
+        // this key update was already successfully decrypted with the new key.
+        self.key_update.packets_encrypted = 0;
+        self.key_update.packets_decrypted = 1;
 
         Ok(())
     }

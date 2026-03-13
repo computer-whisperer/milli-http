@@ -549,6 +549,11 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                 | (io.recv_buf[2] as usize);
             let total = 9 + payload_len;
 
+            // RFC 9113 §4.2: reject frames exceeding our advertised MAX_FRAME_SIZE
+            if payload_len > self.local_settings.max_frame_size as usize {
+                return Err(Error::Http2(crate::error::H2Error::FrameSizeError));
+            }
+
             if io.recv_buf.len() < total {
                 break;
             }
@@ -656,7 +661,7 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                 }
                 FRAME_SETTINGS => {
                     if stream_id != 0 {
-                        return Err(Error::InvalidState);
+                        return Err(Error::Http2(crate::error::H2Error::ProtocolError));
                     }
                     let ack = flags & FLAG_ACK != 0;
                     if ack {
@@ -716,10 +721,10 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                 }
                 FRAME_PING => {
                     if stream_id != 0 {
-                        return Err(Error::InvalidState);
+                        return Err(Error::Http2(crate::error::H2Error::ProtocolError));
                     }
                     if payload_len != 8 {
-                        return Err(Error::InvalidState);
+                        return Err(Error::Http2(crate::error::H2Error::FrameSizeError));
                     }
                     if flags & FLAG_ACK == 0 {
                         let mut data = [0u8; 8];

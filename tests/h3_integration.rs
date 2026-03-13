@@ -88,6 +88,7 @@ fn run_quic_handshake(
 ) {
     let mut client_sio_bufs = QuicStreamIoBufs::<32, 1024, 16>::new();
     let mut server_sio_bufs = QuicStreamIoBufs::<32, 1024, 16>::new();
+    let mut scratch = [0u8; 2048];
 
     for _round in 0..20 {
         // Client -> Server
@@ -98,7 +99,7 @@ fn run_quic_handshake(
                 Some(tx) => {
                     let data = tx.data.to_vec();
                     let mut server_sio = server_sio_bufs.as_io();
-                    let _ = server.recv(&mut server_sio, &data, now, pool);
+                    let _ = server.recv(&mut server_sio, &data, &mut scratch, now, pool);
                 }
                 None => break,
             }
@@ -112,7 +113,7 @@ fn run_quic_handshake(
                 Some(tx) => {
                     let data = tx.data.to_vec();
                     let mut client_sio = client_sio_bufs.as_io();
-                    let _ = client.recv(&mut client_sio, &data, now, pool);
+                    let _ = client.recv(&mut client_sio, &data, &mut scratch, now, pool);
                 }
                 None => break,
             }
@@ -137,6 +138,8 @@ fn exchange_h3_packets(
     now: u64,
     pool: &mut HandshakePool<Aes128GcmProvider, 4>,
 ) {
+    let mut scratch = [0u8; 2048];
+
     for _round in 0..10 {
         let mut any_sent = false;
 
@@ -146,7 +149,7 @@ fn exchange_h3_packets(
             match client.poll_transmit(&mut buf, now, pool) {
                 Some(tx) => {
                     let data = tx.data.to_vec();
-                    let _ = server.recv(&data, now, pool);
+                    let _ = server.recv(&data, &mut scratch, now, pool);
                     any_sent = true;
                 }
                 None => break,
@@ -159,7 +162,7 @@ fn exchange_h3_packets(
             match server.poll_transmit(&mut buf, now, pool) {
                 Some(tx) => {
                     let data = tx.data.to_vec();
-                    let _ = client.recv(&data, now, pool);
+                    let _ = client.recv(&data, &mut scratch, now, pool);
                     any_sent = true;
                 }
                 None => break,
@@ -190,10 +193,11 @@ fn setup_h3_pair() -> (
 
     let mut client = H3Client::new(quic_client);
     let mut server = H3Server::new(quic_server);
+    let mut scratch = [0u8; 2048];
 
     // Trigger H3 stream setup by processing the QUIC Connected event.
-    let _ = client.poll_event();
-    let _ = server.poll_event();
+    let _ = client.poll_event(&mut scratch);
+    let _ = server.poll_event(&mut scratch);
 
     // Exchange control stream data (SETTINGS frames) between client and server.
     exchange_h3_packets(&mut client, &mut server, now, &mut pool);
@@ -202,12 +206,12 @@ fn setup_h3_pair() -> (
     let mut client_connected = false;
     let mut server_connected = false;
     for _ in 0..10 {
-        while let Some(ev) = client.poll_event() {
+        while let Some(ev) = client.poll_event(&mut scratch) {
             if ev == H3Event::Connected {
                 client_connected = true;
             }
         }
-        while let Some(ev) = server.poll_event() {
+        while let Some(ev) = server.poll_event(&mut scratch) {
             if ev == H3Event::Connected {
                 server_connected = true;
             }
@@ -238,13 +242,14 @@ fn drain_client_events(
     pool: &mut HandshakePool<Aes128GcmProvider, 4>,
 ) -> Vec<H3Event> {
     let mut events = Vec::new();
+    let mut scratch = [0u8; 2048];
     for _ in 0..10 {
-        while let Some(ev) = client.poll_event() {
+        while let Some(ev) = client.poll_event(&mut scratch) {
             events.push(ev);
         }
         exchange_h3_packets(client, server, now, pool);
     }
-    while let Some(ev) = client.poll_event() {
+    while let Some(ev) = client.poll_event(&mut scratch) {
         events.push(ev);
     }
     events
@@ -286,8 +291,9 @@ fn h3_get_request_response() {
 
     // Server should see a Headers event.
     let mut got_headers_stream = None;
+    let mut scratch = [0u8; 2048];
     for _ in 0..5 {
-        while let Some(ev) = server.poll_event() {
+        while let Some(ev) = server.poll_event(&mut scratch) {
             if let H3Event::Headers(sid) = ev {
                 got_headers_stream = Some(sid);
             }
@@ -326,7 +332,7 @@ fn h3_get_request_response() {
     let mut got_response_headers = false;
     let mut got_response_data = false;
     for _ in 0..5 {
-        while let Some(ev) = client.poll_event() {
+        while let Some(ev) = client.poll_event(&mut scratch) {
             match ev {
                 H3Event::Headers(sid) if sid == stream_id => got_response_headers = true,
                 H3Event::Data(sid) if sid == stream_id => got_response_data = true,
@@ -386,8 +392,9 @@ fn h3_post_with_body() {
 
     // Server receives the request.
     let mut header_stream = None;
+    let mut scratch = [0u8; 2048];
     for _ in 0..5 {
-        while let Some(ev) = server.poll_event() {
+        while let Some(ev) = server.poll_event(&mut scratch) {
             if let H3Event::Headers(sid) = ev {
                 header_stream = Some(sid);
             }
@@ -451,8 +458,9 @@ fn h3_multiple_requests() {
 
     // Server should see Headers events for both streams.
     let mut header_streams = Vec::new();
+    let mut scratch = [0u8; 2048];
     for _ in 0..10 {
-        while let Some(ev) = server.poll_event() {
+        while let Some(ev) = server.poll_event(&mut scratch) {
             if let H3Event::Headers(sid) = ev {
                 header_streams.push(sid);
             }
@@ -480,7 +488,7 @@ fn h3_multiple_requests() {
     // Client should see response headers for both.
     let mut response_streams = Vec::new();
     for _ in 0..5 {
-        while let Some(ev) = client.poll_event() {
+        while let Some(ev) = client.poll_event(&mut scratch) {
             if let H3Event::Headers(sid) = ev {
                 response_streams.push(sid);
             }
@@ -515,8 +523,9 @@ fn h3_large_response_body() {
 
     // Wait for server to receive request headers.
     let mut req_stream = None;
+    let mut scratch = [0u8; 2048];
     for _ in 0..5 {
-        while let Some(ev) = server.poll_event() {
+        while let Some(ev) = server.poll_event(&mut scratch) {
             if let H3Event::Headers(sid) = ev {
                 req_stream = Some(sid);
             }
@@ -546,7 +555,7 @@ fn h3_large_response_body() {
     let mut got_headers = false;
     let mut got_data = false;
     for _ in 0..5 {
-        while let Some(ev) = client.poll_event() {
+        while let Some(ev) = client.poll_event(&mut scratch) {
             match ev {
                 H3Event::Headers(sid) if sid == stream_id => got_headers = true,
                 H3Event::Data(sid) if sid == stream_id => got_data = true,
@@ -591,8 +600,9 @@ fn h3_response_headers_correct() {
 
     // Wait for server to receive headers.
     let mut req_stream = None;
+    let mut scratch = [0u8; 2048];
     for _ in 0..5 {
-        while let Some(ev) = server.poll_event() {
+        while let Some(ev) = server.poll_event(&mut scratch) {
             if let H3Event::Headers(sid) = ev {
                 req_stream = Some(sid);
             }
@@ -624,7 +634,7 @@ fn h3_response_headers_correct() {
     // Client reads response headers.
     let mut got_headers = false;
     for _ in 0..5 {
-        while let Some(ev) = client.poll_event() {
+        while let Some(ev) = client.poll_event(&mut scratch) {
             if let H3Event::Headers(sid) = ev {
                 if sid == stream_id {
                     got_headers = true;
@@ -680,8 +690,9 @@ fn h3_settings_exchanged() {
     let mut server = H3Server::new(quic_server);
 
     // Trigger H3 stream setup by letting wrappers see the QUIC Connected event.
-    let _ = client.poll_event();
-    let _ = server.poll_event();
+    let mut scratch = [0u8; 2048];
+    let _ = client.poll_event(&mut scratch);
+    let _ = server.poll_event(&mut scratch);
 
     // Exchange the control stream packets carrying SETTINGS frames.
     exchange_h3_packets(&mut client, &mut server, now, &mut pool);
@@ -691,12 +702,12 @@ fn h3_settings_exchanged() {
     let mut client_connected = false;
     let mut server_connected = false;
     for _ in 0..10 {
-        while let Some(ev) = client.poll_event() {
+        while let Some(ev) = client.poll_event(&mut scratch) {
             if ev == H3Event::Connected {
                 client_connected = true;
             }
         }
-        while let Some(ev) = server.poll_event() {
+        while let Some(ev) = server.poll_event(&mut scratch) {
             if ev == H3Event::Connected {
                 server_connected = true;
             }
@@ -760,8 +771,9 @@ fn h3_stream_fin_on_response() {
 
     // Server receives request.
     let mut req_stream = None;
+    let mut scratch = [0u8; 2048];
     for _ in 0..5 {
-        while let Some(ev) = server.poll_event() {
+        while let Some(ev) = server.poll_event(&mut scratch) {
             if let H3Event::Headers(sid) = ev {
                 req_stream = Some(sid);
             }
@@ -825,8 +837,9 @@ fn h3_empty_body_response() {
 
     // Server receives request.
     let mut req_stream = None;
+    let mut scratch = [0u8; 2048];
     for _ in 0..5 {
-        while let Some(ev) = server.poll_event() {
+        while let Some(ev) = server.poll_event(&mut scratch) {
             if let H3Event::Headers(sid) = ev {
                 req_stream = Some(sid);
             }
@@ -847,7 +860,7 @@ fn h3_empty_body_response() {
     // Client receives response.
     let mut got_headers = false;
     for _ in 0..5 {
-        while let Some(ev) = client.poll_event() {
+        while let Some(ev) = client.poll_event(&mut scratch) {
             if let H3Event::Headers(sid) = ev {
                 if sid == stream_id {
                     got_headers = true;
@@ -900,8 +913,9 @@ fn h3_request_headers_round_trip() {
 
     // Server receives the request.
     let mut req_stream = None;
+    let mut scratch = [0u8; 2048];
     for _ in 0..5 {
-        while let Some(ev) = server.poll_event() {
+        while let Some(ev) = server.poll_event(&mut scratch) {
             if let H3Event::Headers(sid) = ev {
                 req_stream = Some(sid);
             }
@@ -967,8 +981,9 @@ fn h3_server_responds_different_status_codes() {
         exchange_h3_packets(&mut client, &mut server, now, &mut pool);
 
         let mut req_stream = None;
+        let mut scratch = [0u8; 2048];
         for _ in 0..5 {
-            while let Some(ev) = server.poll_event() {
+            while let Some(ev) = server.poll_event(&mut scratch) {
                 if let H3Event::Headers(sid) = ev {
                     req_stream = Some(sid);
                 }
@@ -987,7 +1002,7 @@ fn h3_server_responds_different_status_codes() {
 
         let mut got_headers = false;
         for _ in 0..5 {
-            while let Some(ev) = client.poll_event() {
+            while let Some(ev) = client.poll_event(&mut scratch) {
                 if let H3Event::Headers(sid) = ev {
                     if sid == stream_id {
                         got_headers = true;

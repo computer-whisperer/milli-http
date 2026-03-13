@@ -22,6 +22,7 @@ pub use messages::CipherSuite;
 pub use transport_params::TransportParams;
 
 use crate::crypto::Level;
+use zeroize::Zeroize;
 
 /// Keys derived during the TLS handshake, to be consumed by QUIC.
 pub struct DerivedKeys {
@@ -33,6 +34,13 @@ pub struct DerivedKeys {
     pub recv_secret: [u8; 48],
     /// Actual length of the secrets in bytes (32 for SHA-256, 48 for SHA-384).
     pub secret_len: usize,
+}
+
+impl Drop for DerivedKeys {
+    fn drop(&mut self) {
+        self.send_secret.zeroize();
+        self.recv_secret.zeroize();
+    }
 }
 
 /// The TLS session interface used by QUIC.

@@ -112,7 +112,8 @@ fn transfer_one(
         Some(tx) => {
             let data: Vec<u8> = tx.data.to_vec();
             let mut sio = dst_sio.as_io();
-            let _ = dst.recv(&mut sio, &data, now, pool);
+            let mut scratch = [0u8; 2048];
+            let _ = dst.recv(&mut sio, &data, &mut scratch, now, pool);
             true
         }
         None => false,

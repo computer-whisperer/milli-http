@@ -93,9 +93,11 @@ struct QuicConn<
     const MAX_CIDS: usize,
     const STREAM_BUF: usize,
     const SEND_QUEUE: usize,
+    const H3_HDR_BUF: usize,
+    const H3_DATA_BUF: usize,
 > {
     id: ConnId,
-    server: H3Server<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>,
+    server: H3Server<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, H3_HDR_BUF, H3_DATA_BUF>,
     peer_addr: A,
     local_cids: Vec<ConnectionId>,
 }
@@ -150,20 +152,22 @@ pub struct ServerManager<
     const MAX_CIDS: usize = 2,
     const STREAM_BUF: usize = 256,
     const SEND_QUEUE: usize = 4,
+    const H3_HDR_BUF: usize = 512,
+    const H3_DATA_BUF: usize = 1024,
 > {
     tls_config: ServerTlsConfig,
     provider: C,
     config: ServerConfig,
 
     tcp_conns: Vec<TcpConn<C, BUF>>,
-    quic_conns: Vec<QuicConn<C, A, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>>,
+    quic_conns: Vec<QuicConn<C, A, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, H3_HDR_BUF, H3_DATA_BUF>>,
 
     events: VecDeque<ServerEvent>,
     next_id: u32,
 }
 
-impl<C, A, const BUF: usize, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>
-    ServerManager<C, A, BUF, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>
+impl<C, A, const BUF: usize, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize, const H3_HDR_BUF: usize, const H3_DATA_BUF: usize>
+    ServerManager<C, A, BUF, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, H3_HDR_BUF, H3_DATA_BUF>
 where
     C: CryptoProvider + Clone + 'static,
     C::Hkdf: Default,
@@ -344,7 +348,8 @@ where
             for qconn in &mut self.quic_conns {
                 let matched = qconn.local_cids.iter().any(|cid| cid.as_slice() == dcid);
                 if matched {
-                    qconn.server.recv::<CRYPTO_BUF>(data, now, pool)?;
+                    let mut scratch = [0u8; 2048];
+                    qconn.server.recv::<CRYPTO_BUF>(data, &mut scratch, now, pool)?;
                     return Ok(());
                 }
             }
@@ -366,10 +371,11 @@ where
         // Cache local CIDs
         let local_cids: Vec<ConnectionId> = quic_conn.local_cids().to_vec();
 
-        let mut server = H3Server::<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>::new(quic_conn);
+        let mut server = H3Server::<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, H3_HDR_BUF, H3_DATA_BUF>::new(quic_conn);
         // Feed the initial datagram. If this fails, release the handshake pool
         // slot to avoid leaking it (Connection has no Drop impl).
-        if let Err(e) = server.recv::<CRYPTO_BUF>(data, now, pool) {
+        let mut scratch = [0u8; 2048];
+        if let Err(e) = server.recv::<CRYPTO_BUF>(data, &mut scratch, now, pool) {
             server.release_handshake_slot::<CRYPTO_BUF>(pool);
             return Err(e);
         }
@@ -410,8 +416,9 @@ where
     /// Poll for the next server event.
     ///
     /// Drains events from all connections (TCP and UDP) into the unified
-    /// event stream.
-    pub fn poll_event(&mut self) -> Option<ServerEvent> {
+    /// event stream. `scratch` is a caller-provided buffer for temporary
+    /// stream reads (used by H3 connections to avoid stack allocations).
+    pub fn poll_event(&mut self, scratch: &mut [u8]) -> Option<ServerEvent> {
         // Return any queued events first
         if let Some(ev) = self.events.pop_front() {
             return Some(ev);
@@ -420,7 +427,7 @@ where
         // Poll TCP connections
         for conn in &mut self.tcp_conns {
             if let TcpState::Established(http) = &mut conn.state {
-                if let Some(ev) = http.poll_event() {
+                if let Some(ev) = http.poll_event(scratch) {
                     return Some(ServerEvent::Http {
                         conn: conn.id,
                         event: ev,
@@ -437,7 +444,7 @@ where
         // Poll QUIC connections
         let mut quic_event = None;
         for qconn in &mut self.quic_conns {
-            if let Some(ev) = qconn.server.poll_event() {
+            if let Some(ev) = qconn.server.poll_event(scratch) {
                 let http_ev = crate::h3::server::map_h3_event(ev);
                 quic_event = Some(ServerEvent::Http {
                     conn: qconn.id,
@@ -617,7 +624,8 @@ where
                 return;
             }
             if let TcpState::Established(http) = &mut tcp.state {
-                while let Some(ev) = http.poll_event() {
+                let mut scratch_buf = [0u8; 128]; // TCP-based — scratch unused
+                while let Some(ev) = http.poll_event(&mut scratch_buf) {
                     drained.push(ServerEvent::Http { conn: id, event: ev });
                 }
             }

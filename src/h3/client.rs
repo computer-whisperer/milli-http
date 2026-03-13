@@ -22,12 +22,14 @@ pub struct H3Client<
     const MAX_CIDS: usize = 4,
     const STREAM_BUF: usize = 1024,
     const SEND_QUEUE: usize = 16,
+    const H3_HDR_BUF: usize = 512,
+    const H3_DATA_BUF: usize = 1024,
 > {
-    inner: H3Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>,
+    inner: H3Connection<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, H3_HDR_BUF, H3_DATA_BUF>,
 }
 
-impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>
-    H3Client<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>
+impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize, const H3_HDR_BUF: usize, const H3_DATA_BUF: usize>
+    H3Client<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, H3_HDR_BUF, H3_DATA_BUF>
 where
     C::Hkdf: Default,
 {
@@ -95,9 +97,11 @@ where
     /// Poll for HTTP/3 events.
     ///
     /// Before polling, this processes any pending QUIC events.
-    pub fn poll_event(&mut self) -> Option<H3Event> {
+    /// `scratch` is a caller-provided buffer for reading stream data,
+    /// avoiding internal stack allocations. Should be at least MTU-sized.
+    pub fn poll_event(&mut self, scratch: &mut [u8]) -> Option<H3Event> {
         // Process QUIC events first (client is_server=false).
-        let _ = self.inner.process_quic_events(false);
+        let _ = self.inner.process_quic_events(false, scratch);
         self.inner.poll_event()
     }
 
@@ -141,9 +145,14 @@ where
     // ------------------------------------------------------------------
 
     /// Process an incoming UDP datagram.
-    pub fn recv<const CRYPTO_BUF: usize>(&mut self, datagram: &[u8], now: Instant, pool: &mut dyn HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<(), Error> {
+    ///
+    /// `scratch` is a caller-provided mutable buffer used for in-place
+    /// decryption, avoiding internal stack allocations. It must be at
+    /// least as large as the biggest packet in the datagram (typically
+    /// MTU-sized, e.g. 1500 bytes).
+    pub fn recv<const CRYPTO_BUF: usize>(&mut self, datagram: &[u8], scratch: &mut [u8], now: Instant, pool: &mut dyn HandshakePoolAccess<C, CRYPTO_BUF>) -> Result<(), Error> {
         let mut sio = self.inner.sio_bufs.as_io();
-        self.inner.quic.recv(&mut sio, datagram, now, pool)
+        self.inner.quic.recv(&mut sio, datagram, scratch, now, pool)
     }
 
     /// Build the next outgoing UDP datagram.
@@ -168,13 +177,13 @@ where
     }
 }
 
-impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize>
-    crate::http::server_conn::HttpServerConn for H3Client<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>
+impl<C: CryptoProvider, const MAX_STREAMS: usize, const SENT_PER_SPACE: usize, const MAX_CIDS: usize, const STREAM_BUF: usize, const SEND_QUEUE: usize, const H3_HDR_BUF: usize, const H3_DATA_BUF: usize>
+    crate::http::server_conn::HttpServerConn for H3Client<C, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE, H3_HDR_BUF, H3_DATA_BUF>
 where
     C::Hkdf: Default,
 {
-    fn poll_event(&mut self) -> Option<crate::http::server_conn::HttpEvent> {
-        H3Client::poll_event(self).map(super::server::map_h3_event)
+    fn poll_event(&mut self, scratch: &mut [u8]) -> Option<crate::http::server_conn::HttpEvent> {
+        H3Client::poll_event(self, scratch).map(super::server::map_h3_event)
     }
 
     fn recv_headers(

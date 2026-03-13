@@ -113,9 +113,11 @@ fn tcp_handshake_and_http1_request() {
     // Client should be established
     assert!(client.is_established(), "client TLS handshake should complete");
 
+    let mut scratch = [0u8; 2048];
+
     // Manager should emit Connected event
     let mut got_connected = false;
-    while let Some(ev) = manager.poll_event() {
+    while let Some(ev) = manager.poll_event(&mut scratch) {
         if matches!(ev, ServerEvent::Connected(id) if id == conn_id) {
             got_connected = true;
             break;
@@ -138,7 +140,7 @@ fn tcp_handshake_and_http1_request() {
     // Manager should have request headers event
     let mut got_headers = false;
     let mut header_stream = 0u64;
-    while let Some(ev) = manager.poll_event() {
+    while let Some(ev) = manager.poll_event(&mut scratch) {
         if let ServerEvent::Http { conn, event: HttpEvent::Headers(sid) } = ev {
             if conn == conn_id {
                 got_headers = true;
@@ -247,9 +249,11 @@ fn tcp_handshake_h2_negotiation() {
 
     assert!(client.is_established(), "H2 client should be established");
 
+    let mut scratch = [0u8; 2048];
+
     // Check manager emitted Connected
     let mut got_connected = false;
-    while let Some(ev) = manager.poll_event() {
+    while let Some(ev) = manager.poll_event(&mut scratch) {
         if matches!(ev, ServerEvent::Connected(id) if id == conn_id) {
             got_connected = true;
         }
@@ -292,7 +296,8 @@ fn exchange_udp(
             match manager.udp_poll_transmit::<4096>(&mut buf, now, pool) {
                 Some((_addr, len)) => {
                     let data = buf[..len].to_vec();
-                    let _ = client.recv::<4096>(&data, now, pool);
+                    let mut scratch = [0u8; 4096];
+                    let _ = client.recv::<4096>(&data, &mut scratch, now, pool);
                     any_sent = true;
                 }
                 None => break,
@@ -336,6 +341,7 @@ fn udp_quic_handshake_and_h3_request() {
 
     let peer_addr: u32 = 42;
     let now = 1_000_000u64;
+    let mut scratch = [0u8; 2048];
 
     // Run QUIC handshake + H3 setup.
     // H3 control stream setup is triggered by poll_event(), so we must
@@ -346,14 +352,14 @@ fn udp_quic_handshake_and_h3_request() {
         exchange_udp(&mut client, &mut manager, peer_addr, now, &mut rng, &mut pool);
 
         // Poll manager events (triggers H3 setup when QUIC handshake completes)
-        while let Some(ev) = manager.poll_event() {
+        while let Some(ev) = manager.poll_event(&mut scratch) {
             if let ServerEvent::Http { conn, event: HttpEvent::Connected } = ev {
                 conn_id = Some(conn);
             }
         }
 
         // Poll client events
-        while let Some(ev) = client.poll_event() {
+        while let Some(ev) = client.poll_event(&mut scratch) {
             if ev == milli_http::h3::H3Event::Connected {
                 client_connected = true;
             }
@@ -379,7 +385,7 @@ fn udp_quic_handshake_and_h3_request() {
     let mut got_headers = false;
     let mut header_stream = 0u64;
     for _ in 0..10 {
-        while let Some(ev) = manager.poll_event() {
+        while let Some(ev) = manager.poll_event(&mut scratch) {
             if let ServerEvent::Http { conn, event: HttpEvent::Headers(sid) } = ev {
                 if conn == conn_id {
                     got_headers = true;
@@ -412,7 +418,7 @@ fn udp_quic_handshake_and_h3_request() {
     // Client reads response
     let mut got_resp = false;
     for _ in 0..10 {
-        while let Some(ev) = client.poll_event() {
+        while let Some(ev) = client.poll_event(&mut scratch) {
             if let milli_http::h3::H3Event::Headers(sid) = ev {
                 if sid == stream_id { got_resp = true; }
             }
@@ -433,7 +439,7 @@ fn udp_quic_handshake_and_h3_request() {
     let mut body = [0u8; 64];
     // May need another exchange for Data frame
     exchange_udp(&mut client, &mut manager, peer_addr, now, &mut rng, &mut pool);
-    while let Some(_) = client.poll_event() {} // drain events
+    while let Some(_) = client.poll_event(&mut scratch) {} // drain events
     let (n, _fin) = client.recv_body(stream_id, &mut body).unwrap();
     assert_eq!(&body[..n], b"Hello");
 }
@@ -456,9 +462,11 @@ fn close_tcp_connection() {
     manager.close(id).unwrap();
     assert!(manager.is_closed(id));
 
+    let mut scratch = [0u8; 2048];
+
     // Should emit Closed event
     let mut got_closed = false;
-    while let Some(ev) = manager.poll_event() {
+    while let Some(ev) = manager.poll_event(&mut scratch) {
         if matches!(ev, ServerEvent::Closed(cid) if cid == id) {
             got_closed = true;
         }

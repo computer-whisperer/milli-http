@@ -62,6 +62,7 @@ fn main() {
     let mut h3: H3Client<Aes128GcmProvider> = H3Client::new(conn);
     let mut request_sent = false;
     let mut request_stream: Option<u64> = None;
+    let mut scratch = [0u8; 2048];
 
     for _round in 0..500 {
         let now = to_micros(epoch, time::Instant::now());
@@ -92,7 +93,7 @@ fn main() {
         match socket.recv(&mut recv_buf) {
             Ok(n) => {
                 let now = to_micros(epoch, time::Instant::now());
-                let _ = h3.recv(&recv_buf[..n], now, &mut pool);
+                let _ = h3.recv(&recv_buf[..n], &mut scratch, now, &mut pool);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
@@ -103,7 +104,7 @@ fn main() {
         }
 
         // Process H3 events.
-        while let Some(event) = h3.poll_event() {
+        while let Some(event) = h3.poll_event(&mut scratch) {
             match event {
                 H3Event::Connected => {
                     println!("[h3] connection established");

@@ -5,6 +5,7 @@
 
 use crate::crypto::{Aead, CryptoProvider, DirectionalKeys, Hkdf};
 use crate::error::Error;
+use zeroize::Zeroize;
 
 /// QUIC v1 Initial salt (RFC 9001 section 5.2).
 pub const INITIAL_SALT_V1: [u8; 20] = [
@@ -66,9 +67,13 @@ pub fn derive_initial_secrets<H: Hkdf>(
     let mut initial_secret = [0u8; 32];
     hkdf.extract(&INITIAL_SALT_V1, dcid, &mut initial_secret);
 
-    hkdf_expand_label(hkdf, &initial_secret, b"client in", &[], client_secret)?;
-    hkdf_expand_label(hkdf, &initial_secret, b"server in", &[], server_secret)?;
-    Ok(())
+    let result = (|| {
+        hkdf_expand_label(hkdf, &initial_secret, b"client in", &[], client_secret)?;
+        hkdf_expand_label(hkdf, &initial_secret, b"server in", &[], server_secret)?;
+        Ok(())
+    })();
+    initial_secret.zeroize();
+    result
 }
 
 /// Derive packet protection keys from a traffic secret.
@@ -132,22 +137,27 @@ pub fn derive_directional_keys<C: CryptoProvider>(
     let key_len = C::Aead::KEY_LEN;
     let hp_key_len = core::cmp::max(key_len, 16); // AES HP is always 16, ChaCha HP is 32
 
-    derive_packet_keys(
-        hkdf,
-        secret,
-        &mut key_buf[..key_len],
-        &mut iv,
-        &mut hp_buf[..hp_key_len],
-    )?;
+    let result = (|| {
+        derive_packet_keys(
+            hkdf,
+            secret,
+            &mut key_buf[..key_len],
+            &mut iv,
+            &mut hp_buf[..hp_key_len],
+        )?;
 
-    let aead = provider.aead(&key_buf[..key_len])?;
-    let header_protection = provider.header_protection(&hp_buf[..hp_key_len])?;
+        let aead = provider.aead(&key_buf[..key_len])?;
+        let header_protection = provider.header_protection(&hp_buf[..hp_key_len])?;
 
-    Ok(DirectionalKeys {
-        aead,
-        header_protection,
-        iv,
-    })
+        Ok(DirectionalKeys {
+            aead,
+            header_protection,
+            iv,
+        })
+    })();
+    key_buf.zeroize();
+    hp_buf.zeroize();
+    result
 }
 
 #[cfg(test)]

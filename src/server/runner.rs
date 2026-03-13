@@ -285,7 +285,8 @@ where
         self.manager.handle_timeouts(now);
 
         // 7. Drain manager events
-        if let Some(event) = self.manager.poll_event() {
+        let mut scratch = [0u8; 2048];
+        if let Some(event) = self.manager.poll_event(&mut scratch) {
             if let ServerEvent::Closed(id) = &event {
                 self.tcp_conns.retain(|c| c.id != *id);
             }

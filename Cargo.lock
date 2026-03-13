@@ -380,6 +380,7 @@ dependencies = [
  "rand",
  "sha2",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

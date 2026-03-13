@@ -32,7 +32,11 @@ pub enum HttpEvent {
 /// handled by the connection manager.
 pub trait HttpServerConn {
     /// Poll for the next HTTP event.
-    fn poll_event(&mut self) -> Option<HttpEvent>;
+    ///
+    /// `scratch` is a caller-provided buffer for temporary stream reads,
+    /// avoiding internal stack allocations. Only used by H3 connections;
+    /// TCP-based protocols may ignore it.
+    fn poll_event(&mut self, scratch: &mut [u8]) -> Option<HttpEvent>;
 
     /// Read decoded headers for a stream, calling `emit(name, value)` for each.
     fn recv_headers(

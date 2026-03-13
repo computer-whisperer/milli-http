@@ -21,6 +21,7 @@ pub use header_protection::HeaderProtection;
 pub use hkdf::Hkdf;
 
 use crate::error::Error;
+use zeroize::Zeroize;
 
 /// Encryption level — determines which keys to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +57,12 @@ pub struct DirectionalKeys<A: Aead, H: HeaderProtection> {
     pub header_protection: H,
     /// Nonce base — XORed with packet number to form the per-packet nonce.
     pub iv: [u8; 12],
+}
+
+impl<A: Aead, H: HeaderProtection> Drop for DirectionalKeys<A, H> {
+    fn drop(&mut self) {
+        self.iv.zeroize();
+    }
 }
 
 impl<A: Aead, H: HeaderProtection> DirectionalKeys<A, H> {

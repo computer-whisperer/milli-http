@@ -14,6 +14,7 @@
 
 use crate::buf::{Buf, BufExt};
 use crate::crypto::{Aead, CryptoProvider, Level};
+use zeroize::Zeroize;
 use crate::error::Error;
 use crate::tls::extensions::{
     encode_client_hello_extensions, encode_encrypted_extensions_data,
@@ -171,6 +172,18 @@ pub struct TlsEngine<C: CryptoProvider> {
     legacy_session_id: [u8; 32],
 
     _crypto: core::marker::PhantomData<C>,
+}
+
+impl<C: CryptoProvider> Drop for TlsEngine<C> {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.client_handshake_secret.zeroize();
+        self.server_handshake_secret.zeroize();
+        self.client_app_secret.zeroize();
+        self.server_app_secret.zeroize();
+        // private_key (x25519_dalek::StaticSecret) zeroizes itself on drop
+        // key_schedule (TlsKeySchedule) zeroizes itself on drop
+    }
 }
 
 impl<C: CryptoProvider> TlsEngine<C>
@@ -406,6 +419,11 @@ where
         let server_pk = x25519_dalek::PublicKey::from(server_public);
         let shared_secret = self.private_key.diffie_hellman(&server_pk);
 
+        // RFC 7748: reject low-order points that produce all-zero shared secret
+        if shared_secret.as_bytes().iter().all(|&b| b == 0) {
+            return Err(Error::Tls);
+        }
+
         // Derive handshake secrets
         let hkdf = C::Hkdf::default();
         self.key_schedule
@@ -552,6 +570,7 @@ where
 
         let expected =
             compute_finished_verify_data(&hkdf, &server_finished_key, transcript_before_finished)?;
+        server_finished_key.zeroize();
 
         // Constant-time comparison
         if !ct_eq(&expected, verify_data) {
@@ -594,6 +613,7 @@ where
 
         let client_verify =
             compute_finished_verify_data(&hkdf, &client_finished_key, &transcript_hash)?;
+        client_finished_key.zeroize();
 
         let mut fin_buf = [0u8; 36];
         let fin_len = encode_finished(&client_verify, &mut fin_buf)?;
@@ -697,6 +717,11 @@ where
         // --- Perform X25519 DH ---
         let client_pk = x25519_dalek::PublicKey::from(client_public_bytes);
         let shared_secret = self.private_key.diffie_hellman(&client_pk);
+
+        // RFC 7748: reject low-order points that produce all-zero shared secret
+        if shared_secret.as_bytes().iter().all(|&b| b == 0) {
+            return Err(Error::Tls);
+        }
 
         // Derive handshake secrets
         let hkdf = C::Hkdf::default();
@@ -815,6 +840,7 @@ where
             let transcript_before_fin = self.transcript.current_hash();
             let server_verify =
                 compute_finished_verify_data(&hkdf, &server_finished_key, &transcript_before_fin)?;
+            server_finished_key.zeroize();
             let fin_len = encode_finished(&server_verify, &mut hs_buf[hs_off..])?;
             self.transcript.update(&hs_buf[hs_off..hs_off + fin_len]);
             hs_off += fin_len;
@@ -869,6 +895,7 @@ where
 
         let expected =
             compute_finished_verify_data(&hkdf, &client_finished_key, transcript_before_finished)?;
+        client_finished_key.zeroize();
 
         // Constant-time comparison
         if !ct_eq(&expected, verify_data) {

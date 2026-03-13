@@ -204,10 +204,11 @@ fn main() {
         .expect("failed to create server Connection");
 
     let mut h3: H3Server<Aes128GcmProvider> = H3Server::new(conn);
+    let mut scratch = [0u8; 2048];
 
     // Feed the first datagram.
     let now = to_micros(epoch, time::Instant::now());
-    if let Err(e) = h3.recv(&recv_buf[..first_len], now, &mut pool) {
+    if let Err(e) = h3.recv(&recv_buf[..first_len], &mut scratch, now, &mut pool) {
         eprintln!("[conn] error processing first datagram: {e}");
     }
 
@@ -254,7 +255,7 @@ fn main() {
                         recv_buf[..len].iter().map(|b| format!("{b:02x}")).collect::<String>());
                     let _ = pkt_log.flush();
                     let now = to_micros(epoch, time::Instant::now());
-                    match h3.recv(&recv_buf[..len], now, &mut pool) {
+                    match h3.recv(&recv_buf[..len], &mut scratch, now, &mut pool) {
                         Ok(()) => {},
                         Err(e) => eprintln!("[recv] error: {e}"),
                     }
@@ -270,7 +271,7 @@ fn main() {
         }
 
         // 4. Process H3 events.
-        while let Some(event) = h3.poll_event() {
+        while let Some(event) = h3.poll_event(&mut scratch) {
             match event {
                 H3Event::Connected => {
                     println!("[h3] connection established");
