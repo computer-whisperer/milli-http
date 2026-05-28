@@ -755,12 +755,17 @@ where
 
                 // Even if get_or_create fails (e.g., capacity), try to mark received
                 if self.streams.get(stream.stream_id).is_some() {
-                    let _ = self.streams.mark_recv(
+                    // Enforce per-stream flow control and final-size consistency
+                    // (mark_recv's error was previously discarded), and charge the
+                    // newly received bytes to connection-level flow control
+                    // (RFC 9000 §4.1). A violation is a fatal connection error.
+                    let new_bytes = self.streams.mark_recv(
                         stream.stream_id,
                         stream.offset,
                         stream.data.len() as u64,
                         stream.fin,
-                    );
+                    )?;
+                    self.flow_control.on_recv(new_bytes)?;
 
                     // Store the stream data in our receive buffer
                     self.store_stream_data(

@@ -2,7 +2,9 @@
 
 use crate::crypto::{Aead, CryptoProvider, HeaderProtection, Level};
 use crate::error::Error;
-use crate::frame::{self, AckFrame, ConnectionCloseFrame, CryptoFrame, Frame, StreamFrame};
+use crate::frame::{
+    self, AckFrame, ConnectionCloseFrame, CryptoFrame, Frame, MaxStreamDataFrame, StreamFrame,
+};
 use crate::packet::{self, MIN_INITIAL_PACKET_SIZE};
 use crate::tls::TlsSession;
 use crate::transport::Instant;
@@ -557,6 +559,35 @@ where
         {
             frame_len += written;
             self.ack_eliciting_received[idx] = false;
+        }
+
+        // Connection-level MAX_DATA replenishment (RFC 9000 §4.1): raise the
+        // advertised receive window as we consume data so the peer is not
+        // stalled by the limit we now enforce on the recv path.
+        if let Some(new_max) = self.flow_control.should_send_max_data()
+            && let Ok(written) = frame::encode(
+                &Frame::MaxData(new_max),
+                &mut buf[payload_start + frame_len..],
+            )
+        {
+            frame_len += written;
+            self.flow_control.max_data_sent();
+        }
+
+        // Per-stream MAX_STREAM_DATA replenishment. Each emitted frame commits
+        // the bump; a full buffer simply defers the rest to the next packet.
+        while let Some((sid, new_max)) = self.streams.should_send_max_stream_data() {
+            let msd = Frame::MaxStreamData(MaxStreamDataFrame {
+                stream_id: sid,
+                max_data: new_max,
+            });
+            match frame::encode(&msd, &mut buf[payload_start + frame_len..]) {
+                Ok(written) => {
+                    frame_len += written;
+                    self.streams.mark_max_stream_data_sent(sid);
+                }
+                Err(_) => break,
+            }
         }
 
         // STREAM frames from pending send buffers

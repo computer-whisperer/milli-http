@@ -122,6 +122,8 @@ pub struct RecvState {
     pub offset: u64,
     pub max_data: u64,
     pub max_data_next: u64,
+    /// Initial flow-control window, used as the auto-tune step size.
+    pub initial_window: u64,
     pub fin_offset: Option<u64>,
 }
 
@@ -132,6 +134,7 @@ impl RecvState {
             offset: 0,
             max_data,
             max_data_next: max_data,
+            initial_window: max_data,
             fin_offset: None,
         }
     }
@@ -322,13 +325,19 @@ impl<const N: usize> StreamMap<N> {
     }
 
     /// Record received data on a stream.
+    ///
+    /// Returns the number of newly received bytes — the increase in this
+    /// stream's largest received offset — which the caller charges to
+    /// connection-level flow control (RFC 9000 §4.1 counts the sum of the
+    /// largest received offsets across all streams). Duplicate/retransmitted
+    /// or older data returns 0.
     pub fn mark_recv(
         &mut self,
         stream_id: u64,
         offset: u64,
         len: u64,
         fin: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let stream = self.get_mut(stream_id).ok_or(Error::InvalidState)?;
         let recv = stream.recv.as_mut().ok_or(Error::InvalidState)?;
 
@@ -365,10 +374,16 @@ impl<const N: usize> StreamMap<N> {
             return Err(Error::Transport(TransportError::FlowControlError));
         }
 
-        // Advance contiguous offset (simplified: assumes in-order delivery)
-        if end > recv.offset {
+        // Advance the largest received offset (simplified: assumes in-order
+        // delivery). The increase is the number of newly received bytes that
+        // we charge to connection-level flow control.
+        let new_bytes = if end > recv.offset {
+            let delta = end - recv.offset;
             recv.offset = end;
-        }
+            delta
+        } else {
+            0
+        };
 
         // Check if all data up to FIN has been received
         if let Some(fin_off) = recv.fin_offset
@@ -377,14 +392,42 @@ impl<const N: usize> StreamMap<N> {
             recv.state = RecvStreamState::DataRecvd;
         }
 
-        // Auto-tune: if remaining window < 50% of max, bump next advertised limit
+        // Auto-tune: if remaining window < 50% of the initial window, raise the
+        // next advertised limit by one window. (Uses the stable initial window
+        // as the step, not max_data_next, which grows after each bump.)
         let remaining = recv.max_data.saturating_sub(recv.offset);
-        let window = recv.max_data_next; // original window size
-        if remaining < window / 2 {
-            recv.max_data_next = recv.offset + window;
+        if remaining < recv.initial_window / 2 {
+            recv.max_data_next = recv.offset + recv.initial_window;
         }
 
-        Ok(())
+        Ok(new_bytes)
+    }
+
+    /// Find a stream that should advertise a higher MAX_STREAM_DATA limit.
+    ///
+    /// Returns `(stream_id, new_limit)` for the first receive stream whose
+    /// auto-tuned `max_data_next` exceeds its currently advertised `max_data`.
+    /// The caller emits a MAX_STREAM_DATA frame and then commits the bump via
+    /// [`StreamMap::mark_max_stream_data_sent`].
+    pub fn should_send_max_stream_data(&self) -> Option<(u64, u64)> {
+        for slot in self.streams.iter() {
+            if let Some(s) = slot
+                && let Some(recv) = s.recv.as_ref()
+                && recv.max_data_next > recv.max_data
+            {
+                return Some((s.id, recv.max_data_next));
+            }
+        }
+        None
+    }
+
+    /// Commit a previously emitted MAX_STREAM_DATA advertisement.
+    pub fn mark_max_stream_data_sent(&mut self, stream_id: u64) {
+        if let Some(stream) = self.get_mut(stream_id)
+            && let Some(recv) = stream.recv.as_mut()
+        {
+            recv.max_data = recv.max_data_next;
+        }
     }
 
     /// Mark a stream as reset (we're sending RESET_STREAM).
@@ -688,6 +731,36 @@ mod tests {
         assert_eq!(
             map.get(1).unwrap().recv.as_ref().unwrap().fin_offset,
             Some(150)
+        );
+    }
+
+    #[test]
+    fn mark_recv_reports_new_bytes_and_triggers_max_stream_data() {
+        let mut map = StreamMap::<4>::new();
+        // Peer-initiated bidi stream with a small 100-byte receive window.
+        map.get_or_create(1, true, 100).unwrap();
+
+        // First 60 bytes are all newly received.
+        assert_eq!(map.mark_recv(1, 0, 60, false).unwrap(), 60);
+        // A duplicate frame charges nothing to connection flow control.
+        assert_eq!(map.mark_recv(1, 0, 60, false).unwrap(), 0);
+        // An overlapping frame only charges the high-water-mark increase.
+        assert_eq!(map.mark_recv(1, 40, 40, false).unwrap(), 20); // end=80, prev=60
+
+        // remaining = 100 - 80 = 20 < initial_window/2 (50) -> auto-tune bumped.
+        let (sid, new_limit) = map
+            .should_send_max_stream_data()
+            .expect("a MAX_STREAM_DATA update should be pending");
+        assert_eq!(sid, 1);
+        assert_eq!(new_limit, 80 + 100); // offset + initial window
+
+        map.mark_max_stream_data_sent(1);
+        assert!(map.should_send_max_stream_data().is_none());
+
+        // The peer exceeding the advertised limit is a fatal flow-control error.
+        assert_eq!(
+            map.mark_recv(1, 80, 200, false).unwrap_err(),
+            Error::Transport(TransportError::FlowControlError)
         );
     }
 
