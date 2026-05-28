@@ -282,13 +282,14 @@ where
                     ContentType::ApplicationData => {
                         let keys = self.hs_recv.as_ref().ok_or(Error::Tls)?;
                         let nonce = record::build_nonce(&keys.iv, self.hs_recv_seq);
-                        self.hs_recv_seq += 1;
                         let plain_len = keys.aead.open_in_place(
                             &nonce,
                             &header_bytes,
                             &mut io.recv_buf[ps..ps + payload_len],
                             payload_len,
                         )?;
+                        // Advance only after successful decryption.
+                        self.hs_recv_seq += 1;
                         let (data_len, inner_ct) =
                             find_inner_content_type(&io.recv_buf[ps..ps + plain_len])?;
                         match inner_ct {
@@ -326,13 +327,14 @@ where
                         ContentType::ApplicationData => {
                             let keys = self.app_recv.as_ref().ok_or(Error::Tls)?;
                             let nonce = record::build_nonce(&keys.iv, self.recv_seq);
-                            self.recv_seq += 1;
                             let plain_len = keys.aead.open_in_place(
                                 &nonce,
                                 &header_bytes,
                                 &mut io.recv_buf[ps..ps + payload_len],
                                 payload_len,
                             )?;
+                            // Advance only after successful decryption.
+                            self.recv_seq += 1;
                             let (data_len, inner_ct) =
                                 find_inner_content_type(&io.recv_buf[ps..ps + plain_len])?;
                             match inner_ct {
@@ -563,7 +565,6 @@ where
                 None => break,
             };
             let nonce = record::build_nonce(&keys.iv, self.send_seq);
-            self.send_seq += 1;
 
             if encrypt_into::<C::Aead, BUF>(
                 &io.app_send_buf[..chunk_len],
@@ -574,8 +575,12 @@ where
             )
             .is_err()
             {
+                // Record was not emitted (e.g. send_buf full); do NOT consume the
+                // sequence number, or every subsequent record desyncs the peer's nonce.
                 break;
             }
+            // Only advance the sequence number once the record is committed.
+            self.send_seq += 1;
 
             io.app_send_buf.copy_within(chunk_len.., 0);
             io.app_send_buf.truncate(io.app_send_buf.len() - chunk_len);
@@ -604,13 +609,17 @@ where
         if use_hs_keys {
             let keys = self.hs_send.as_ref().ok_or(Error::Tls)?;
             let nonce = record::build_nonce(&keys.iv, self.hs_send_seq);
+            encrypt_into::<C::Aead, BUF>(data, inner_ct, &keys.aead, &nonce, io.send_buf)?;
+            // Advance only after a record was actually produced, so a buffer-full
+            // failure cannot consume a sequence number and desync the peer.
             self.hs_send_seq += 1;
-            encrypt_into::<C::Aead, BUF>(data, inner_ct, &keys.aead, &nonce, io.send_buf)
+            Ok(())
         } else {
             let keys = self.app_send.as_ref().ok_or(Error::Tls)?;
             let nonce = record::build_nonce(&keys.iv, self.send_seq);
+            encrypt_into::<C::Aead, BUF>(data, inner_ct, &keys.aead, &nonce, io.send_buf)?;
             self.send_seq += 1;
-            encrypt_into::<C::Aead, BUF>(data, inner_ct, &keys.aead, &nonce, io.send_buf)
+            Ok(())
         }
     }
 }
