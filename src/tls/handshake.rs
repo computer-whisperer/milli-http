@@ -703,6 +703,21 @@ where
             }
         }
 
+        // RFC 7301 §3.2 / RFC 9001 §8.1: if the client offered ALPN and we have
+        // protocols configured, we MUST agree on one. Previously a non-overlapping
+        // (or unknown) ALPN offer was accepted silently and the connection was then
+        // routed to a default handler — a client offering only "h3"/"hq-interop"
+        // could be misdirected to an HTTP/1.1 handler. Abort the handshake instead.
+        // (We do not have a TLS alert pipeline yet, so this aborts rather than
+        // sending no_application_protocol; a client that offers no ALPN at all is
+        // still allowed, matching RFC 7301 — the caller defaults such connections.)
+        if selected_alpn.is_none()
+            && !self.alpn_protocols.is_empty()
+            && !ext.alpn_protocols.is_empty()
+        {
+            return Err(Error::Tls);
+        }
+
         // Store peer transport params
         self.peer_transport_params = ext.transport_params;
 
@@ -1773,6 +1788,35 @@ mod tests {
         assert_eq!(msg_types[1], HandshakeType::Certificate as u8);
         assert_eq!(msg_types[2], HandshakeType::CertificateVerify as u8);
         assert_eq!(msg_types[3], HandshakeType::Finished as u8);
+    }
+
+    /// Test: Server aborts the handshake when the client's ALPN offer does not
+    /// overlap the server's configured protocols (RFC 7301 §3.2 / RFC 9001 §8.1).
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn server_rejects_alpn_mismatch() {
+        use crate::crypto::rustcrypto::Aes128GcmProvider;
+
+        // Client offers only "h3"; server supports only "h2" — no overlap.
+        let mut client =
+            TlsEngine::<Aes128GcmProvider>::new_client(make_client_config(), [0x42; 32], [0; 32]);
+        let server_config = ServerTlsConfig {
+            cert_der: get_test_ed25519_cert_der(),
+            private_key_der: &TEST_ED25519_SEED,
+            alpn_protocols: &[b"h2"],
+            transport_params: TransportParams::default_params(),
+        };
+        let mut server =
+            TlsEngine::<Aes128GcmProvider>::new_server(server_config, [0xAA; 32], [0xBB; 32]);
+
+        let mut ch_buf = [0u8; 2048];
+        let (ch_len, _) = client.write_handshake(&mut ch_buf).unwrap();
+
+        let res = server.read_handshake(Level::Initial, &ch_buf[..ch_len]);
+        assert!(
+            res.is_err(),
+            "server must abort the handshake when no ALPN protocol overlaps"
+        );
     }
 
     /// Test: Full client-server handshake driven to completion.
