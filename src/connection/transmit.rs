@@ -590,8 +590,19 @@ where
             }
         }
 
-        // STREAM frames from pending send buffers
-        let stream_written = self.build_stream_frames(sio, &mut buf[payload_start + frame_len..]);
+        // STREAM frames from pending send buffers, bounded by the congestion
+        // window (RFC 9002 §7). Only new stream data is congestion-controlled;
+        // the ACK and control frames above are exempt, so a cwnd-limited
+        // connection still makes progress (ACKs flow, the window reopens). When
+        // the window is exhausted we defer stream data to a later packet.
+        let buf_avail = buf.len().saturating_sub(payload_start + frame_len);
+        let stream_budget = (self.congestion.available_window() as usize).min(buf_avail);
+        let stream_written = if stream_budget > 0 {
+            let end = payload_start + frame_len + stream_budget;
+            self.build_stream_frames(sio, &mut buf[payload_start + frame_len..end])
+        } else {
+            0
+        };
         frame_len += stream_written;
 
         if frame_len == 0 {
@@ -2081,6 +2092,132 @@ mod tests {
         assert!(
             result.is_err(),
             "stream_send after close should return an error"
+        );
+    }
+
+    /// Deliver every pending packet from `src` to `dst`.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    fn drain_to(
+        src: &mut Connection<Aes128GcmProvider>,
+        src_sio: &mut SioBufs,
+        dst: &mut Connection<Aes128GcmProvider>,
+        dst_sio: &mut SioBufs,
+        now: crate::transport::Instant,
+        pool: &mut HandshakePool<Aes128GcmProvider, 4>,
+    ) {
+        let mut scratch = [0u8; 2048];
+        loop {
+            let mut buf = [0u8; 4096];
+            match src.poll_transmit(&mut src_sio.as_io(), &mut buf, now, pool) {
+                Some(tx) => {
+                    let data: heapless::Vec<u8, 4096> = {
+                        let mut v = heapless::Vec::new();
+                        let _ = v.extend_from_slice(tx.data);
+                        v
+                    };
+                    let _ = dst.recv(&mut dst_sio.as_io(), &data, &mut scratch, now, pool);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Congestion control (RFC 9002 §7): when the congestion window is full,
+    /// new STREAM data is deferred rather than flooded onto the network, while
+    /// the connection otherwise stays alive and resumes once the window reopens.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn congestion_window_gates_stream_data() {
+        let mut pool = make_pool();
+        let (mut client, mut c_sio) = make_client(&mut pool);
+        let (mut server, mut s_sio) = make_server(&mut pool);
+        let now: crate::transport::Instant = 1_000_000;
+
+        run_handshake(
+            &mut client,
+            &mut c_sio,
+            &mut server,
+            &mut s_sio,
+            now,
+            &mut pool,
+        );
+        for _ in 0..5 {
+            drain_to(
+                &mut client,
+                &mut c_sio,
+                &mut server,
+                &mut s_sio,
+                now,
+                &mut pool,
+            );
+            drain_to(
+                &mut server,
+                &mut s_sio,
+                &mut client,
+                &mut c_sio,
+                now,
+                &mut pool,
+            );
+        }
+        while client.poll_event().is_some() {}
+        while server.poll_event().is_some() {}
+
+        // Exhaust the congestion window: pretend a full cwnd is already in flight
+        // so available_window() == 0.
+        let cwnd = client.congestion.cwnd();
+        client.congestion.on_packet_sent(cwnd);
+        assert_eq!(client.congestion.available_window(), 0);
+
+        let stream_id = client.open_stream().unwrap();
+        assert_eq!(
+            client
+                .stream_send(&mut c_sio.as_io(), stream_id, &[0xABu8; 1024], false)
+                .unwrap(),
+            1024
+        );
+
+        drain_to(
+            &mut client,
+            &mut c_sio,
+            &mut server,
+            &mut s_sio,
+            now,
+            &mut pool,
+        );
+
+        let mut readable = false;
+        while let Some(ev) = server.poll_event() {
+            if matches!(ev, crate::Event::StreamReadable(_)) {
+                readable = true;
+            }
+        }
+        assert!(
+            !readable,
+            "stream data must be withheld while the congestion window is full"
+        );
+
+        // Simulate the in-flight data being acknowledged; the window reopens and
+        // the queued stream data now reaches the server.
+        client.congestion.on_packet_acked(cwnd, now, now);
+        assert!(client.congestion.available_window() > 0);
+        drain_to(
+            &mut client,
+            &mut c_sio,
+            &mut server,
+            &mut s_sio,
+            now,
+            &mut pool,
+        );
+
+        let mut readable_after = false;
+        while let Some(ev) = server.poll_event() {
+            if matches!(ev, crate::Event::StreamReadable(_)) {
+                readable_after = true;
+            }
+        }
+        assert!(
+            readable_after,
+            "stream data should flow once the congestion window reopens"
         );
     }
 }
