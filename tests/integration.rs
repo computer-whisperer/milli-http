@@ -784,6 +784,137 @@ fn large_data_transfer() {
     assert!(!fin);
 }
 
+/// Transfer well over 1 MiB on a single stream. This exceeds both the
+/// per-stream (256 KiB) and connection-level (1 MiB) initial receive windows,
+/// so it only completes if receive flow control is enforced AND the matching
+/// MAX_DATA / MAX_STREAM_DATA replenishment is emitted (C2), and if the
+/// per-stream receive buffer reclaims space as the application reads.
+#[test]
+fn transfer_exceeds_initial_flow_control_windows() {
+    let mut pool = make_pool();
+    let mut client = make_client(&mut pool);
+    let mut server = make_server(&mut pool);
+    let mut c_sio = SioBufs::new();
+    let mut s_sio = SioBufs::new();
+    let now = 1_000_000u64;
+
+    run_handshake(
+        &mut client,
+        &mut c_sio,
+        &mut server,
+        &mut s_sio,
+        now,
+        &mut pool,
+    );
+    drain_post_handshake(
+        &mut client,
+        &mut c_sio,
+        &mut server,
+        &mut s_sio,
+        now,
+        &mut pool,
+    );
+
+    let stream_id = client.open_stream().unwrap();
+
+    let chunk: [u8; 1024] = {
+        let mut a = [0u8; 1024];
+        for (i, b) in a.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        a
+    };
+
+    // ~1.5 MiB: comfortably past the 1 MiB connection window and 256 KiB stream window.
+    const TOTAL: usize = 1536 * 1024;
+    let mut sent_total = 0usize;
+    let mut recv_total = 0usize;
+    let mut rbuf = [0u8; 1024];
+
+    let mut guard = 0usize;
+    while sent_total < TOTAL {
+        guard += 1;
+        assert!(guard < 1_000_000, "transfer stalled (no progress)");
+
+        // stream_send returns Ok(0) when the per-stream window is momentarily
+        // exhausted; draining delivers the server's MAX_STREAM_DATA so the next
+        // round unblocks.
+        let sent = client
+            .stream_send(&mut c_sio.as_io(), stream_id, &chunk, false)
+            .unwrap();
+        sent_total += sent;
+
+        // client -> server (data), then server -> client (ACK, MAX_DATA, MAX_STREAM_DATA).
+        drain_transmits(
+            &mut client,
+            &mut c_sio,
+            &mut server,
+            &mut s_sio,
+            now,
+            &mut pool,
+        );
+        drain_transmits(
+            &mut server,
+            &mut s_sio,
+            &mut client,
+            &mut c_sio,
+            now,
+            &mut pool,
+        );
+        drain_events(&mut server);
+
+        loop {
+            match server.stream_recv(&mut s_sio.as_io(), stream_id, &mut rbuf) {
+                Ok((0, _)) => break,
+                Ok((n, _)) => recv_total += n,
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            !server.is_closed(),
+            "server closed mid-transfer (flow control?)"
+        );
+        assert!(!client.is_closed(), "client closed mid-transfer");
+    }
+
+    // Flush trailing data still in flight / buffered.
+    for _ in 0..8 {
+        drain_transmits(
+            &mut client,
+            &mut c_sio,
+            &mut server,
+            &mut s_sio,
+            now,
+            &mut pool,
+        );
+        drain_transmits(
+            &mut server,
+            &mut s_sio,
+            &mut client,
+            &mut c_sio,
+            now,
+            &mut pool,
+        );
+        loop {
+            match server.stream_recv(&mut s_sio.as_io(), stream_id, &mut rbuf) {
+                Ok((0, _)) => break,
+                Ok((n, _)) => recv_total += n,
+                Err(_) => break,
+            }
+        }
+    }
+
+    assert!(
+        sent_total >= TOTAL,
+        "sent {sent_total}, expected >= {TOTAL}"
+    );
+    assert_eq!(
+        recv_total, sent_total,
+        "server must receive every byte sent"
+    );
+}
+
 /// Test 10: Client initiates key update mid-stream; data still flows
 /// correctly afterward.
 #[test]

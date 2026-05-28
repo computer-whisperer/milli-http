@@ -637,7 +637,21 @@ where
             return Err(Error::InvalidState);
         }
         let is_client = self.role == Role::Client;
-        self.streams.open_bidi(is_client)
+        let stream_id = self.streams.open_bidi(is_client)?;
+        // open_bidi seeds placeholder windows; apply the negotiated limits so we
+        // may send up to the peer's advertised limit (otherwise a transfer larger
+        // than the placeholder deadlocks before the peer grants more) and we
+        // advertise our own limit on the receive side.
+        let send_max = self
+            .peer_params
+            .as_ref()
+            .map(|p| p.initial_max_stream_data_bidi_remote);
+        self.streams.set_stream_windows(
+            stream_id,
+            send_max,
+            Some(self.local_params.initial_max_stream_data_bidi_local),
+        );
+        Ok(stream_id)
     }
 
     /// Open a new unidirectional stream.
@@ -646,7 +660,13 @@ where
             return Err(Error::InvalidState);
         }
         let is_client = self.role == Role::Client;
-        self.streams.open_uni(is_client)
+        let stream_id = self.streams.open_uni(is_client)?;
+        let send_max = self
+            .peer_params
+            .as_ref()
+            .map(|p| p.initial_max_stream_data_uni);
+        self.streams.set_stream_windows(stream_id, send_max, None);
+        Ok(stream_id)
     }
 
     /// Send data on a stream.
@@ -740,6 +760,15 @@ where
                 let fin = recv.fin_received && recv.read_offset >= recv.len;
                 if fin {
                     *slot = None;
+                } else if recv.read_offset > 0 {
+                    // Compact: discard already-read bytes from the front so the
+                    // fixed-capacity buffer can keep accepting data on a
+                    // long-lived stream. Without this, `len` only ever grows and
+                    // store_stream_data silently drops everything once the
+                    // buffer first fills, capping stream throughput at STREAM_BUF.
+                    recv.data.copy_within(recv.read_offset..recv.len, 0);
+                    recv.len -= recv.read_offset;
+                    recv.read_offset = 0;
                 }
                 return Ok((copy_len, fin));
             }

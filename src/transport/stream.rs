@@ -482,6 +482,33 @@ impl<const N: usize> StreamMap<N> {
         }
     }
 
+    /// Set the initial flow-control windows for a freshly opened stream from
+    /// negotiated transport parameters. `send_max` is the peer's advertised
+    /// limit for streams we initiate; `recv_max` is the limit we advertise.
+    /// `None` leaves the corresponding window unchanged (e.g. a uni stream has
+    /// no receive side).
+    pub fn set_stream_windows(
+        &mut self,
+        stream_id: u64,
+        send_max: Option<u64>,
+        recv_max: Option<u64>,
+    ) {
+        if let Some(stream) = self.get_mut(stream_id) {
+            if let Some(max) = send_max
+                && let Some(send) = stream.send.as_mut()
+            {
+                send.max_data = max;
+            }
+            if let Some(max) = recv_max
+                && let Some(recv) = stream.recv.as_mut()
+            {
+                recv.max_data = max;
+                recv.max_data_next = max;
+                recv.initial_window = max;
+            }
+        }
+    }
+
     /// Handle received MAX_STREAM_DATA.
     pub fn handle_max_stream_data(&mut self, stream_id: u64, max_data: u64) -> Result<(), Error> {
         let stream = self.get_mut(stream_id).ok_or(Error::InvalidState)?;
