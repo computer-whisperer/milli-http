@@ -727,9 +727,19 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                             stream.open();
                         }
                         stream.headers_data.clear();
-                        let _ = stream
+                        // RFC 9113 §6.5.2 / §6.10 (CVE-2024-27316): bound the header
+                        // block. The accumulation buffer (HDRBUF) caps the field
+                        // section we will accept; if it overflows, reject the whole
+                        // connection rather than silently truncating an
+                        // attacker-controlled header set or accepting an unbounded
+                        // CONTINUATION flood.
+                        if stream
                             .headers_data
-                            .extend_from_slice(&io.recv_buf[frag_start..data_end]);
+                            .extend_from_slice(&io.recv_buf[frag_start..data_end])
+                            .is_err()
+                        {
+                            return Err(Error::Http2(crate::error::H2Error::EnhanceYourCalm));
+                        }
                         if end_headers {
                             stream.headers_received = true;
                         }
@@ -869,7 +879,16 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                     }
                     let end_headers = flags & FLAG_END_HEADERS != 0;
                     if let Some(stream) = self.streams.iter_mut().find(|s| s.id == stream_id) {
-                        let _ = stream.headers_data.extend_from_slice(&io.recv_buf[ps..pe]);
+                        // Bound the accumulated header block (see FRAME_HEADERS): an
+                        // overflow here means a CONTINUATION flood or oversized field
+                        // section — terminate rather than silently truncate.
+                        if stream
+                            .headers_data
+                            .extend_from_slice(&io.recv_buf[ps..pe])
+                            .is_err()
+                        {
+                            return Err(Error::Http2(crate::error::H2Error::EnhanceYourCalm));
+                        }
                         if end_headers {
                             stream.headers_received = true;
                             self.continuation_stream_id = None;
@@ -1622,6 +1641,56 @@ mod tests {
         assert!(
             got_reset,
             "client should emit StreamReset(stream_id, CANCEL)"
+        );
+    }
+
+    #[test]
+    fn continuation_flood_rejected() {
+        // RFC 9113 §6.5.2 / §6.10 (CVE-2024-27316): a HEADERS frame without
+        // END_HEADERS followed by CONTINUATION frames whose accumulated field
+        // section exceeds what we will buffer (HDRBUF) must terminate the
+        // connection rather than silently truncate or loop unboundedly.
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<32768>::new();
+        let mut server = H2Connection::<16>::new_server(); // HDRBUF = 2048
+        let mut sio = H2IoBufs::<32768>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+
+        fn raw_frame(
+            ty: u8,
+            flags: u8,
+            stream_id: u32,
+            payload_len: usize,
+            out: &mut [u8],
+        ) -> usize {
+            out[0] = (payload_len >> 16) as u8;
+            out[1] = (payload_len >> 8) as u8;
+            out[2] = payload_len as u8;
+            out[3] = ty;
+            out[4] = flags;
+            out[5..9].copy_from_slice(&stream_id.to_be_bytes());
+            for b in &mut out[9..9 + payload_len] {
+                *b = 0;
+            }
+            9 + payload_len
+        }
+
+        let mut buf = [0u8; 2048];
+
+        // HEADERS (no END_HEADERS): 1500 bytes — fits within HDRBUF.
+        let n = raw_frame(FRAME_HEADERS, 0, 1, 1500, &mut buf);
+        server.feed_data(&mut sio.as_io(), &buf[..n]).unwrap();
+
+        // CONTINUATION pushes the accumulated block past HDRBUF (2048).
+        let n = raw_frame(FRAME_CONTINUATION, 0, 1, 1500, &mut buf);
+        let res = server.feed_data(&mut sio.as_io(), &buf[..n]);
+        assert!(
+            matches!(
+                res,
+                Err(Error::Http2(crate::error::H2Error::EnhanceYourCalm))
+            ),
+            "oversized CONTINUATION accumulation must terminate the connection, got {:?}",
+            res
         );
     }
 
