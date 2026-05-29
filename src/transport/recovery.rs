@@ -20,12 +20,16 @@ pub struct AckResult {
 }
 
 /// Fixed-capacity tracker of sent-but-unacked packets.
+///
+/// `entries` is kept **dense** (no holes): packets are appended on send and
+/// removed with `swap_remove` on ack/loss. Storage order is therefore not PN
+/// order — no consumer depends on order — but every operation costs
+/// O(in-flight count) rather than O(N), and sends are O(1) appends.
 pub struct SentPacketTracker<const N: usize = 128> {
     #[cfg(not(feature = "alloc"))]
-    entries: [Option<SentPacket>; N],
+    entries: heapless::Vec<SentPacket, N>,
     #[cfg(feature = "alloc")]
-    entries: alloc::vec::Vec<Option<SentPacket>>,
-    count: usize,
+    entries: alloc::vec::Vec<SentPacket>,
 }
 
 impl<const N: usize> Default for SentPacketTracker<N> {
@@ -38,34 +42,20 @@ impl<const N: usize> SentPacketTracker<N> {
     pub fn new() -> Self {
         Self {
             #[cfg(not(feature = "alloc"))]
-            entries: [None; N],
+            entries: heapless::Vec::new(),
             #[cfg(feature = "alloc")]
             entries: alloc::vec::Vec::new(),
-            count: 0,
         }
     }
 
     /// Record a sent packet.
     pub fn on_packet_sent(&mut self, pkt: SentPacket) -> Result<(), Error> {
-        // Find an empty slot.
-        for slot in self.entries.iter_mut() {
-            if slot.is_none() {
-                *slot = Some(pkt);
-                self.count += 1;
-                return Ok(());
-            }
+        if self.entries.len() >= N {
+            return Err(Error::BufferTooSmall { needed: N + 1 });
         }
-        #[cfg(not(feature = "alloc"))]
-        return Err(Error::BufferTooSmall { needed: N + 1 });
-        #[cfg(feature = "alloc")]
-        {
-            if self.entries.len() >= N {
-                return Err(Error::BufferTooSmall { needed: N + 1 });
-            }
-            self.entries.push(Some(pkt));
-            self.count += 1;
-            Ok(())
-        }
+        // Capacity is guaranteed by the check above.
+        let _ = self.entries.push(pkt);
+        Ok(())
     }
 
     /// Process an ACK: mark packets as acknowledged.
@@ -103,27 +93,26 @@ impl<const N: usize> SentPacketTracker<N> {
             largest_newly_acked: None,
         };
 
-        for slot in self.entries.iter_mut() {
-            if let Some(pkt) = slot {
-                if pkt.level != level {
-                    continue;
-                }
-                // Check if this packet's PN falls in any acked range.
-                let pn = pkt.pn;
-                let is_acked = acked_ranges.iter().any(|&(lo, hi)| pn >= lo && pn <= hi);
-                if is_acked {
-                    let p = *pkt;
-                    let _ = result.newly_acked.push(p);
-                    match result.largest_newly_acked {
-                        None => result.largest_newly_acked = Some(p),
-                        Some(ref prev) if p.pn > prev.pn => {
-                            result.largest_newly_acked = Some(p);
-                        }
-                        _ => {}
+        let mut i = 0;
+        while i < self.entries.len() {
+            let pkt = self.entries[i];
+            let is_acked = pkt.level == level
+                && acked_ranges
+                    .iter()
+                    .any(|&(lo, hi)| pkt.pn >= lo && pkt.pn <= hi);
+            if is_acked {
+                let _ = result.newly_acked.push(pkt);
+                match result.largest_newly_acked {
+                    None => result.largest_newly_acked = Some(pkt),
+                    Some(prev) if pkt.pn > prev.pn => {
+                        result.largest_newly_acked = Some(pkt);
                     }
-                    *slot = None;
-                    self.count -= 1;
+                    _ => {}
                 }
+                // Remove without preserving order; re-check the swapped-in entry.
+                self.entries.swap_remove(i);
+            } else {
+                i += 1;
             }
         }
 
@@ -132,10 +121,9 @@ impl<const N: usize> SentPacketTracker<N> {
 
     /// Get all packets in a given space that were sent before `before`.
     pub fn sent_before(&self, level: Level, before: Instant) -> impl Iterator<Item = &SentPacket> {
-        self.entries.iter().filter_map(move |slot| {
-            slot.as_ref()
-                .filter(|p| p.level == level && p.time_sent < before)
-        })
+        self.entries
+            .iter()
+            .filter(move |p| p.level == level && p.time_sent < before)
     }
 
     /// Get all packets with PN less than threshold in a given space.
@@ -144,51 +132,42 @@ impl<const N: usize> SentPacketTracker<N> {
         level: Level,
         pn_threshold: u64,
     ) -> impl Iterator<Item = &SentPacket> {
-        self.entries.iter().filter_map(move |slot| {
-            slot.as_ref()
-                .filter(|p| p.level == level && p.pn < pn_threshold)
-        })
+        self.entries
+            .iter()
+            .filter(move |p| p.level == level && p.pn < pn_threshold)
     }
 
     /// Remove a packet (after declaring it lost or acked).
     pub fn remove(&mut self, level: Level, pn: u64) -> Option<SentPacket> {
-        for slot in self.entries.iter_mut() {
-            if let Some(pkt) = slot
-                && pkt.level == level
-                && pkt.pn == pn
-            {
-                let p = *pkt;
-                *slot = None;
-                self.count -= 1;
-                return Some(p);
-            }
-        }
-        None
+        let pos = self
+            .entries
+            .iter()
+            .position(|p| p.level == level && p.pn == pn)?;
+        Some(self.entries.swap_remove(pos))
     }
 
     /// Drop all packets in a packet number space.
     pub fn drop_space(&mut self, level: Level) {
-        for slot in self.entries.iter_mut() {
-            if let Some(pkt) = slot
-                && pkt.level == level
-            {
-                *slot = None;
-                self.count -= 1;
+        let mut i = 0;
+        while i < self.entries.len() {
+            if self.entries[i].level == level {
+                self.entries.swap_remove(i);
+            } else {
+                i += 1;
             }
         }
     }
 
     /// Number of tracked packets.
     pub fn count(&self) -> usize {
-        self.count
+        self.entries.len()
     }
 
     /// Any ack-eliciting packets in flight for this space?
     pub fn has_ack_eliciting_in_flight(&self, level: Level) -> bool {
-        self.entries.iter().any(|slot| {
-            slot.as_ref()
-                .is_some_and(|p| p.level == level && p.ack_eliciting && p.in_flight)
-        })
+        self.entries
+            .iter()
+            .any(|p| p.level == level && p.ack_eliciting && p.in_flight)
     }
 }
 
@@ -205,6 +184,34 @@ mod tests {
             ack_eliciting: true,
             in_flight: true,
         }
+    }
+
+    /// Dense storage uses `swap_remove`, which reorders entries. Verify that
+    /// across several partial acks the *exact* set of remaining packets is
+    /// preserved (no loss or duplication from the reordering).
+    #[test]
+    fn dense_partial_acks_preserve_set() {
+        let mut tracker = SentPacketTracker::<32>::new();
+        for pn in 0..10u64 {
+            tracker
+                .on_packet_sent(make_pkt(pn, Level::Application, pn * 10, 100))
+                .unwrap();
+        }
+        // Ack a scattered middle range: largest=7, first_range=2 -> {5,6,7}.
+        let r = tracker.on_ack_received(Level::Application, 7, 2, &[]);
+        assert_eq!(r.newly_acked.len(), 3);
+        assert_eq!(tracker.count(), 7);
+
+        // Remaining must be exactly {0,1,2,3,4,8,9}.
+        let mut remaining: heapless::Vec<u64, 32> =
+            tracker.sent_below_pn(Level::Application, u64::MAX).map(|p| p.pn).collect();
+        remaining.sort_unstable();
+        assert_eq!(remaining.as_slice(), &[0, 1, 2, 3, 4, 8, 9]);
+
+        // Ack the rest and confirm the tracker drains exactly.
+        let r2 = tracker.on_ack_received(Level::Application, 9, 9, &[]);
+        assert_eq!(r2.newly_acked.len(), 7);
+        assert_eq!(tracker.count(), 0);
     }
 
     #[test]
