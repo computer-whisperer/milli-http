@@ -41,7 +41,9 @@ impl FlowController {
         }
         let n_i32 = n as i32;
         if self.window < n_i32 {
-            return Err(Error::InvalidState);
+            // RFC 9113 §6.9.1: receiving more than the advertised window is a
+            // flow-control violation, not a generic protocol error.
+            return Err(Error::Http2(crate::error::H2Error::FlowControlError));
         }
         self.window -= n_i32;
         Ok(())

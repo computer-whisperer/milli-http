@@ -679,6 +679,12 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                     self.conn_recv_fc.consume(data_len as u32)?;
 
                     if let Some(stream) = self.streams.iter_mut().find(|s| s.id == stream_id) {
+                        // RFC 9113 §6.9.1: a peer exceeding the stream-level
+                        // flow-control window is a FLOW_CONTROL_ERROR (previously
+                        // recv_window was driven silently negative).
+                        if (data_len as i32) > stream.recv_window {
+                            return Err(Error::Http2(crate::error::H2Error::FlowControlError));
+                        }
                         let _ = stream
                             .data_buf
                             .extend_from_slice(&io.recv_buf[data_start..data_end]);
@@ -719,6 +725,25 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                     } else {
                         data_start
                     };
+
+                    // RFC 9113 §5.1.1: a stream newly opened by HEADERS must use
+                    // the initiator's ID space — client-initiated streams are
+                    // odd, server-initiated even. A server must only see new odd
+                    // streams from a client; a client must not have the peer open
+                    // a new stream via HEADERS (server push uses PUSH_PROMISE and
+                    // is disabled). Existing streams (e.g. a response on a stream
+                    // we opened) are unaffected.
+                    let is_new = !self.streams.iter().any(|s| s.id == stream_id);
+                    if is_new {
+                        let odd = stream_id % 2 == 1;
+                        let ok = match self.role {
+                            Role::Server => odd,
+                            Role::Client => false,
+                        };
+                        if !ok {
+                            return Err(Error::Http2(crate::error::H2Error::ProtocolError));
+                        }
+                    }
 
                     self.last_peer_stream_id = self.last_peer_stream_id.max(stream_id);
                     self.ensure_stream(stream_id);
@@ -791,7 +816,13 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                         let delta = new_initial - old_initial;
                         if delta != 0 {
                             for stream in self.streams.iter_mut() {
-                                stream.send_window += delta;
+                                // RFC 9113 §6.9.2: a window pushed above 2^31-1 by an
+                                // INITIAL_WINDOW_SIZE change is a FLOW_CONTROL_ERROR,
+                                // not an overflow panic / silent wrap.
+                                stream.send_window = stream
+                                    .send_window
+                                    .checked_add(delta)
+                                    .ok_or(Error::Http2(crate::error::H2Error::FlowControlError))?;
                             }
                         }
                     }
@@ -1691,6 +1722,132 @@ mod tests {
             ),
             "oversized CONTINUATION accumulation must terminate the connection, got {:?}",
             res
+        );
+    }
+
+    #[test]
+    fn settings_initial_window_overflow_is_flow_control_error() {
+        // RFC 9113 §6.9.2: a SETTINGS_INITIAL_WINDOW_SIZE change that pushes a
+        // stream's flow-control window above 2^31-1 MUST be a FLOW_CONTROL_ERROR,
+        // not a panic (debug) or silent wrap to negative (release).
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<32768>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<32768>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+
+        fn raw_frame(ty: u8, flags: u8, stream_id: u32, payload: &[u8], out: &mut [u8]) -> usize {
+            let n = payload.len();
+            out[0] = (n >> 16) as u8;
+            out[1] = (n >> 8) as u8;
+            out[2] = n as u8;
+            out[3] = ty;
+            out[4] = flags;
+            out[5..9].copy_from_slice(&stream_id.to_be_bytes());
+            out[9..9 + n].copy_from_slice(payload);
+            9 + n
+        }
+
+        let mut buf = [0u8; 64];
+
+        // Create stream 1 on the server (empty header block, END_HEADERS).
+        let n = raw_frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, &[], &mut buf);
+        server.feed_data(&mut sio.as_io(), &buf[..n]).unwrap();
+
+        // Push stream 1's send_window to exactly i32::MAX via WINDOW_UPDATE
+        // (default initial window is 65535).
+        let inc: u32 = 0x7fff_ffff - 65535;
+        let n = raw_frame(FRAME_WINDOW_UPDATE, 0, 1, &inc.to_be_bytes(), &mut buf);
+        server.feed_data(&mut sio.as_io(), &buf[..n]).unwrap();
+
+        // SETTINGS raising INITIAL_WINDOW_SIZE by +1 would overflow send_window.
+        let mut setting = [0u8; 6];
+        setting[0..2].copy_from_slice(&SETTINGS_INITIAL_WINDOW_SIZE.to_be_bytes());
+        setting[2..6].copy_from_slice(&65536u32.to_be_bytes());
+        let n = raw_frame(FRAME_SETTINGS, 0, 0, &setting, &mut buf);
+        let res = server.feed_data(&mut sio.as_io(), &buf[..n]);
+
+        assert_eq!(
+            res,
+            Err(Error::Http2(crate::error::H2Error::FlowControlError)),
+            "SETTINGS-induced stream window overflow must be FLOW_CONTROL_ERROR"
+        );
+    }
+
+    #[test]
+    fn stream_recv_flow_control_enforced() {
+        // RFC 9113 §6.9.1: exceeding the stream-level receive window is a
+        // FLOW_CONTROL_ERROR. Raise the connection window first so the stream
+        // limit is the one that binds.
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<65536>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<65536>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+
+        fn raw_frame(ty: u8, flags: u8, stream_id: u32, payload: &[u8], out: &mut [u8]) -> usize {
+            let n = payload.len();
+            out[0] = (n >> 16) as u8;
+            out[1] = (n >> 8) as u8;
+            out[2] = n as u8;
+            out[3] = ty;
+            out[4] = flags;
+            out[5..9].copy_from_slice(&stream_id.to_be_bytes());
+            out[9..9 + n].copy_from_slice(payload);
+            9 + n
+        }
+
+        let mut buf = [0u8; 20_000];
+
+        // Open stream 1.
+        let n = raw_frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, &[], &mut buf);
+        server.feed_data(&mut sio.as_io(), &buf[..n]).unwrap();
+
+        // Lift the connection-level *receive* window well above the stream
+        // window so the per-stream limit is the one that binds.
+        server.conn_recv_fc.replenish(2_000_000).unwrap();
+
+        // Send DATA past the 65535 stream window in 16384-byte frames.
+        let payload = [0u8; 16384];
+        let mut result = Ok(());
+        for _ in 0..5 {
+            let n = raw_frame(FRAME_DATA, 0, 1, &payload, &mut buf);
+            result = server.feed_data(&mut sio.as_io(), &buf[..n]);
+            if result.is_err() {
+                break;
+            }
+        }
+        assert_eq!(
+            result,
+            Err(Error::Http2(crate::error::H2Error::FlowControlError)),
+            "exceeding the stream receive window must be FLOW_CONTROL_ERROR"
+        );
+    }
+
+    #[test]
+    fn server_rejects_even_stream_id_headers() {
+        // RFC 9113 §5.1.1: a server must not accept a new stream on an
+        // even (server-initiated) stream ID from the client.
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<8192>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<8192>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+
+        let mut buf = [0u8; 32];
+        // HEADERS on stream 2 (even) -> illegal for a client to open.
+        let payload_len = 0usize;
+        buf[0] = 0;
+        buf[1] = 0;
+        buf[2] = payload_len as u8;
+        buf[3] = FRAME_HEADERS;
+        buf[4] = FLAG_END_HEADERS;
+        buf[5..9].copy_from_slice(&2u32.to_be_bytes());
+        let res = server.feed_data(&mut sio.as_io(), &buf[..9 + payload_len]);
+        assert_eq!(
+            res,
+            Err(Error::Http2(crate::error::H2Error::ProtocolError)),
+            "HEADERS on an even stream id must be a PROTOCOL_ERROR for a server"
         );
     }
 
