@@ -39,6 +39,12 @@ pub fn parse_long_header(buf: &[u8]) -> Result<(PacketHeader<'_>, usize), Error>
     let dcid = &buf[pos..pos + dcid_len];
     pos += dcid_len;
 
+    // Need one more byte for the SCID length. The DCID check above only
+    // guarantees `pos <= buf.len()`, so a packet whose DCID fills the datagram
+    // exactly would otherwise index out of bounds (remote panic / DoS).
+    if pos >= buf.len() {
+        return Err(Error::BufferTooSmall { needed: pos + 1 });
+    }
     let scid_len = buf[pos] as usize;
     pos += 1;
     if pos + scid_len > buf.len() {
@@ -113,6 +119,12 @@ pub fn parse_initial_header(buf: &[u8]) -> Result<(InitialHeader<'_>, usize), Er
     let dcid = &buf[pos..pos + dcid_len];
     pos += dcid_len;
 
+    // Need one more byte for the SCID length. The DCID check above only
+    // guarantees `pos <= buf.len()`, so a packet whose DCID fills the datagram
+    // exactly would otherwise index out of bounds (remote panic / DoS).
+    if pos >= buf.len() {
+        return Err(Error::BufferTooSmall { needed: pos + 1 });
+    }
     let scid_len = buf[pos] as usize;
     pos += 1;
     if pos + scid_len > buf.len() {
@@ -179,6 +191,12 @@ pub fn parse_handshake_header(buf: &[u8]) -> Result<(HandshakeHeader<'_>, usize)
     let dcid = &buf[pos..pos + dcid_len];
     pos += dcid_len;
 
+    // Need one more byte for the SCID length. The DCID check above only
+    // guarantees `pos <= buf.len()`, so a packet whose DCID fills the datagram
+    // exactly would otherwise index out of bounds (remote panic / DoS).
+    if pos >= buf.len() {
+        return Err(Error::BufferTooSmall { needed: pos + 1 });
+    }
     let scid_len = buf[pos] as usize;
     pos += 1;
     if pos + scid_len > buf.len() {
