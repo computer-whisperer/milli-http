@@ -101,10 +101,24 @@ pub fn parse_header_line(buf: &[u8]) -> Result<(&[u8], &[u8], usize), Error> {
     if name.is_empty() {
         return Err(Error::InvalidState);
     }
+    // RFC 9112 §5.1: no whitespace is allowed between the field name and the
+    // colon. Field names are tokens and never contain SP/HTAB; accepting
+    // "Name : value" creates a request-smuggling differential with intermediaries
+    // that trim it.
+    if name.iter().any(|&b| b == b' ' || b == b'\t') {
+        return Err(Error::InvalidState);
+    }
 
     // Skip optional whitespace after colon
     let value_start = colon + 1;
     let value = trim_ows(&line[value_start..]);
+
+    // RFC 9110 §5.5: field values must not contain control characters other
+    // than HTAB — in particular bare CR/LF/NUL, which enable header injection
+    // and response splitting when the parsed value is forwarded.
+    if value.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f) {
+        return Err(Error::InvalidState);
+    }
 
     Ok((name, value, line_end + 2))
 }
@@ -203,6 +217,30 @@ mod tests {
     fn find_end_of_headers_basic() {
         let buf = b"Host: example.com\r\n\r\n";
         assert_eq!(find_end_of_headers(buf), Some(21));
+    }
+
+    #[test]
+    fn header_line_accepts_normal() {
+        let (name, value, _) = parse_header_line(b"Host: example.com\r\n").unwrap();
+        assert_eq!(name, b"Host");
+        assert_eq!(value, b"example.com");
+    }
+
+    #[test]
+    fn header_line_rejects_whitespace_before_colon() {
+        // RFC 9112 §5.1 request-smuggling differential.
+        assert!(parse_header_line(b"Content-Length : 5\r\n").is_err());
+        assert!(parse_header_line(b"Content-Length\t: 5\r\n").is_err());
+    }
+
+    #[test]
+    fn header_line_rejects_control_chars_in_value() {
+        // RFC 9110 §5.5: bare CR / LF / NUL in a value -> header injection.
+        assert!(parse_header_line(b"X: a\rb\r\n").is_err()); // bare CR
+        assert!(parse_header_line(b"X: a\nb\r\n").is_err()); // bare LF
+        assert!(parse_header_line(b"X: a\x00b\r\n").is_err()); // NUL
+        // HTAB inside a value remains allowed.
+        assert!(parse_header_line(b"X: a\tb\r\n").is_ok());
     }
 
     #[test]
