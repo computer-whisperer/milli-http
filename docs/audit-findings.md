@@ -88,29 +88,48 @@ Branch for the 2026-05-29 fixes: `fix/critical-audit-findings` (unmerged).
   SubjectPublicKeyInfo. A crafted cert can steer extraction. Exploitability is
   gated by the pinning model above. Files: `crypto/ecdsa_p256.rs`, `crypto/ed25519.rs`.
 
+- [x] **FIXED (`63128fe`) — OOB panic parsing long-header packets.** `parse_long_header`/
+  `parse_initial_header`/`parse_handshake_header` read the SCID-length byte after the
+  DCID, but the DCID check only guaranteed `pos <= buf.len()`, so a packet whose DCID
+  filled the datagram exactly (e.g. a 6-byte packet, `dcid_len = 0`) indexed out of
+  bounds — a remote DoS. Added the missing guard. Found by the new
+  `tests/decoder_robustness.rs` harness (400k random/structured inputs across every
+  decoder); **refutes the sweep's "no packet-parsing panic" claim.** File: `packet/long_header.rs`.
+
+- [x] **FIXED (`b1159fb`) — H2 `send_window += delta` overflow.** Unchecked `+=` on an
+  INITIAL_WINDOW_SIZE change → debug panic / release wrap; now `checked_add` →
+  FLOW_CONTROL_ERROR (RFC 9113 §6.9.2). Test: `settings_initial_window_overflow_is_flow_control_error`.
+
+- [x] **FIXED (`b1159fb`) — H2 per-stream receive flow control unenforced** (recv_window
+  driven silently negative); now FLOW_CONTROL_ERROR (§6.9.1). Also fixed connection-level
+  `FlowController::consume` returning `InvalidState` instead of FLOW_CONTROL_ERROR.
+  Test: `stream_recv_flow_control_enforced`.
+
+- [x] **FIXED (`b1159fb`) — H2 stream-ID parity not validated** (server accepted new even
+  streams); now PROTOCOL_ERROR for a new stream in the wrong ID space (§5.1.1). Monotonicity
+  (reopening a lower closed ID) is still **OPEN**. Test: `server_rejects_even_stream_id_headers`.
+
+- [x] **FIXED (`7067f8c`) — RecvPnTracker eviction re-opened replays.** Now tracks a floor so
+  evicted packet numbers stay rejected (§12.3). Test: `evicted_packet_numbers_still_rejected_as_replays`.
+
+- [x] **FIXED (`dffe989`) — HTTP/1.1 header-name whitespace + CTLs in values.** Rejects SP/HTAB
+  before the colon (§5.1) and control chars other than HTAB in values incl. bare CR/LF
+  (§5.5). Tests in `http1/parse.rs`.
+
 - [ ] **OPEN (reported) — key-update "confirmed" set on any current-phase packet**
   rather than on an ACK of a packet sent in the new phase (RFC 9001 §6.1); can
   desync 1-RTT keys under reordering / a malicious peer. File: `connection/recv.rs:538`.
 
-- [ ] **OPEN (reported) — RecvPnTracker evicts its lowest range when full** (cap 32),
-  re-enabling replay of old packet numbers (RFC 9000 §12.3). File: `connection/mod.rs:270`.
-
 - [ ] **OPEN (reported) — ACK ranges parsed into a cap-16 Vec with silent `push` drop**,
   causing spurious retransmits when a peer sends many ranges. File: `connection/recv.rs:688`.
-
-- [ ] **OPEN (reported) — H2 `send_window += delta` unchecked** on SETTINGS_INITIAL_WINDOW_SIZE
-  change → debug panic / release wrap (RFC 9113 §6.9.2 FLOW_CONTROL_ERROR). File: `h2/connection.rs:784`.
 
 - [ ] **OPEN (reported) — H2 no MAX_CONCURRENT_STREAMS enforcement**; at-capacity streams
   silently dropped instead of RST_STREAM(REFUSED_STREAM)/GOAWAY. File: `h2/connection.rs`.
 
 - [ ] **OPEN (reported) — H2 no Rapid Reset mitigation** (CVE-2023-44487). File: `h2/connection.rs`.
 
-- [ ] **OPEN (reported) — H2 per-stream receive flow control not enforced** (only
-  connection-level). File: `h2/connection.rs:686`.
-
-- [ ] **OPEN (reported) — H2 no inbound stream-ID parity/monotonicity validation**
-  (RFC 9113 §5.1.1). File: `h2/connection.rs`.
+- [ ] **OPEN (reported) — H2 stream-ID monotonicity not validated** (reopening a lower
+  closed/idle ID; parity is now enforced). File: `h2/connection.rs`.
 
 - [ ] **OPEN (reported) — TLS: QUIC transport-parameters extension not required**
   (RFC 9001 §8.2 mandates TRANSPORT_PARAMETER_ERROR if absent). File: `tls/handshake.rs:474`.
@@ -119,10 +138,6 @@ Branch for the 2026-05-29 fixes: `fix/critical-audit-findings` (unmerged).
   legacy_version/compression unvalidated. File: `tls/handshake.rs`, `tls/messages.rs`.
 
 - [ ] **OPEN (reported) — TLS: duplicate extensions silently overwrite** (RFC 8446 §4.2). File: `tls/extensions.rs`.
-
-- [ ] **OPEN (reported) — HTTP/1.1 request smuggling vectors:** whitespace between
-  header-name and colon not rejected; bare CR/LF in header values not rejected
-  (RFC 9112 §5.1 / RFC 9110 §5.5). File: `http1/connection.rs`, `http1/parse.rs`.
 
 - [ ] **OPEN (reported) — incoming TLS record length not validated vs `MAX_RECORD_PAYLOAD`**
   (defined but unused; RFC 8446 §5.2 record_overflow). File: `tcp_tls/connection.rs`.
