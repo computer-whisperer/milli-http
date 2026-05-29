@@ -197,6 +197,11 @@ pub struct RecvPnTracker {
     pub ranges: heapless::Vec<(u64, u64), 32>,
     #[cfg(feature = "alloc")]
     pub ranges: alloc::vec::Vec<(u64, u64)>,
+    /// Highest packet number evicted from `ranges` once the tracker filled.
+    /// Everything at or below this is treated as already received, so a replay
+    /// of an old packet number whose range was dropped is still rejected
+    /// (RFC 9000 §12.3) rather than re-processed as new.
+    floor: Option<u64>,
 }
 
 impl Default for RecvPnTracker {
@@ -212,6 +217,7 @@ impl RecvPnTracker {
             ranges: heapless::Vec::new(),
             #[cfg(feature = "alloc")]
             ranges: alloc::vec::Vec::new(),
+            floor: None,
         }
     }
 
@@ -222,6 +228,13 @@ impl RecvPnTracker {
 
     /// Record reception of packet number `pn`.
     pub fn record(&mut self, pn: u64) {
+        // Packets at or below the floor were evicted from the window and are
+        // treated as already received; do not re-insert them.
+        if let Some(f) = self.floor
+            && pn <= f
+        {
+            return;
+        }
         // Find which range to extend / insert at.
         // Ranges are sorted ascending by start.
 
@@ -269,21 +282,30 @@ impl RecvPnTracker {
                 // New standalone range.
                 #[cfg(not(feature = "alloc"))]
                 if self.ranges.is_full() {
-                    // Drop the lowest (oldest) range.
-                    self.ranges.remove(0);
+                    // Drop the lowest (oldest) range and raise the floor so its
+                    // packet numbers remain rejected as replays.
+                    let dropped = self.ranges.remove(0);
+                    self.floor = Some(self.floor.map_or(dropped.1, |f| f.max(dropped.1)));
                 }
                 #[cfg(feature = "alloc")]
                 if self.ranges.len() >= 32 {
                     // Drop the lowest (oldest) range to match no-alloc cap.
-                    self.ranges.remove(0);
+                    let dropped = self.ranges.remove(0);
+                    self.floor = Some(self.floor.map_or(dropped.1, |f| f.max(dropped.1)));
                 }
                 self.insert_range(pn, pn);
             }
         }
     }
 
-    /// Returns `true` if `pn` has already been recorded.
+    /// Returns `true` if `pn` has already been recorded (or is at/below the
+    /// evicted floor and so must be treated as a replay).
     pub fn contains(&self, pn: u64) -> bool {
+        if let Some(f) = self.floor
+            && pn <= f
+        {
+            return true;
+        }
         self.ranges
             .iter()
             .any(|&(start, end)| pn >= start && pn <= end)
@@ -2430,6 +2452,29 @@ mod tests {
             assert_eq!(t.ranges.len(), 32);
             assert_eq!(t.ranges[0], (100, 100));
             assert_eq!(t.ranges[31], (5000, 5000));
+        }
+
+        #[test]
+        fn evicted_packet_numbers_still_rejected_as_replays() {
+            // RFC 9000 §12.3: dropping the lowest tracked range when the window
+            // fills must not re-open old packet numbers to replay. A replayed
+            // packet whose range was evicted must still be reported as seen.
+            let mut t = RecvPnTracker::new();
+            for i in 0..32 {
+                t.record(i * 100);
+            }
+            assert!(t.contains(0));
+            // Overflow the window, evicting the lowest range (0, 0).
+            t.record(5000);
+            assert!(
+                t.contains(0),
+                "an evicted packet number must still be treated as already received"
+            );
+            // Recording it again must not resurrect it as a new range.
+            let len_before = t.ranges.len();
+            t.record(0);
+            assert_eq!(t.ranges.len(), len_before);
+            assert!(!t.ranges.iter().any(|&(s, _)| s == 0));
         }
 
         #[test]
