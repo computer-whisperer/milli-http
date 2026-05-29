@@ -195,6 +195,10 @@ where
     /// Called by the connection manager when a new connection fails after
     /// `Connection::server()` claimed a slot (e.g. malformed initial datagram).
     /// Without this, the slot leaks since `Connection` has no `Drop` impl.
+    ///
+    /// The only caller is the `server`-feature connection manager, so this reads
+    /// as dead code when `H3Server` is built without it.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn release_handshake_slot<const CRYPTO_BUF: usize>(
         &mut self,
         pool: &mut dyn HandshakePoolAccess<C, CRYPTO_BUF>,
