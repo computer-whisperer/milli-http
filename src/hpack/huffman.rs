@@ -836,22 +836,90 @@ static HUFF_TABLE: [HuffSym; 257] = [
 ];
 
 // ---------------------------------------------------------------------------
-// Decoder -- bit-by-bit tree walk
+// Decoder -- canonical Huffman decode
 // ---------------------------------------------------------------------------
+//
+// RFC 7541's Huffman code is canonical: within each code length the codes are
+// consecutive integers, and the first code of each length follows the standard
+// `code = (code + count) << 1` recurrence (verified by a debug_assert in the
+// test module). That lets us decode each symbol with a bounded bit-walk
+// (<= 30 iterations) instead of scanning all 257 entries per candidate length.
+//
+// Two compact tables, both built from `HUFF_TABLE` at compile time so they
+// stay in sync automatically:
+//   * `LEN_COUNT[len]` — number of codes of each length (31 bytes).
+//   * `SYMBOLS`        — symbols ordered by (length, code); decode lands a
+//                        symbol at a computed offset into this array (514 bytes).
 
-/// Decode state for walking the Huffman tree bit by bit.
-///
-/// The tree is implicit: we keep a 32-bit accumulator of the bits seen so far
-/// and the count.  When we have accumulated enough bits to match a symbol we
-/// emit it.  This is done by checking the accumulator against the table after
-/// each bit.  For efficiency we use a precomputed decode table that maps
-/// (accumulated_bits, bit_length) to a symbol.
-///
-/// A fully precomputed multi-level table would be faster but significantly
-/// larger.  The approach here uses a compact 256-entry lookup for short codes
-/// (5-8 bits) and falls back to linear scan for longer codes.  This is fine
-/// for an embedded/no_std context.
-///
+/// Number of codes of each bit-length (index 0 and unused lengths are 0).
+const LEN_COUNT: [u8; 31] = {
+    let mut count = [0u8; 31];
+    let mut s = 0;
+    while s < HUFF_TABLE.len() {
+        count[HUFF_TABLE[s].len as usize] += 1;
+        s += 1;
+    }
+    count
+};
+
+/// Symbols ordered by (code length, code value) — the canonical decode order.
+const SYMBOLS: [u16; 257] = {
+    let mut out = [0u16; 257];
+    let mut idx = 0;
+    let mut len = 1usize;
+    let mut code: u32 = 0;
+    while len <= 30 {
+        let count = LEN_COUNT[len] as u32;
+        // Emit the symbols of this length in code order (codes are the
+        // consecutive range [code, code + count)).
+        let mut c = 0;
+        while c < count {
+            let target = code + c;
+            let mut s = 0;
+            while s < HUFF_TABLE.len() {
+                if HUFF_TABLE[s].len as usize == len && HUFF_TABLE[s].bits == target {
+                    out[idx] = s as u16;
+                    idx += 1;
+                    break;
+                }
+                s += 1;
+            }
+            c += 1;
+        }
+        code = (code + count) << 1;
+        len += 1;
+    }
+    out
+};
+
+/// Decode one symbol from the high bits of `acc` (which holds `acc_len` valid
+/// bits, MSB-first). Returns `(symbol, bits_consumed)`, or `None` when the
+/// available bits do not (yet) complete a code.
+#[inline]
+fn decode_one(acc: u64, acc_len: u8) -> Option<(u16, u8)> {
+    // Standard canonical decode: walk bits MSB-first, tracking the first code
+    // and symbol-index of the current length, until `code` falls within the
+    // current length's contiguous code range.
+    let mut code: u32 = 0;
+    let mut first: u32 = 0;
+    let mut index: u32 = 0;
+    let mut len: u8 = 0;
+    // A valid code is at most 30 bits; never read past that or past `acc_len`.
+    let max = if acc_len < 30 { acc_len } else { 30 };
+    while len < max {
+        let bit = ((acc >> (acc_len - 1 - len)) & 1) as u32;
+        len += 1;
+        code = (code << 1) | bit;
+        let count = LEN_COUNT[len as usize] as u32;
+        if code.wrapping_sub(first) < count {
+            return Some((SYMBOLS[(index + (code - first)) as usize], len));
+        }
+        index += count;
+        first = (first + count) << 1;
+    }
+    None
+}
+
 /// Decode a Huffman-encoded byte string.
 ///
 /// Reads Huffman-coded bits from `src`, writes decoded bytes into `buf`.
@@ -868,35 +936,22 @@ pub fn decode(src: &[u8], buf: &mut [u8]) -> Result<usize, Error> {
     }
 
     let mut out_pos = 0;
-    // Accumulator: holds bits read so far for the current symbol.
-    // We shift bits in from the MSB side.
-    let mut acc: u32 = 0;
+    // Accumulator: holds bits read so far, shifted in from the MSB side.
+    // u64 so it never overflows: between emits `acc_len` stays < 30, plus 8.
+    let mut acc: u64 = 0;
     let mut acc_len: u8 = 0;
 
     for &byte in src {
-        // Process 8 bits, MSB first
-        acc = (acc << 8) | u32::from(byte);
+        acc = (acc << 8) | u64::from(byte);
         acc_len += 8;
 
-        // Try to decode as many symbols as possible from the accumulator
+        // Emit as many complete symbols as the accumulator allows.
+        // The shortest code is 5 bits, so stop trying below that.
         while acc_len >= 5 {
-            // The shortest code in the Huffman table is 5 bits.
-            // Try to find a match starting from the shortest code length.
-            let mut matched = false;
-
-            // We need to check codes from length 5 up to acc_len.
-            // The bits to match are the top `code_len` bits of `acc`.
-            let max_check = if acc_len > 30 { 30 } else { acc_len };
-
-            for code_len in 5..=max_check {
-                // Extract the top `code_len` bits from the accumulator.
-                let candidate = acc >> (acc_len - code_len);
-
-                // Look up in the table.  We check byte values 0..=255 only
-                // (EOS is index 256 and must not appear in the stream).
-                if let Some(sym) = lookup_decode(candidate, code_len) {
+            match decode_one(acc, acc_len) {
+                Some((sym, used)) => {
                     if sym == 256 {
-                        // EOS in stream is an error
+                        // EOS must not appear in the stream (RFC 7541 §5.2).
                         return Err(Error::Http3(
                             crate::error::H3Error::QpackDecompressionFailed,
                         ));
@@ -908,64 +963,35 @@ pub fn decode(src: &[u8], buf: &mut [u8]) -> Result<usize, Error> {
                     }
                     buf[out_pos] = sym as u8;
                     out_pos += 1;
-                    acc_len -= code_len;
-                    // Mask out the consumed bits
-                    acc &= (1u32 << acc_len) - 1;
-                    matched = true;
+                    acc_len -= used;
+                    acc &= (1u64 << acc_len) - 1;
+                }
+                None => {
+                    // 30 accumulated bits that decode to nothing is invalid;
+                    // otherwise we simply need more input.
+                    if acc_len >= 30 {
+                        return Err(Error::Http3(
+                            crate::error::H3Error::QpackDecompressionFailed,
+                        ));
+                    }
                     break;
                 }
-            }
-
-            if !matched {
-                // We couldn't decode a symbol.  If we have 30 bits accumulated
-                // and still no match, the input is invalid.
-                if acc_len >= 30 {
-                    return Err(Error::Http3(
-                        crate::error::H3Error::QpackDecompressionFailed,
-                    ));
-                }
-                // Need more bits -- break out and read the next input byte.
-                break;
             }
         }
     }
 
     // Validate padding: remaining bits must all be 1s and at most 7 bits.
     if acc_len > 7 {
-        return Err(Error::Http3(
-            crate::error::H3Error::QpackDecompressionFailed,
-        ));
+        return Err(Error::Http3(crate::error::H3Error::QpackDecompressionFailed));
     }
     if acc_len > 0 {
-        // Check that all remaining bits are 1
-        let mask = (1u32 << acc_len) - 1;
+        let mask = (1u64 << acc_len) - 1;
         if acc & mask != mask {
-            return Err(Error::Http3(
-                crate::error::H3Error::QpackDecompressionFailed,
-            ));
+            return Err(Error::Http3(crate::error::H3Error::QpackDecompressionFailed));
         }
     }
 
     Ok(out_pos)
-}
-
-/// Look up a candidate code in the Huffman table.
-///
-/// Returns `Some(symbol)` (0..=256) if `(bits, len)` matches a table entry.
-/// Returns `None` otherwise.
-fn lookup_decode(bits: u32, len: u8) -> Option<u16> {
-    // For efficiency, we can use the length to narrow the search.
-    // Codes are unique by (bits, len) pair.
-    //
-    // We do a linear scan.  With 257 entries and max 30-bit codes this is
-    // fast enough for header decoding in an embedded context.  A smarter
-    // approach would group entries by length, but this keeps the code simple.
-    for (sym, entry) in HUFF_TABLE.iter().enumerate() {
-        if entry.len == len && entry.bits == bits {
-            return Some(sym as u16);
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,6 +1072,61 @@ pub fn encoded_len(src: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guard: the canonical decode tables assume RFC 7541's code is canonical
+    /// (consecutive codes per length, standard first-code recurrence). If
+    /// `HUFF_TABLE` is ever edited into a non-canonical shape, this fails before
+    /// the silently-wrong `SYMBOLS` table can ship.
+    #[test]
+    fn huff_table_is_canonical() {
+        let mut code = 0u32;
+        for len in 1..=30usize {
+            let count = LEN_COUNT[len] as u32;
+            // Every code of this length must exist in the contiguous range
+            // [code, code + count) and nowhere else.
+            for c in 0..count {
+                let target = code + c;
+                let found = HUFF_TABLE
+                    .iter()
+                    .any(|e| e.len as usize == len && e.bits == target);
+                assert!(found, "missing canonical code len={len} value={target:#x}");
+            }
+            code = (code + count) << 1;
+        }
+        assert_eq!(LEN_COUNT.iter().map(|&c| c as usize).sum::<usize>(), 257);
+    }
+
+    /// Every byte value must survive an encode -> decode round-trip. This
+    /// exercises every entry in `SYMBOLS`, catching any decode-table error.
+    #[test]
+    fn roundtrip_every_byte() {
+        for b in 0u16..=255 {
+            let input = [b as u8];
+            let mut enc = [0u8; 8];
+            let n = encode(&input, &mut enc).unwrap();
+            let mut dec = [0u8; 8];
+            let m = decode(&enc[..n], &mut dec).unwrap();
+            assert_eq!(&dec[..m], &input, "byte {b:#x} failed round-trip");
+        }
+    }
+
+    /// Many-byte round-trips over pseudo-random data.
+    #[test]
+    fn roundtrip_random_strings() {
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (state >> 16) as u8
+        };
+        for len in 0..200usize {
+            let input: Vec<u8> = (0..len).map(|_| next()).collect();
+            let mut enc = vec![0u8; len * 4 + 8];
+            let n = encode(&input, &mut enc).unwrap();
+            let mut dec = vec![0u8; len + 8];
+            let m = decode(&enc[..n], &mut dec).unwrap();
+            assert_eq!(&dec[..m], &input[..], "len {len} failed round-trip");
+        }
+    }
 
     // -----------------------------------------------------------------------
     // 1. Basic encode and decode round-trip
