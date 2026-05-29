@@ -925,19 +925,16 @@ where
                 break;
             }
 
-            // Copy the complete message to a stack buffer (to release the
-            // borrow on crypto_reasm before calling into TLS).
-            let mut tmp = [0u8; 2048];
-            if msg_len > tmp.len() {
-                return Err(Error::Tls);
-            }
-            tmp[..msg_len].copy_from_slice(&ctx.crypto_reasm[idx].contiguous_data()[..msg_len]);
+            // Feed the complete message straight from the reassembly buffer.
+            // `tls` and `crypto_reasm` are disjoint fields of the same context,
+            // so the input slice and the TLS engine can be borrowed at once —
+            // no intermediate stack copy. This also lifts the old 2 KiB message
+            // cap: messages up to CRYPTO_BUF (e.g. a larger Certificate) work.
+            ctx.tls
+                .read_handshake(level, &ctx.crypto_reasm[idx].contiguous_data()[..msg_len])?;
 
             // Advance the reassembly buffer past this message.
             ctx.crypto_reasm[idx].advance(msg_len);
-
-            // Feed to the TLS engine.
-            ctx.tls.read_handshake(level, &tmp[..msg_len])?;
 
             // Check for newly derived keys after each TLS message.
             self.check_tls_keys(pool)?;
