@@ -203,8 +203,10 @@ mod tests {
         assert_eq!(tracker.count(), 7);
 
         // Remaining must be exactly {0,1,2,3,4,8,9}.
-        let mut remaining: heapless::Vec<u64, 32> =
-            tracker.sent_below_pn(Level::Application, u64::MAX).map(|p| p.pn).collect();
+        let mut remaining: heapless::Vec<u64, 32> = tracker
+            .sent_below_pn(Level::Application, u64::MAX)
+            .map(|p| p.pn)
+            .collect();
         remaining.sort_unstable();
         assert_eq!(remaining.as_slice(), &[0, 1, 2, 3, 4, 8, 9]);
 

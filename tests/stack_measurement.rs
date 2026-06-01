@@ -615,7 +615,10 @@ fn measure_stack_high_water() {
                 let _ = sid;
                 let mut buf = [0u8; 4096];
                 let mut packet: Vec<u8> = Vec::new();
-                if let Some(tx) = pair.client.poll_transmit(&mut buf, pair.now, &mut *pair.pool) {
+                if let Some(tx) = pair
+                    .client
+                    .poll_transmit(&mut buf, pair.now, &mut *pair.pool)
+                {
                     packet = tx.data.to_vec();
                 }
                 (pair, packet)
@@ -649,7 +652,12 @@ fn measure_stack_high_water() {
     rows.push((
         "HTTPS/1.1 handshake + request",
         measure_stack(
-            || (Box::new(make_https1_client()), Box::new(make_https1_server())),
+            || {
+                (
+                    Box::new(make_https1_client()),
+                    Box::new(make_https1_server()),
+                )
+            },
             |(client, server)| {
                 https1_exchange(client, server);
                 while client.poll_event().is_some() {}
@@ -699,15 +707,9 @@ fn measure_stack_high_water() {
         ),
     ));
 
-    println!(
-        "  {:<42} {:>10}  {:>12}",
-        "scenario", "raw", "above noop"
-    );
+    println!("  {:<42} {:>10}  {:>12}", "scenario", "raw", "above noop");
     println!("  {:-<42} {:->10}  {:->12}", "", "", "");
-    println!(
-        "  {:<42} {:>7} B  {:>10}",
-        "baseline (noop)", baseline, "-"
-    );
+    println!("  {:<42} {:>7} B  {:>10}", "baseline (noop)", baseline, "-");
     for (name, used) in &rows {
         let above = used.saturating_sub(baseline);
         println!(

@@ -982,12 +982,16 @@ pub fn decode(src: &[u8], buf: &mut [u8]) -> Result<usize, Error> {
 
     // Validate padding: remaining bits must all be 1s and at most 7 bits.
     if acc_len > 7 {
-        return Err(Error::Http3(crate::error::H3Error::QpackDecompressionFailed));
+        return Err(Error::Http3(
+            crate::error::H3Error::QpackDecompressionFailed,
+        ));
     }
     if acc_len > 0 {
         let mask = (1u64 << acc_len) - 1;
         if acc & mask != mask {
-            return Err(Error::Http3(crate::error::H3Error::QpackDecompressionFailed));
+            return Err(Error::Http3(
+                crate::error::H3Error::QpackDecompressionFailed,
+            ));
         }
     }
 
