@@ -18,7 +18,7 @@ std = []
 rustcrypto-chacha = ["dep:chacha20poly1305", "dep:chacha20", "dep:aes-gcm", "dep:aes", "dep:hkdf", "dep:hmac"]
 rustcrypto-aes = ["dep:aes-gcm", "dep:aes", "dep:hkdf", "dep:hmac"]
 discovery = []
-server = ["alloc", "tcp-tls", "http", "h2", "http1", "h3"]
+server = ["alloc", "tcp-tls", "http"]
 
 [dependencies]
 heapless = "0.8"

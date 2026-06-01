@@ -9,17 +9,22 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
+#[cfg(feature = "h3")]
 use crate::connection::{Connection, ConnectionId, HandshakePoolAccess};
 use crate::crypto::CryptoProvider;
 use crate::error::Error;
+#[cfg(feature = "h3")]
 use crate::h3::server::H3Server;
 use crate::http::server_conn::{HttpEvent, HttpServerConn};
+#[cfg(feature = "h3")]
 use crate::packet::decode_dcid::decode_dcid;
 use crate::tcp_tls::TlsParts;
 use crate::tls::handshake::ServerTlsConfig;
+#[cfg(feature = "h3")]
 use crate::tls::transport_params::TransportParams;
 use crate::transport::{Address, Rng};
 
+#[cfg(feature = "h3")]
 pub mod runner;
 
 // ---------------------------------------------------------------------------
@@ -40,6 +45,7 @@ pub enum ConnProtocol {
     /// HTTP/2 over TLS.
     H2,
     /// HTTP/3 over QUIC.
+    #[cfg(feature = "h3")]
     H3,
 }
 
@@ -85,6 +91,7 @@ struct TcpConn<C: CryptoProvider, const BUF: usize> {
 // QUIC/H3 connection state
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "h3")]
 struct QuicConn<
     C: CryptoProvider,
     A: Address,
@@ -120,6 +127,7 @@ pub struct ServerConfig {
     /// Maximum number of TCP connections.
     pub max_tcp_conns: usize,
     /// Maximum number of QUIC connections.
+    #[cfg(feature = "h3")]
     pub max_quic_conns: usize,
     /// Maximum number of queued events.
     pub max_events: usize,
@@ -131,6 +139,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             max_tcp_conns: 4,
+            #[cfg(feature = "h3")]
             max_quic_conns: 8,
             max_events: 32,
             handshake_timeout_us: 10_000_000,
@@ -169,6 +178,7 @@ pub struct ServerManager<
     config: ServerConfig,
 
     tcp_conns: Vec<TcpConn<C, BUF>>,
+    #[cfg(feature = "h3")]
     quic_conns: Vec<
         QuicConn<
             C,
@@ -185,6 +195,7 @@ pub struct ServerManager<
 
     events: VecDeque<ServerEvent>,
     next_id: u32,
+    _marker: core::marker::PhantomData<A>,
 }
 
 impl<
@@ -223,9 +234,11 @@ where
             provider,
             config,
             tcp_conns: Vec::new(),
+            #[cfg(feature = "h3")]
             quic_conns: Vec::new(),
             events: VecDeque::new(),
             next_id: 0,
+            _marker: core::marker::PhantomData,
         }
     }
 
@@ -316,16 +329,23 @@ where
 
                 let alpn = parts.alpn();
                 let (protocol, http_conn): (ConnProtocol, Box<dyn HttpServerConn>) = match alpn {
+                    #[cfg(feature = "h2")]
                     Some(b"h2") => (
                         ConnProtocol::H2,
                         Box::new(crate::h2_tls::H2TlsServer::<C, BUF>::from_parts(parts)),
                     ),
-                    Some(b"http/1.1") | None => (
+                    #[cfg(feature = "http1")]
+                    Some(b"http/1.1") => (
                         ConnProtocol::Http1,
                         Box::new(crate::https1::Https1Server::<C, BUF>::from_parts(parts)),
                     ),
-                    Some(_) => {
-                        // Unknown ALPN — reject the connection.
+                    #[cfg(feature = "http1")]
+                    None => (
+                        ConnProtocol::Http1,
+                        Box::new(crate::https1::Https1Server::<C, BUF>::from_parts(parts)),
+                    ),
+                    _ => {
+                        // Unknown/unsupported ALPN — reject the connection.
                         let conn_id = conn.id;
                         conn.state = TcpState::Closed;
                         self.push_server_event(ServerEvent::Closed(conn_id));
@@ -373,6 +393,7 @@ where
     // -----------------------------------------------------------------------
 
     /// Feed a UDP datagram. Routes by DCID to existing connections or creates new ones.
+    #[cfg(feature = "h3")]
     pub fn udp_feed<const CRYPTO_BUF: usize>(
         &mut self,
         data: &[u8],
@@ -445,6 +466,7 @@ where
     /// Pull the next outgoing UDP datagram.
     ///
     /// Call repeatedly until `None` to drain all pending transmits.
+    #[cfg(feature = "h3")]
     pub fn udp_poll_transmit<'a, const CRYPTO_BUF: usize>(
         &'a mut self,
         buf: &'a mut [u8],
@@ -494,19 +516,22 @@ where
         }
 
         // Poll QUIC connections
-        let mut quic_event = None;
-        for qconn in &mut self.quic_conns {
-            if let Some(ev) = qconn.server.poll_event(scratch) {
-                let http_ev = crate::h3::server::map_h3_event(ev);
-                quic_event = Some(ServerEvent::Http {
-                    conn: qconn.id,
-                    event: http_ev,
-                });
-                break;
+        #[cfg(feature = "h3")]
+        {
+            let mut quic_event = None;
+            for qconn in &mut self.quic_conns {
+                if let Some(ev) = qconn.server.poll_event(scratch) {
+                    let http_ev = crate::h3::server::map_h3_event(ev);
+                    quic_event = Some(ServerEvent::Http {
+                        conn: qconn.id,
+                        event: http_ev,
+                    });
+                    break;
+                }
             }
-        }
-        if quic_event.is_some() {
-            return quic_event;
+            if quic_event.is_some() {
+                return quic_event;
+            }
         }
 
         // Clean up closed TCP connections
@@ -514,17 +539,20 @@ where
             .retain(|c| !matches!(c.state, TcpState::Closed));
 
         // Clean up closed QUIC connections
-        let mut closed_ids = Vec::new();
-        self.quic_conns.retain(|c| {
-            if c.server.is_closed() {
-                closed_ids.push(c.id);
-                false
-            } else {
-                true
+        #[cfg(feature = "h3")]
+        {
+            let mut closed_ids = Vec::new();
+            self.quic_conns.retain(|c| {
+                if c.server.is_closed() {
+                    closed_ids.push(c.id);
+                    false
+                } else {
+                    true
+                }
+            });
+            for id in closed_ids {
+                self.push_server_event(ServerEvent::Closed(id));
             }
-        });
-        for id in closed_ids {
-            self.push_server_event(ServerEvent::Closed(id));
         }
 
         self.events.pop_front()
@@ -542,6 +570,7 @@ where
                 return http.recv_headers(stream_id, emit);
             }
         }
+        #[cfg(feature = "h3")]
         if let Some(qconn) = self.quic_conns.iter_mut().find(|c| c.id == conn) {
             return qconn.server.recv_headers(stream_id, emit);
         }
@@ -560,6 +589,7 @@ where
                 return http.recv_body(stream_id, buf);
             }
         }
+        #[cfg(feature = "h3")]
         if let Some(qconn) = self.quic_conns.iter_mut().find(|c| c.id == conn) {
             return qconn.server.recv_body(stream_id, buf);
         }
@@ -580,6 +610,7 @@ where
                 return http.send_response(stream_id, status, headers, end_stream);
             }
         }
+        #[cfg(feature = "h3")]
         if let Some(qconn) = self.quic_conns.iter_mut().find(|c| c.id == conn) {
             return qconn
                 .server
@@ -601,6 +632,7 @@ where
                 return http.send_body(stream_id, data, end_stream);
             }
         }
+        #[cfg(feature = "h3")]
         if let Some(qconn) = self.quic_conns.iter_mut().find(|c| c.id == conn) {
             return qconn.server.send_body(stream_id, data, end_stream);
         }
@@ -632,6 +664,7 @@ where
             }
         }
 
+        #[cfg(feature = "h3")]
         for qconn in &self.quic_conns {
             if let Some(t) = qconn.server.next_timeout() {
                 earliest = Some(earliest.map_or(t, |e: u64| e.min(t)));
@@ -667,6 +700,7 @@ where
         for id in timed_out {
             self.push_server_event(ServerEvent::Closed(id));
         }
+        #[cfg(feature = "h3")]
         for qconn in &mut self.quic_conns {
             qconn.server.handle_timeout(now);
         }
@@ -712,6 +746,7 @@ where
             }
             return Ok(());
         }
+        #[cfg(feature = "h3")]
         if let Some(qconn) = self.quic_conns.iter_mut().find(|c| c.id == id) {
             qconn.server.close(0, b"");
             return Ok(());
@@ -724,6 +759,7 @@ where
         if let Some(tcp) = self.tcp_conns.iter().find(|c| c.id == id) {
             return matches!(tcp.state, TcpState::Closed);
         }
+        #[cfg(feature = "h3")]
         if let Some(qconn) = self.quic_conns.iter().find(|c| c.id == id) {
             return qconn.server.is_closed();
         }
@@ -731,6 +767,7 @@ where
     }
 
     /// Number of active QUIC connections.
+    #[cfg(feature = "h3")]
     pub fn quic_conn_count(&self) -> usize {
         self.quic_conns.len()
     }
@@ -747,6 +784,7 @@ where
         if let Some(tcp) = self.tcp_conns.iter().find(|c| c.id == id) {
             return Some(tcp.protocol);
         }
+        #[cfg(feature = "h3")]
         if self.quic_conns.iter().any(|c| c.id == id) {
             return Some(ConnProtocol::H3);
         }
