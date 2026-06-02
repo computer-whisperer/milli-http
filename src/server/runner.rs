@@ -61,7 +61,11 @@ pub struct ServerRunner<
 {
     pub manager:
         ServerManager<C, A, BUF, MAX_STREAMS, SENT_PER_SPACE, MAX_CIDS, STREAM_BUF, SEND_QUEUE>,
-    tcp_listener: &'a mut L,
+    /// TLS listener. Accepted connections go through the TLS handshake.
+    tls_listener: Option<&'a mut L>,
+    /// Cleartext listener. Accepted connections start as plaintext HTTP/1.1.
+    #[cfg_attr(not(feature = "http1"), allow(dead_code))]
+    cleartext_listener: Option<&'a mut L>,
     udp_socket: &'a mut U,
     rng: &'a mut R,
     pool: &'a mut dyn HandshakePoolAccess<C, CRYPTO_BUF>,
@@ -108,6 +112,11 @@ where
     A: Address,
 {
     /// Create a new server runner.
+    ///
+    /// `tls_listener` and `cleartext_listener` are independent and optional:
+    /// pass both for standard dual HTTP/HTTPS (e.g. port 80 cleartext + 443
+    /// TLS), or just one for single-mode operation. Both feed the same manager
+    /// and event stream.
     pub fn new(
         manager: ServerManager<
             C,
@@ -119,14 +128,16 @@ where
             STREAM_BUF,
             SEND_QUEUE,
         >,
-        tcp_listener: &'a mut L,
+        tls_listener: Option<&'a mut L>,
+        cleartext_listener: Option<&'a mut L>,
         udp_socket: &'a mut U,
         rng: &'a mut R,
         pool: &'a mut dyn HandshakePoolAccess<C, CRYPTO_BUF>,
     ) -> Self {
         Self {
             manager,
-            tcp_listener,
+            tls_listener,
+            cleartext_listener,
             udp_socket,
             rng,
             pool,
@@ -156,17 +167,35 @@ where
     pub fn poll_event(&mut self, cx: &mut Context<'_>, now: u64) -> Poll<ServerEvent> {
         let mut has_pending_output = false;
 
-        // 1. Accept new TCP connections (accept at most one per cycle to
-        //    avoid starving existing connections on burst arrivals).
-        if let Poll::Ready(Ok(stream)) = self.tcp_listener.poll_accept(cx) {
-            if let Ok(id) = self.manager.accept_tcp(self.rng, now) {
-                self.tcp_conns.push(TcpConnState {
-                    id,
-                    stream,
-                    pending_write: Vec::new(),
-                    write_offset: 0,
-                    eof: false,
-                });
+        // 1. Accept new TCP connections from each listener (at most one per
+        //    listener per cycle to avoid starving established connections).
+        //    The TLS listener's connections handshake; the cleartext listener's
+        //    start as plaintext HTTP/1.1. Both feed the same manager.
+        if let Some(listener) = self.tls_listener.as_mut() {
+            if let Poll::Ready(Ok(stream)) = listener.poll_accept(cx) {
+                if let Ok(id) = self.manager.accept_tcp(self.rng, now) {
+                    self.tcp_conns.push(TcpConnState {
+                        id,
+                        stream,
+                        pending_write: Vec::new(),
+                        write_offset: 0,
+                        eof: false,
+                    });
+                }
+            }
+        }
+        #[cfg(feature = "http1")]
+        if let Some(listener) = self.cleartext_listener.as_mut() {
+            if let Poll::Ready(Ok(stream)) = listener.poll_accept(cx) {
+                if let Ok(id) = self.manager.accept_tcp_cleartext(now) {
+                    self.tcp_conns.push(TcpConnState {
+                        id,
+                        stream,
+                        pending_write: Vec::new(),
+                        write_offset: 0,
+                        eof: false,
+                    });
+                }
             }
         }
 

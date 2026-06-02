@@ -129,6 +129,78 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize> Default
     }
 }
 
+/// Cleartext HTTP/1.1 over a plain TCP byte stream.
+///
+/// This lets `ServerManager`/`ServerRunner` drive plaintext HTTP/1.1 through the
+/// same unified event loop as the TLS-wrapped [`Https1Server`](crate::https1)
+/// — `tcp_feed_data`/`tcp_poll_output` operate directly on cleartext bytes (no
+/// TLS layer). Selected via
+/// [`ServerManager::accept_tcp_cleartext`](crate::server::ServerManager::accept_tcp_cleartext).
+impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
+    crate::http::server_conn::HttpServerConn for Http1Server<BUF, HDRBUF, DATABUF>
+{
+    fn poll_event(&mut self, _scratch: &mut [u8]) -> Option<crate::http::server_conn::HttpEvent> {
+        use crate::http::server_conn::HttpEvent;
+        self.poll_event().map(|ev| match ev {
+            Http1Event::Connected => HttpEvent::Connected,
+            Http1Event::Headers(s) => HttpEvent::Headers(s),
+            Http1Event::Data(s) => HttpEvent::Data(s),
+            Http1Event::Finished(s) => HttpEvent::Finished(s),
+            Http1Event::Timeout => HttpEvent::Timeout,
+        })
+    }
+
+    fn recv_headers(
+        &mut self,
+        stream_id: u64,
+        emit: &mut dyn FnMut(&[u8], &[u8]),
+    ) -> Result<(), Error> {
+        Http1Server::recv_headers(self, stream_id, emit)
+    }
+
+    fn recv_body(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
+        Http1Server::recv_body(self, stream_id, buf)
+    }
+
+    fn send_response(
+        &mut self,
+        stream_id: u64,
+        status: u16,
+        headers: &[(&[u8], &[u8])],
+        end_stream: bool,
+    ) -> Result<(), Error> {
+        Http1Server::send_response(self, stream_id, status, headers, end_stream)
+    }
+
+    fn send_body(&mut self, stream_id: u64, data: &[u8], end_stream: bool) -> Result<usize, Error> {
+        Http1Server::send_body(self, stream_id, data, end_stream)
+    }
+
+    fn is_established(&self) -> bool {
+        Http1Server::is_established(self)
+    }
+
+    fn is_closed(&self) -> bool {
+        Http1Server::is_closed(self)
+    }
+
+    fn next_timeout(&self) -> Option<u64> {
+        Http1Server::next_timeout(self)
+    }
+
+    fn handle_timeout(&mut self, now: u64) {
+        Http1Server::handle_timeout(self, now);
+    }
+
+    fn tcp_feed_data(&mut self, data: &[u8]) -> Result<(), Error> {
+        Http1Server::feed_data(self, data)
+    }
+
+    fn tcp_poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+        Http1Server::poll_output(self, buf)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

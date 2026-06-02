@@ -293,6 +293,31 @@ where
         Ok(id)
     }
 
+    /// Accept a new cleartext (non-TLS) TCP connection.
+    ///
+    /// Unlike [`accept_tcp`](Self::accept_tcp), this skips the TLS handshake and
+    /// starts the connection as an established plaintext HTTP/1.1 server. Feed
+    /// raw TCP bytes via `tcp_feed` and drain output via `tcp_poll_output`, same
+    /// as a TLS connection. Used to serve plain HTTP alongside HTTPS.
+    #[cfg(feature = "http1")]
+    pub fn accept_tcp_cleartext(&mut self, now: u64) -> Result<ConnId, Error> {
+        if self.tcp_conns.len() >= self.config.max_tcp_conns {
+            return Err(Error::StreamLimitExhausted);
+        }
+        let id = self.alloc_id();
+
+        let http_conn: Box<dyn HttpServerConn> = Box::new(crate::http1::Http1Server::<BUF>::new());
+        self.tcp_conns.push(TcpConn {
+            id,
+            state: TcpState::Established(http_conn),
+            protocol: ConnProtocol::Http1,
+            accepted_at: now,
+        });
+        self.push_server_event(ServerEvent::Connected(id));
+
+        Ok(id)
+    }
+
     /// Feed TCP data into a connection.
     pub fn tcp_feed(&mut self, id: ConnId, data: &[u8], now: u64) -> Result<(), Error> {
         let conn = self

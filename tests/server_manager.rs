@@ -583,3 +583,87 @@ fn unknown_connection_returns_error() {
     assert!(manager.tcp_feed(fake_id, &[0], 0).is_err());
     assert!(manager.is_closed(fake_id)); // not found = closed
 }
+
+/// Cleartext (non-TLS) HTTP/1.1 over the manager: `accept_tcp_cleartext` starts
+/// the connection established, raw HTTP/1.1 bytes route through the same event
+/// stream, and the response comes back as plaintext. This is the path used for
+/// dual HTTP/HTTPS serving alongside the TLS `accept_tcp`.
+#[cfg(feature = "http1")]
+#[test]
+fn tcp_cleartext_http1_request() {
+    let cert: &'static [u8] = test_cert_der().leak();
+    let server_config = make_server_config(cert);
+    let mut manager: ServerManager<Aes128GcmProvider, (), 32768> =
+        ServerManager::new(Aes128GcmProvider, server_config, ServerConfig::default());
+
+    // Cleartext accept: no TLS handshake, no rng — established immediately.
+    let conn_id = manager.accept_tcp_cleartext(0).unwrap();
+
+    let mut scratch = [0u8; 2048];
+
+    // Cleartext accept emits Connected right away.
+    let mut got_connected = false;
+    while let Some(ev) = manager.poll_event(&mut scratch) {
+        if matches!(ev, ServerEvent::Connected(id) if id == conn_id) {
+            got_connected = true;
+        }
+    }
+    assert!(got_connected, "cleartext accept should emit Connected");
+
+    // Feed a raw plaintext HTTP/1.1 request.
+    manager
+        .tcp_feed(
+            conn_id,
+            b"GET /hello HTTP/1.1\r\nHost: test.local\r\n\r\n",
+            1_000_000,
+        )
+        .unwrap();
+
+    // Manager surfaces request headers through the unified event stream.
+    let mut header_stream = None;
+    while let Some(ev) = manager.poll_event(&mut scratch) {
+        if let ServerEvent::Http {
+            conn,
+            event: HttpEvent::Headers(sid),
+        } = ev
+        {
+            if conn == conn_id {
+                header_stream = Some(sid);
+            }
+        }
+    }
+    let header_stream = header_stream.expect("manager should receive cleartext HTTP headers");
+
+    let mut method = Vec::new();
+    manager
+        .recv_headers(conn_id, header_stream, &mut |name: &[u8], value: &[u8]| {
+            if name == b":method" {
+                method.extend_from_slice(value);
+            }
+        })
+        .unwrap();
+    assert_eq!(method, b"GET");
+
+    // Response goes back out as plaintext HTTP/1.1 (no TLS records).
+    manager
+        .send_response(
+            conn_id,
+            header_stream,
+            200,
+            &[(b"content-length", b"2")],
+            false,
+        )
+        .unwrap();
+    manager
+        .send_body(conn_id, header_stream, b"ok", true)
+        .unwrap();
+
+    let mut out = Vec::new();
+    let mut buf = [0u8; 32768];
+    while let Some(data) = manager.tcp_poll_output(conn_id, &mut buf) {
+        out.extend_from_slice(data);
+    }
+    let text = core::str::from_utf8(&out).unwrap();
+    assert!(text.starts_with("HTTP/1.1 200"), "got: {text}");
+    assert!(text.ends_with("ok"), "got: {text}");
+}
