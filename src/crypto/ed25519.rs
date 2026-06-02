@@ -177,107 +177,113 @@ pub fn ed25519_public_key_from_seed(seed: &[u8; 32]) -> [u8; 32] {
 /// the Ed25519 OID and the 32-byte public key.
 ///
 /// Returns the DER-encoded certificate bytes and the length used.
+/// Build a minimal self-signed Ed25519 X.509 certificate (CN=milli-quic).
+///
+/// Equivalent to [`build_ed25519_cert_der_with_san`] with no SAN entries.
 pub fn build_ed25519_cert_der(public_key: &[u8; 32], out: &mut [u8]) -> Result<usize, Error> {
-    // Build a minimal X.509 Certificate structure:
-    // SEQUENCE (Certificate) {
-    //   SEQUENCE (TBSCertificate) {
-    //     [0] EXPLICIT INTEGER (version = v3 = 2)
-    //     INTEGER (serialNumber = 1)
-    //     SEQUENCE (signature algorithm = Ed25519) {
-    //       OID 1.3.101.112
-    //     }
-    //     SEQUENCE (issuer = CN=milli-quic) {
-    //       SET { SEQUENCE { OID 2.5.4.3, UTF8String "milli-quic" } }
-    //     }
-    //     SEQUENCE (validity) {
-    //       UTCTime "250101000000Z"
-    //       UTCTime "350101000000Z"
-    //     }
-    //     SEQUENCE (subject = CN=milli-quic) {
-    //       SET { SEQUENCE { OID 2.5.4.3, UTF8String "milli-quic" } }
-    //     }
-    //     SEQUENCE (SubjectPublicKeyInfo) {
-    //       SEQUENCE { OID 1.3.101.112 }
-    //       BIT STRING (0x00 + public_key)
-    //     }
-    //   }
-    //   SEQUENCE (signatureAlgorithm = Ed25519) {
-    //     OID 1.3.101.112
-    //   }
-    //   BIT STRING (signature - placeholder)
-    // }
+    build_ed25519_cert_der_with_san(public_key, &[], &[], out)
+}
 
-    // Pre-built DER template for a minimal Ed25519 certificate.
-    // The public key bytes are at a known offset.
-    #[rustfmt::skip]
-    let template: &[u8] = &[
-        // SEQUENCE (Certificate)
-        0x30, 0x81, 0xd6,
-          // SEQUENCE (TBSCertificate)
-          0x30, 0x81, 0x89,
-            // [0] EXPLICIT INTEGER v3 (2)
-            0xa0, 0x03, 0x02, 0x01, 0x02,
-            // INTEGER serialNumber = 1
-            0x02, 0x01, 0x01,
-            // SEQUENCE (signature algorithm OID = Ed25519)
-            0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
-            // SEQUENCE (issuer: CN=milli-quic)
-            0x30, 0x15,
-              0x31, 0x13, 0x30, 0x11,
-                0x06, 0x03, 0x55, 0x04, 0x03,  // OID 2.5.4.3 (CN)
-                0x0c, 0x0a,                      // UTF8String length 10
-                b'm', b'i', b'l', b'l', b'i', b'-', b'q', b'u', b'i', b'c',
-            // SEQUENCE (validity)
-            0x30, 0x1e,
-              // UTCTime "250101000000Z"
-              0x17, 0x0d, b'2', b'5', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0', b'Z',
-              // UTCTime "350101000000Z"
-              0x17, 0x0d, b'3', b'5', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0', b'Z',
-            // SEQUENCE (subject: CN=milli-quic) - same as issuer
-            0x30, 0x15,
-              0x31, 0x13, 0x30, 0x11,
-                0x06, 0x03, 0x55, 0x04, 0x03,
-                0x0c, 0x0a,
-                b'm', b'i', b'l', b'l', b'i', b'-', b'q', b'u', b'i', b'c',
-            // SEQUENCE (SubjectPublicKeyInfo)
-            0x30, 0x2a,
-              // SEQUENCE { OID 1.3.101.112 }
-              0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
-              // BIT STRING: 0x00 padding + 32 bytes public key
-              0x03, 0x21, 0x00,
-              // 32 bytes of public key placeholder (will be replaced)
-              0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-              0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-              0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-              0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-          // SEQUENCE (signatureAlgorithm = Ed25519)
-          0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
-          // BIT STRING (signature - 64 bytes + 1 padding byte)
-          0x03, 0x41, 0x00,
-          // 64 bytes of placeholder signature
-          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+/// Build a minimal self-signed Ed25519 X.509 certificate (CN=milli-quic) with
+/// an optional `subjectAltName` extension.
+///
+/// `dns_names` and `ip_addrs` populate the SAN so TLS clients can validate the
+/// hostname or IP they connected to (modern clients ignore the CN). Both are
+/// optional — pass empty slices to omit the extension entirely, which yields a
+/// certificate byte-identical to [`build_ed25519_cert_der`]. The signature is a
+/// fixed placeholder: this certificate is meant to be pinned/trusted directly,
+/// not chain-verified.
+pub fn build_ed25519_cert_der_with_san(
+    public_key: &[u8; 32],
+    dns_names: &[&str],
+    ip_addrs: &[core::net::IpAddr],
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    use crate::crypto::x509::{asn1_len_size, encode_san_extensions, write_asn1_len};
+
+    // Fixed TBSCertificate fragments. The DER structure is:
+    //   TBSCertificate ::= SEQUENCE {
+    //     [0] version v3, serialNumber 1, signature Ed25519,
+    //     issuer/subject CN=milli-quic, validity 2025-2035, SPKI, [3] extensions
+    //   }
+    const VERSION: [u8; 5] = [0xa0, 0x03, 0x02, 0x01, 0x02];
+    const SERIAL: [u8; 3] = [0x02, 0x01, 0x01];
+    // signatureAlgorithm: SEQUENCE { OID 1.3.101.112 (Ed25519) }
+    const SIG_ALGO: [u8; 7] = [0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70];
+    // issuer == subject: SEQUENCE { SET { SEQUENCE { OID 2.5.4.3 (CN), UTF8String "milli-quic" } } }
+    const NAME: [u8; 23] = [
+        0x30, 0x15, 0x31, 0x13, 0x30, 0x11, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x0a, b'm', b'i',
+        b'l', b'l', b'i', b'-', b'q', b'u', b'i', b'c',
+    ];
+    // validity: SEQUENCE { UTCTime "250101000000Z", UTCTime "350101000000Z" }
+    const VALIDITY: [u8; 32] = [
+        0x30, 0x1e, 0x17, 0x0d, b'2', b'5', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0',
+        b'0', b'Z', 0x17, 0x0d, b'3', b'5', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0',
+        b'0', b'Z',
+    ];
+    // SubjectPublicKeyInfo header: SEQUENCE { SEQUENCE { Ed25519 OID }, BIT STRING (0x00 + key) }
+    const SPKI_HEADER: [u8; 12] = [
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
     ];
 
-    let total = template.len();
+    // Encode the SAN extensions block first (0 bytes if both lists are empty).
+    let mut ext = [0u8; 320];
+    let ext_len = encode_san_extensions(dns_names, ip_addrs, &mut ext)?;
+
+    // ---- assemble TBSCertificate content ----
+    let mut tbs = [0u8; 512];
+    let mut t = 0usize;
+    for frag in [
+        &VERSION[..],
+        &SERIAL[..],
+        &SIG_ALGO[..],
+        &NAME[..],
+        &VALIDITY[..],
+        &NAME[..],
+        &SPKI_HEADER[..],
+    ] {
+        tbs[t..t + frag.len()].copy_from_slice(frag);
+        t += frag.len();
+    }
+    tbs[t..t + 32].copy_from_slice(public_key);
+    t += 32;
+    tbs[t..t + ext_len].copy_from_slice(&ext[..ext_len]);
+    t += ext_len;
+    let tbs_len = t;
+
+    // ---- outer Certificate: TBS + signatureAlgorithm + signature ----
+    // signature BIT STRING: 03 41 00 + 64-byte placeholder.
+    const SIG_LEN: usize = 3 + 64;
+    let tbs_wrapped = 1 + asn1_len_size(tbs_len) + tbs_len;
+    let outer_content = tbs_wrapped + SIG_ALGO.len() + SIG_LEN;
+    let total = 1 + asn1_len_size(outer_content) + outer_content;
     if out.len() < total {
         return Err(Error::BufferTooSmall { needed: total });
     }
 
-    out[..total].copy_from_slice(template);
+    let mut o = 0usize;
+    out[o] = 0x30;
+    o += 1;
+    o += write_asn1_len(outer_content, &mut out[o..])?;
+    // TBSCertificate
+    out[o] = 0x30;
+    o += 1;
+    o += write_asn1_len(tbs_len, &mut out[o..])?;
+    out[o..o + tbs_len].copy_from_slice(&tbs[..tbs_len]);
+    o += tbs_len;
+    // signatureAlgorithm
+    out[o..o + SIG_ALGO.len()].copy_from_slice(&SIG_ALGO);
+    o += SIG_ALGO.len();
+    // signature BIT STRING (placeholder zeros)
+    out[o] = 0x03;
+    out[o + 1] = 0x41;
+    out[o + 2] = 0x00;
+    for b in out[o + 3..o + SIG_LEN].iter_mut() {
+        *b = 0x00;
+    }
+    o += SIG_LEN;
 
-    // Find the public key location: after BIT STRING tag 0x03 0x21 0x00
-    // in the SubjectPublicKeyInfo section. We search for the OID first.
-    let pubkey_offset = find_subsequence(&out[..total], &[0x03, 0x21, 0x00]).ok_or(Error::Tls)? + 3;
-    out[pubkey_offset..pubkey_offset + 32].copy_from_slice(public_key);
-
-    Ok(total)
+    Ok(o)
 }
 
 /// Find the first occurrence of `needle` in `haystack`.
@@ -340,6 +346,39 @@ mod tests {
 
         let extracted = extract_ed25519_pubkey_from_cert(cert_der).unwrap();
         assert_eq!(extracted, pubkey);
+    }
+
+    #[test]
+    fn build_cert_with_san_embeds_names_and_ip() {
+        use core::net::{IpAddr, Ipv6Addr};
+
+        let seed = [0x42u8; 32];
+        let pubkey = ed25519_public_key_from_seed(&seed);
+        let v6 = Ipv6Addr::new(0xfd54, 0xa4ae, 0x56de, 1, 0, 0, 0, 1);
+
+        let mut cert_buf = [0u8; 512];
+        let cert_len = build_ed25519_cert_der_with_san(
+            &pubkey,
+            &["raven.local"],
+            &[IpAddr::V6(v6)],
+            &mut cert_buf,
+        )
+        .unwrap();
+        let cert_der = &cert_buf[..cert_len];
+
+        // subjectAltName OID (2.5.29.17), the dNSName, and the iPAddress octets
+        // are all present.
+        assert!(find_subsequence(cert_der, &[0x06, 0x03, 0x55, 0x1d, 0x11]).is_some());
+        assert!(find_subsequence(cert_der, b"raven.local").is_some());
+        assert!(find_subsequence(cert_der, &v6.octets()).is_some());
+
+        // The public key is still extractable past the SAN block.
+        assert_eq!(extract_ed25519_pubkey_from_cert(cert_der).unwrap(), pubkey);
+
+        // And the SAN cert is larger than the equivalent no-SAN cert.
+        let mut plain = [0u8; 512];
+        let plain_len = build_ed25519_cert_der(&pubkey, &mut plain).unwrap();
+        assert!(cert_len > plain_len);
     }
 
     #[test]

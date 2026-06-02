@@ -10,6 +10,7 @@ pub mod ecdsa_p256;
 pub mod ed25519;
 mod header_protection;
 mod hkdf;
+mod x509;
 
 #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
 pub mod rustcrypto;

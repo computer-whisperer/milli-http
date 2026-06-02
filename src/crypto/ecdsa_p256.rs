@@ -151,14 +151,23 @@ pub fn p256_public_key_from_scalar(scalar: &[u8; 32]) -> Result<heapless::Vec<u8
     Ok(result)
 }
 
-/// Build a minimal self-signed DER certificate containing a P-256 public key.
+/// Build a minimal self-signed ECDSA P-256 X.509 certificate (CN=milli-quic).
 ///
-/// Creates a minimal X.509v3-like structure sufficient for TLS 1.3
-/// CertificateVerify purposes. The certificate signature is a placeholder
-/// (not a valid signature).
-///
-/// Returns the number of bytes written to `out`.
+/// Equivalent to [`build_p256_cert_der_with_san`] with no SAN entries.
 pub fn build_p256_cert_der(public_key: &[u8], out: &mut [u8]) -> Result<usize, Error> {
+    build_p256_cert_der_with_san(public_key, &[], &[], out)
+}
+
+/// Build a minimal self-signed ECDSA P-256 X.509 certificate (CN=milli-quic)
+/// with an optional `subjectAltName` extension. `dns_names` and `ip_addrs`
+/// populate the SAN so TLS clients can validate the hostname/IP they connected
+/// to; both are optional (pass empty slices to omit the extension).
+pub fn build_p256_cert_der_with_san(
+    public_key: &[u8],
+    dns_names: &[&str],
+    ip_addrs: &[core::net::IpAddr],
+    out: &mut [u8],
+) -> Result<usize, Error> {
     // We need the uncompressed public key (65 bytes: 0x04 || x || y)
     if public_key.len() != 65 || public_key[0] != 0x04 {
         return Err(Error::Tls);
@@ -290,6 +299,10 @@ pub fn build_p256_cert_der(public_key: &[u8], out: &mut [u8]) -> Result<usize, E
     tbs_off += 1;
     tbs[tbs_off..tbs_off + 65].copy_from_slice(public_key);
     tbs_off += 65;
+
+    // Extensions: [3] EXPLICIT subjectAltName (nothing written if both empty).
+    tbs_off +=
+        crate::crypto::x509::encode_san_extensions(dns_names, ip_addrs, &mut tbs[tbs_off..])?;
 
     let tbs_len = tbs_off;
 
@@ -471,6 +484,37 @@ mod tests {
 
         let extracted = extract_p256_pubkey_from_cert(cert_der).unwrap();
         assert_eq!(extracted.as_slice(), pubkey.as_slice());
+    }
+
+    #[test]
+    fn build_cert_with_san_embeds_names_and_ip() {
+        use core::net::{IpAddr, Ipv4Addr};
+
+        let scalar = [0x42u8; 32];
+        let pubkey = p256_public_key_from_scalar(&scalar).unwrap();
+        let v4 = Ipv4Addr::new(192, 168, 1, 50);
+
+        let mut cert_buf = [0u8; 512];
+        let cert_len = build_p256_cert_der_with_san(
+            &pubkey,
+            &["raven.local"],
+            &[IpAddr::V4(v4)],
+            &mut cert_buf,
+        )
+        .unwrap();
+        let cert_der = &cert_buf[..cert_len];
+
+        assert!(find_subsequence(cert_der, &[0x06, 0x03, 0x55, 0x1d, 0x11]).is_some());
+        assert!(find_subsequence(cert_der, b"raven.local").is_some());
+        assert!(find_subsequence(cert_der, &v4.octets()).is_some());
+        assert_eq!(
+            extract_p256_pubkey_from_cert(cert_der).unwrap().as_slice(),
+            pubkey.as_slice()
+        );
+
+        let mut plain = [0u8; 512];
+        let plain_len = build_p256_cert_der(&pubkey, &mut plain).unwrap();
+        assert!(cert_len > plain_len);
     }
 
     #[test]
