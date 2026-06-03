@@ -3,6 +3,7 @@
 pub mod header;
 pub mod method;
 pub mod server_conn;
+pub mod sse;
 pub mod status;
 
 pub use header::Header;

@@ -667,3 +667,438 @@ fn tcp_cleartext_http1_request() {
     assert!(text.starts_with("HTTP/1.1 200"), "got: {text}");
     assert!(text.ends_with("ok"), "got: {text}");
 }
+
+// -----------------------------------------------------------------------
+// Streaming (SSE-style) response tests
+//
+// A server-sent-events response is `200` with `content-type:
+// text/event-stream`, no content-length, `end_stream = false`, followed by
+// body frames pushed incrementally as application events occur. These tests
+// prove each frame is deliverable (and observable by the client) *before*
+// the next one exists, on all three protocol paths.
+// -----------------------------------------------------------------------
+
+const SSE_HEADERS: &[(&[u8], &[u8])] = &[(b"content-type", b"text/event-stream")];
+
+#[test]
+fn tcp_http1_streaming_response() {
+    let cert: &'static [u8] = test_cert_der().leak();
+    let server_config = make_server_config(cert);
+    let mut manager: ServerManager<Aes128GcmProvider, (), 32768> =
+        ServerManager::new(Aes128GcmProvider, server_config, ServerConfig::default());
+    let mut rng = TestRng(0x50);
+
+    let conn_id = manager.accept_tcp(&mut rng, 0).unwrap();
+
+    let client_config = TlsConfig {
+        server_name: heapless::String::try_from("test.local").unwrap(),
+        alpn_protocols: &[b"http/1.1"],
+        transport_params: TransportParams::default_params(),
+        pinned_certs: &[],
+    };
+    let mut client = milli_http::https1::Https1Client::<Aes128GcmProvider, 32768>::new(
+        Aes128GcmProvider,
+        client_config,
+        [0xAA; 32],
+        [0xBB; 32],
+    );
+
+    // TLS handshake
+    for _ in 0..20 {
+        let mut buf = [0u8; 32768];
+        let mut progress = false;
+        while let Some(data) = client.poll_output(&mut buf) {
+            let copy = data.to_vec();
+            manager.tcp_feed(conn_id, &copy, 1_000_000).unwrap();
+            progress = true;
+        }
+        let mut buf2 = [0u8; 32768];
+        while let Some(data) = manager.tcp_poll_output(conn_id, &mut buf2) {
+            let copy = data.to_vec();
+            client.feed_data(&copy).unwrap();
+            progress = true;
+        }
+        if !progress {
+            break;
+        }
+    }
+    assert!(client.is_established());
+
+    let mut scratch = [0u8; 2048];
+    while manager.poll_event(&mut scratch).is_some() {}
+
+    // Subscribe
+    let stream_id = client
+        .send_request("GET", "/events", "test.local", &[], true)
+        .unwrap();
+    let mut buf = [0u8; 32768];
+    while let Some(data) = client.poll_output(&mut buf) {
+        let copy = data.to_vec();
+        manager.tcp_feed(conn_id, &copy, 1_000_000).unwrap();
+    }
+    let mut header_stream = None;
+    while let Some(ev) = manager.poll_event(&mut scratch) {
+        if let ServerEvent::Http {
+            event: HttpEvent::Headers(sid),
+            ..
+        } = ev
+        {
+            header_stream = Some(sid);
+        }
+    }
+    let header_stream = header_stream.expect("request headers");
+
+    // Open the stream: no content-length, not finished.
+    manager
+        .send_response(conn_id, header_stream, 200, SSE_HEADERS, false)
+        .unwrap();
+    let mut buf2 = [0u8; 32768];
+    while let Some(data) = manager.tcp_poll_output(conn_id, &mut buf2) {
+        let copy = data.to_vec();
+        client.feed_data(&copy).unwrap();
+    }
+    while client.poll_event().is_some() {}
+    let mut status = Vec::new();
+    client
+        .recv_headers(stream_id, |name, value| {
+            if name == b":status" {
+                status.extend_from_slice(value);
+            }
+        })
+        .unwrap();
+    assert_eq!(status, b"200");
+
+    // Push frames one at a time; each must arrive before the next is sent.
+    for i in 0..3u32 {
+        let frame = format!("event: volume\ndata: {i}\n\n");
+        manager
+            .send_body(conn_id, header_stream, frame.as_bytes(), false)
+            .unwrap();
+        let mut buf3 = [0u8; 32768];
+        while let Some(data) = manager.tcp_poll_output(conn_id, &mut buf3) {
+            let copy = data.to_vec();
+            client.feed_data(&copy).unwrap();
+        }
+        while client.poll_event().is_some() {}
+        let mut body = [0u8; 256];
+        let (n, fin) = client.recv_body(stream_id, &mut body).unwrap();
+        assert_eq!(
+            core::str::from_utf8(&body[..n]).unwrap(),
+            frame,
+            "frame {i} should arrive incrementally"
+        );
+        assert!(!fin, "stream must stay open after frame {i}");
+    }
+
+    // SSE streams over HTTP/1.1 end by closing the connection.
+    manager.close(conn_id).unwrap();
+}
+
+#[test]
+fn tcp_h2_streaming_response() {
+    let cert: &'static [u8] = test_cert_der().leak();
+    let server_config = make_server_config(cert);
+    let mut manager: ServerManager<Aes128GcmProvider, (), 32768> =
+        ServerManager::new(Aes128GcmProvider, server_config, ServerConfig::default());
+    let mut rng = TestRng(0x60);
+
+    let conn_id = manager.accept_tcp(&mut rng, 0).unwrap();
+
+    let client_config = TlsConfig {
+        server_name: heapless::String::try_from("test.local").unwrap(),
+        alpn_protocols: &[b"h2"],
+        transport_params: TransportParams::default_params(),
+        pinned_certs: &[],
+    };
+    let mut client = milli_http::h2_tls::H2TlsClient::<Aes128GcmProvider, 32768>::new(
+        Aes128GcmProvider,
+        client_config,
+        [0xCC; 32],
+        [0xDD; 32],
+    );
+
+    // TLS + H2 handshake
+    for _ in 0..20 {
+        let mut buf = [0u8; 32768];
+        let mut progress = false;
+        while let Some(data) = client.poll_output(&mut buf) {
+            let copy = data.to_vec();
+            manager.tcp_feed(conn_id, &copy, 1_000_000).unwrap();
+            progress = true;
+        }
+        let mut buf2 = [0u8; 32768];
+        while let Some(data) = manager.tcp_poll_output(conn_id, &mut buf2) {
+            let copy = data.to_vec();
+            client.feed_data(&copy).unwrap();
+            progress = true;
+        }
+        if !progress {
+            break;
+        }
+    }
+    assert!(client.is_established());
+
+    let mut scratch = [0u8; 2048];
+    while manager.poll_event(&mut scratch).is_some() {}
+    while client.poll_event().is_some() {}
+
+    // Subscribe
+    let stream_id = client
+        .send_request("GET", "/events", "test.local", &[], true)
+        .unwrap();
+    let mut buf = [0u8; 32768];
+    while let Some(data) = client.poll_output(&mut buf) {
+        let copy = data.to_vec();
+        manager.tcp_feed(conn_id, &copy, 1_000_000).unwrap();
+    }
+    let mut header_stream = None;
+    while let Some(ev) = manager.poll_event(&mut scratch) {
+        if let ServerEvent::Http {
+            event: HttpEvent::Headers(sid),
+            ..
+        } = ev
+        {
+            header_stream = Some(sid);
+        }
+    }
+    let header_stream = header_stream.expect("request headers");
+
+    // Open the stream
+    manager
+        .send_response(conn_id, header_stream, 200, SSE_HEADERS, false)
+        .unwrap();
+    let mut buf2 = [0u8; 32768];
+    while let Some(data) = manager.tcp_poll_output(conn_id, &mut buf2) {
+        let copy = data.to_vec();
+        client.feed_data(&copy).unwrap();
+    }
+    while client.poll_event().is_some() {}
+    let mut status = Vec::new();
+    client
+        .recv_headers(stream_id, |name, value| {
+            if name == b":status" {
+                status.extend_from_slice(value);
+            }
+        })
+        .unwrap();
+    assert_eq!(status, b"200");
+
+    // Push frames one at a time
+    for i in 0..3u32 {
+        let frame = format!("event: volume\ndata: {i}\n\n");
+        manager
+            .send_body(conn_id, header_stream, frame.as_bytes(), false)
+            .unwrap();
+        let mut buf3 = [0u8; 32768];
+        while let Some(data) = manager.tcp_poll_output(conn_id, &mut buf3) {
+            let copy = data.to_vec();
+            client.feed_data(&copy).unwrap();
+        }
+        while client.poll_event().is_some() {}
+        let mut body = [0u8; 256];
+        let (n, fin) = client.recv_body(stream_id, &mut body).unwrap();
+        assert_eq!(
+            core::str::from_utf8(&body[..n]).unwrap(),
+            frame,
+            "frame {i} should arrive incrementally"
+        );
+        assert!(!fin, "stream must stay open after frame {i}");
+    }
+
+    // H2 ends the stream cleanly with END_STREAM.
+    manager
+        .send_body(conn_id, header_stream, &[], true)
+        .unwrap();
+    let mut buf4 = [0u8; 32768];
+    while let Some(data) = manager.tcp_poll_output(conn_id, &mut buf4) {
+        let copy = data.to_vec();
+        client.feed_data(&copy).unwrap();
+    }
+    while client.poll_event().is_some() {}
+    let mut body = [0u8; 64];
+    let (n, fin) = client.recv_body(stream_id, &mut body).unwrap();
+    assert_eq!(n, 0);
+    assert!(fin, "client should observe END_STREAM");
+}
+
+#[test]
+fn udp_quic_h3_streaming_response() {
+    let cert: &'static [u8] = test_cert_der().leak();
+    let server_config = make_h3_server_config(cert);
+    let mut manager: ServerManager<Aes128GcmProvider, u32> =
+        ServerManager::new(Aes128GcmProvider, server_config, ServerConfig::default());
+    let mut rng = TestRng(0x70);
+    let mut pool: HandshakePool<Aes128GcmProvider, 4> = HandshakePool::new();
+
+    let client_conn: milli_http::Connection<Aes128GcmProvider> = milli_http::Connection::client(
+        Aes128GcmProvider,
+        "test.local",
+        &[b"h3"],
+        TransportParams::default_params(),
+        &mut rng,
+        &mut pool,
+    )
+    .unwrap();
+    let mut client = milli_http::h3::client::H3Client::new(client_conn);
+
+    let peer_addr: u32 = 43;
+    let now = 1_000_000u64;
+    let mut scratch = [0u8; 2048];
+
+    // QUIC handshake + H3 setup
+    let mut client_connected = false;
+    let mut conn_id = None;
+    for _ in 0..20 {
+        exchange_udp(
+            &mut client,
+            &mut manager,
+            peer_addr,
+            now,
+            &mut rng,
+            &mut pool,
+        );
+        while let Some(ev) = manager.poll_event(&mut scratch) {
+            if let ServerEvent::Http {
+                conn,
+                event: HttpEvent::Connected,
+            } = ev
+            {
+                conn_id = Some(conn);
+            }
+        }
+        while let Some(ev) = client.poll_event(&mut scratch) {
+            if ev == milli_http::h3::H3Event::Connected {
+                client_connected = true;
+            }
+        }
+        if client_connected && conn_id.is_some() {
+            break;
+        }
+    }
+    assert!(client_connected);
+    let conn_id = conn_id.expect("Connected");
+
+    // Subscribe
+    let stream_id = client
+        .send_request("GET", "/events", "test.local", &[], false)
+        .unwrap();
+    client.send_body(stream_id, &[], true).unwrap();
+
+    let mut header_stream = None;
+    for _ in 0..10 {
+        exchange_udp(
+            &mut client,
+            &mut manager,
+            peer_addr,
+            now,
+            &mut rng,
+            &mut pool,
+        );
+        while let Some(ev) = manager.poll_event(&mut scratch) {
+            if let ServerEvent::Http {
+                event: HttpEvent::Headers(sid),
+                ..
+            } = ev
+            {
+                header_stream = Some(sid);
+            }
+        }
+        if header_stream.is_some() {
+            break;
+        }
+    }
+    let header_stream = header_stream.expect("request headers");
+
+    // Open the stream
+    manager
+        .send_response(conn_id, header_stream, 200, SSE_HEADERS, false)
+        .unwrap();
+    let mut got_headers = false;
+    for _ in 0..10 {
+        exchange_udp(
+            &mut client,
+            &mut manager,
+            peer_addr,
+            now,
+            &mut rng,
+            &mut pool,
+        );
+        while let Some(ev) = client.poll_event(&mut scratch) {
+            if let milli_http::h3::H3Event::Headers(sid) = ev {
+                if sid == stream_id {
+                    got_headers = true;
+                }
+            }
+        }
+        if got_headers {
+            break;
+        }
+    }
+    assert!(got_headers, "client should receive stream headers");
+    let mut status = Vec::new();
+    client
+        .recv_headers(stream_id, |name, value| {
+            if name == b":status" {
+                status.extend_from_slice(value);
+            }
+        })
+        .unwrap();
+    assert_eq!(status, b"200");
+
+    // Push frames one at a time
+    for i in 0..3u32 {
+        let frame = format!("event: volume\ndata: {i}\n\n");
+        manager
+            .send_body(conn_id, header_stream, frame.as_bytes(), false)
+            .unwrap();
+        let mut collected = Vec::new();
+        for _ in 0..10 {
+            exchange_udp(
+                &mut client,
+                &mut manager,
+                peer_addr,
+                now,
+                &mut rng,
+                &mut pool,
+            );
+            while client.poll_event(&mut scratch).is_some() {}
+            let mut body = [0u8; 256];
+            if let Ok((n, _fin)) = client.recv_body(stream_id, &mut body) {
+                collected.extend_from_slice(&body[..n]);
+            }
+            if collected.len() >= frame.len() {
+                break;
+            }
+        }
+        assert_eq!(
+            core::str::from_utf8(&collected).unwrap(),
+            frame,
+            "frame {i} should arrive incrementally"
+        );
+    }
+
+    // H3 ends the stream cleanly with FIN.
+    manager
+        .send_body(conn_id, header_stream, &[], true)
+        .unwrap();
+    let mut got_fin = false;
+    for _ in 0..10 {
+        exchange_udp(
+            &mut client,
+            &mut manager,
+            peer_addr,
+            now,
+            &mut rng,
+            &mut pool,
+        );
+        while client.poll_event(&mut scratch).is_some() {}
+        let mut body = [0u8; 64];
+        if let Ok((_n, fin)) = client.recv_body(stream_id, &mut body) {
+            if fin {
+                got_fin = true;
+                break;
+            }
+        }
+    }
+    assert!(got_fin, "client should observe stream FIN");
+}
