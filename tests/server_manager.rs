@@ -286,8 +286,17 @@ fn tcp_handshake_h2_negotiation() {
 // -----------------------------------------------------------------------
 
 /// Helper: exchange UDP packets between an H3Client and ServerManager.
-fn exchange_udp(
-    client: &mut milli_http::h3::client::H3Client<Aes128GcmProvider>,
+fn exchange_udp<const STREAM_BUF: usize, const H3_DATA_BUF: usize>(
+    client: &mut milli_http::h3::client::H3Client<
+        Aes128GcmProvider,
+        32,
+        128,
+        4,
+        STREAM_BUF,
+        16,
+        512,
+        H3_DATA_BUF,
+    >,
     manager: &mut ServerManager<Aes128GcmProvider, u32>,
     peer_addr: u32,
     now: u64,
@@ -1240,4 +1249,173 @@ fn udp_quic_handshake_with_small_transmit_buffer() {
         "handshake must complete when the server flight is drained through \
          a small transmit buffer (client={client_connected} server={server_connected})"
     );
+}
+
+/// Regression: a response body much larger than the per-entry stream
+/// buffer (STREAM_BUF = 256 by default) must arrive intact over h3.
+///
+/// Previously `send_data` encoded the whole body into a single DATA
+/// frame, `stream_send` silently queued only the first STREAM_BUF bytes
+/// (and recorded the FIN at the truncated offset), and the peer saw a
+/// malformed DATA frame — curl killed the connection mid-body when the
+/// firmware served its 3.4 KB dev page.
+#[test]
+fn udp_quic_h3_large_body_response() {
+    let cert: &'static [u8] = test_cert_der().leak();
+    let server_config = make_h3_server_config(cert);
+    let mut manager: ServerManager<Aes128GcmProvider, u32> =
+        ServerManager::new(Aes128GcmProvider, server_config, ServerConfig::default());
+    let mut rng = TestRng(0x90);
+    let mut pool: HandshakePool<Aes128GcmProvider, 4> = HandshakePool::new();
+
+    let client_conn: milli_http::Connection<Aes128GcmProvider> = milli_http::Connection::client(
+        Aes128GcmProvider,
+        "test.local",
+        &[b"h3"],
+        TransportParams::default_params(),
+        &mut rng,
+        &mut pool,
+    )
+    .unwrap();
+    // Client with 4 KiB stream/data buffers so the whole body fits in
+    // flight (a desktop client like curl buffers far more than this).
+    let mut client: milli_http::h3::client::H3Client<
+        Aes128GcmProvider,
+        32,
+        128,
+        4,
+        4096,
+        16,
+        512,
+        4096,
+    > = milli_http::h3::client::H3Client::new(client_conn);
+
+    let peer_addr: u32 = 77;
+    let now = 1_000_000u64;
+    let mut scratch = [0u8; 4096];
+
+    // Handshake + H3 setup.
+    let mut client_connected = false;
+    let mut conn_id = None;
+    for _ in 0..20 {
+        exchange_udp(
+            &mut client,
+            &mut manager,
+            peer_addr,
+            now,
+            &mut rng,
+            &mut pool,
+        );
+        while let Some(ev) = manager.poll_event(&mut scratch) {
+            if let ServerEvent::Http {
+                conn,
+                event: HttpEvent::Connected,
+            } = ev
+            {
+                conn_id = Some(conn);
+            }
+        }
+        while let Some(ev) = client.poll_event(&mut scratch) {
+            if ev == milli_http::h3::H3Event::Connected {
+                client_connected = true;
+            }
+        }
+        if client_connected && conn_id.is_some() {
+            break;
+        }
+    }
+    assert!(client_connected, "H3 client should be connected");
+    let conn_id = conn_id.expect("manager should emit Connected");
+
+    // Request.
+    let stream_id = client
+        .send_request("GET", "/big", "test.local", &[], false)
+        .unwrap();
+    client.send_body(stream_id, &[], true).unwrap();
+
+    let mut header_stream = None;
+    for _ in 0..10 {
+        exchange_udp(
+            &mut client,
+            &mut manager,
+            peer_addr,
+            now,
+            &mut rng,
+            &mut pool,
+        );
+        while let Some(ev) = manager.poll_event(&mut scratch) {
+            if let ServerEvent::Http {
+                event: HttpEvent::Headers(sid),
+                ..
+            } = ev
+            {
+                header_stream = Some(sid);
+            }
+        }
+        if header_stream.is_some() {
+            break;
+        }
+    }
+    let header_stream = header_stream.expect("manager should receive request headers");
+
+    // Respond with a 3.5 KB patterned body, the size class of the
+    // firmware's gzipped dev page.
+    let body: Vec<u8> = (0..3500usize).map(|i| (i % 251) as u8).collect();
+    manager
+        .send_response(
+            conn_id,
+            header_stream,
+            200,
+            &[(b"content-length", b"3500")],
+            false,
+        )
+        .unwrap();
+
+    // send_body may accept only part of the body per call; loop,
+    // draining packets between calls, until everything is queued.
+    let mut offset = 0;
+    let mut received = Vec::new();
+    let mut got_fin = false;
+    for _ in 0..50 {
+        if offset < body.len() {
+            let n = manager
+                .send_body(conn_id, header_stream, &body[offset..], true)
+                .unwrap();
+            offset += n;
+        }
+        exchange_udp(
+            &mut client,
+            &mut manager,
+            peer_addr,
+            now,
+            &mut rng,
+            &mut pool,
+        );
+        while let Some(_) = client.poll_event(&mut scratch) {}
+
+        // Drain whatever body bytes have arrived at the client.
+        loop {
+            let mut chunk = [0u8; 512];
+            match client.recv_body(stream_id, &mut chunk) {
+                Ok((n, fin)) => {
+                    received.extend_from_slice(&chunk[..n]);
+                    if fin {
+                        got_fin = true;
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if got_fin {
+            break;
+        }
+    }
+
+    assert_eq!(offset, body.len(), "all body bytes should be accepted");
+    assert!(got_fin, "client should see end of stream");
+    assert_eq!(received.len(), body.len(), "body length must match");
+    assert_eq!(received, body, "body must arrive intact");
 }

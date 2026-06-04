@@ -607,34 +607,65 @@ where
         let mut frame_buf = [0u8; 2048];
         let frame_len = encode_h3_frame(&frame, &mut frame_buf)?;
 
+        // HEADERS must go out atomically — a partial frame would corrupt
+        // the stream — so check capacity up front.
         let mut sio = self.sio_bufs.as_io();
-        self.quic
-            .stream_send(&mut sio, stream_id, &frame_buf[..frame_len], end_stream)?;
+        if self.quic.stream_send_capacity(&sio, stream_id) < frame_len {
+            return Err(Error::BufferTooSmall { needed: frame_len });
+        }
+        let sent =
+            self.quic
+                .stream_send(&mut sio, stream_id, &frame_buf[..frame_len], end_stream)?;
+        debug_assert_eq!(sent, frame_len);
         Ok(())
     }
 
     /// Send a DATA frame on a request stream.
+    ///
+    /// Sizes the frame to what the send queue can take right now and
+    /// returns the number of payload bytes accepted (possibly less than
+    /// `data.len()`, possibly 0). On a partial write the caller re-sends
+    /// the remainder later, passing `end_stream` again; the FIN is only
+    /// emitted once all data has been accepted.
     pub(crate) fn send_data(
         &mut self,
         stream_id: u64,
         data: &[u8],
         end_stream: bool,
     ) -> Result<usize, Error> {
+        let mut sio = self.sio_bufs.as_io();
+
         if data.is_empty() && end_stream {
             // Send FIN with empty data.
-            let mut sio = self.sio_bufs.as_io();
             self.quic.stream_send(&mut sio, stream_id, &[], true)?;
             return Ok(0);
         }
 
-        let frame = H3Frame::Data(data);
-        let mut frame_buf = [0u8; 4096];
-        let frame_len = encode_h3_frame(&frame, &mut frame_buf)?;
+        // Size the DATA frame to the available send capacity: once the
+        // frame header is on the stream, every byte it declares must
+        // follow, or the peer sees a malformed frame.
+        let capacity = self.quic.stream_send_capacity(&sio, stream_id);
+        const MAX_DATA_HEADER: usize = 5; // 1 B type + ≤4 B length varint
+        if capacity <= MAX_DATA_HEADER {
+            return Ok(0);
+        }
+        let chunk = data.len().min(capacity - MAX_DATA_HEADER);
 
-        let mut sio = self.sio_bufs.as_io();
-        self.quic
-            .stream_send(&mut sio, stream_id, &frame_buf[..frame_len], end_stream)?;
-        Ok(data.len())
+        let mut header = [0u8; MAX_DATA_HEADER];
+        let header_len = super::frame::encode_data_frame_header(chunk as u64, &mut header)?;
+
+        let sent = self
+            .quic
+            .stream_send(&mut sio, stream_id, &header[..header_len], false)?;
+        debug_assert_eq!(sent, header_len);
+
+        let fin = end_stream && chunk == data.len();
+        let sent = self
+            .quic
+            .stream_send(&mut sio, stream_id, &data[..chunk], fin)?;
+        debug_assert_eq!(sent, chunk);
+
+        Ok(chunk)
     }
 }
 

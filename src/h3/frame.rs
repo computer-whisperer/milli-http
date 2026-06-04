@@ -151,6 +151,20 @@ pub fn encode_h3_frame(frame: &H3Frame<'_>, buf: &mut [u8]) -> Result<usize, Err
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Encode just the header (type + length varints) of a DATA frame whose
+/// payload will follow separately on the stream. Avoids copying the
+/// payload through an intermediate frame buffer.
+pub(crate) fn encode_data_frame_header(payload_len: u64, buf: &mut [u8]) -> Result<usize, Error> {
+    let needed = varint_len(H3_FRAME_DATA) + varint_len(payload_len);
+    if buf.len() < needed {
+        return Err(Error::BufferTooSmall { needed });
+    }
+    let mut off = 0;
+    off += encode_varint(H3_FRAME_DATA, &mut buf[off..])?;
+    off += encode_varint(payload_len, &mut buf[off..])?;
+    Ok(off)
+}
+
 /// Encode a frame whose payload is a raw byte slice (DATA, HEADERS).
 fn encode_simple_frame(frame_type: u64, payload: &[u8], buf: &mut [u8]) -> Result<usize, Error> {
     let payload_len = payload.len() as u64;

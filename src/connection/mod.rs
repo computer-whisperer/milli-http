@@ -691,7 +691,48 @@ where
         Ok(stream_id)
     }
 
+    /// How many more bytes `stream_send` can accept for `stream_id` right
+    /// now, bounded by the stream's flow-control window and the free space
+    /// in the send queue (including room left in a coalescible tail entry).
+    ///
+    /// Returns 0 for unknown/recv-only streams and closed connections.
+    pub fn stream_send_capacity<const STREAM_BUF: usize, const SEND_QUEUE: usize>(
+        &self,
+        sio: &io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>,
+        stream_id: u64,
+    ) -> usize {
+        if matches!(
+            self.state,
+            ConnectionState::Closed | ConnectionState::Draining
+        ) {
+            return 0;
+        }
+        let Some(stream) = self.streams.get(stream_id) else {
+            return 0;
+        };
+        let Some(send) = stream.send.as_ref() else {
+            return 0;
+        };
+
+        let window = send.max_data.saturating_sub(send.offset) as usize;
+        let tail_room = match sio.send_queue.last() {
+            Some(tail) if tail.stream_id == stream_id && !tail.fin => STREAM_BUF - tail.len,
+            _ => 0,
+        };
+        let free_entries = SEND_QUEUE.saturating_sub(sio.send_queue.len());
+        window.min(tail_room + free_entries * STREAM_BUF)
+    }
+
     /// Send data on a stream.
+    ///
+    /// Accepts up to [`Self::stream_send_capacity`] bytes, coalescing into
+    /// the tail send-queue entry when possible and spilling the rest into
+    /// fresh entries. Returns the number of bytes accepted; the caller
+    /// re-sends the remainder later.
+    ///
+    /// `fin` takes effect only when all of `data` is accepted — on a
+    /// partial write the caller must pass `fin` again with the remainder,
+    /// so the FIN ends up at the true end of the stream.
     pub fn stream_send<const STREAM_BUF: usize, const SEND_QUEUE: usize>(
         &mut self,
         sio: &mut io::QuicStreamIo<'_, MAX_STREAMS, STREAM_BUF, SEND_QUEUE>,
@@ -709,25 +750,26 @@ where
         // Validate stream exists
         let stream = self.streams.get(stream_id).ok_or(Error::InvalidState)?;
         let send = stream.send.as_ref().ok_or(Error::InvalidState)?;
-        let offset = send.offset;
+        let mut offset = send.offset;
 
-        // Limit data to available capacity
-        let max_send = (send.max_data - send.offset) as usize;
-        let send_len = data.len().min(max_send).min(STREAM_BUF);
+        // Limit data to available capacity.
+        let send_len = data.len().min(self.stream_send_capacity(sio, stream_id));
+
+        // FIN only applies when all of `data` was accepted.
+        let fin = fin && send_len == data.len();
 
         if send_len == 0 && !fin {
             return Ok(0);
         }
 
-        // Check send queue capacity before modifying state.
-        #[cfg(not(feature = "alloc"))]
-        if sio.send_queue.is_full() {
-            return Err(Error::BufferTooSmall {
-                needed: SEND_QUEUE + 1,
-            });
-        }
-        #[cfg(feature = "alloc")]
-        if sio.send_queue.len() >= SEND_QUEUE {
+        let coalesce_tail = matches!(
+            sio.send_queue.last(),
+            Some(tail) if tail.stream_id == stream_id && !tail.fin
+        );
+
+        // A bare FIN (no data) needs either a coalescible tail entry to
+        // mark or a free queue slot for an empty entry.
+        if send_len == 0 && !coalesce_tail && sio.send_queue.len() >= SEND_QUEUE {
             return Err(Error::BufferTooSmall {
                 needed: SEND_QUEUE + 1,
             });
@@ -736,16 +778,37 @@ where
         // Record in stream map
         self.streams.mark_send(stream_id, send_len as u64, fin)?;
 
-        // Queue for transmission
-        let mut entry = StreamSendEntry {
-            stream_id,
-            offset,
-            data: [0u8; STREAM_BUF],
-            len: send_len,
-            fin,
-        };
-        entry.data[..send_len].copy_from_slice(&data[..send_len]);
-        let _ = sio.send_queue.push(entry);
+        let mut written = 0;
+
+        // Coalesce into the tail entry first.
+        if coalesce_tail {
+            let tail = sio.send_queue.last_mut().unwrap();
+            let room = (STREAM_BUF - tail.len).min(send_len);
+            tail.data[tail.len..tail.len + room].copy_from_slice(&data[..room]);
+            tail.len += room;
+            tail.fin = fin && room == send_len;
+            written += room;
+            offset += room as u64;
+        }
+
+        // Spill the rest into fresh entries.
+        while written < send_len || (fin && written == 0 && !coalesce_tail) {
+            let chunk = (send_len - written).min(STREAM_BUF);
+            let mut entry = StreamSendEntry {
+                stream_id,
+                offset,
+                data: [0u8; STREAM_BUF],
+                len: chunk,
+                fin: fin && written + chunk == send_len,
+            };
+            entry.data[..chunk].copy_from_slice(&data[written..written + chunk]);
+            let _ = sio.send_queue.push(entry);
+            written += chunk;
+            offset += chunk as u64;
+            if chunk == 0 {
+                break; // bare-FIN entry pushed
+            }
+        }
 
         Ok(send_len)
     }
@@ -1789,6 +1852,139 @@ mod tests {
             assert_eq!(len, 5);
             assert_eq!(&recv_buf[..len], b"final");
             assert!(fin);
+        }
+
+        #[test]
+        fn stream_send_coalesces_same_stream_entries() {
+            let mut pool = make_pool();
+            let (mut client, mut c_sio) = make_client(&mut pool);
+            let (mut server, mut s_sio) = make_server(&mut pool);
+            let mut scratch = [0u8; 2048];
+            let now = 1_000_000u64;
+
+            run_handshake_to_completion(
+                &mut client,
+                &mut c_sio,
+                &mut server,
+                &mut s_sio,
+                now,
+                &mut pool,
+            );
+
+            // Consecutive sends on the same stream share one queue entry.
+            let stream_id = client.open_stream().unwrap();
+            client
+                .stream_send(&mut c_sio.as_io(), stream_id, b"abc", false)
+                .unwrap();
+            client
+                .stream_send(&mut c_sio.as_io(), stream_id, b"def", true)
+                .unwrap();
+            assert_eq!(c_sio.send_queue.len(), 1, "sends should coalesce");
+            assert_eq!(c_sio.send_queue[0].len, 6);
+            assert!(c_sio.send_queue[0].fin);
+
+            let mut buf = [0u8; 2048];
+            let tx = client
+                .poll_transmit(&mut c_sio.as_io(), &mut buf, now, &mut pool)
+                .unwrap();
+            let pkt: heapless::Vec<u8, 2048> = {
+                let mut v = heapless::Vec::new();
+                let _ = v.extend_from_slice(tx.data);
+                v
+            };
+            server
+                .recv(&mut s_sio.as_io(), &pkt, &mut scratch, now, &mut pool)
+                .unwrap();
+
+            let mut recv_buf = [0u8; 256];
+            let (len, fin) = server
+                .stream_recv(&mut s_sio.as_io(), stream_id, &mut recv_buf)
+                .unwrap();
+            assert_eq!(&recv_buf[..len], b"abcdef");
+            assert!(fin);
+        }
+
+        #[test]
+        fn stream_send_partial_write_defers_fin() {
+            let mut pool = make_pool();
+            let (mut client, mut c_sio) = make_client(&mut pool);
+            let (mut server, mut s_sio) = make_server(&mut pool);
+            let mut scratch = [0u8; 2048];
+            let now = 1_000_000u64;
+
+            run_handshake_to_completion(
+                &mut client,
+                &mut c_sio,
+                &mut server,
+                &mut s_sio,
+                now,
+                &mut pool,
+            );
+
+            // Tiny send queue: 2 entries x 8 bytes = 16 bytes capacity.
+            let mut small: QuicStreamIoBufs<32, 8, 2> = QuicStreamIoBufs::new();
+            let stream_id = client.open_stream().unwrap();
+            let data = b"0123456789abcdefghij"; // 20 bytes
+
+            assert_eq!(client.stream_send_capacity(&small.as_io(), stream_id), 16);
+
+            // Only 16 bytes fit; the FIN must NOT be recorded yet.
+            let sent = client
+                .stream_send(&mut small.as_io(), stream_id, data, true)
+                .unwrap();
+            assert_eq!(sent, 16, "write should be limited by queue capacity");
+            assert_eq!(client.stream_send_capacity(&small.as_io(), stream_id), 0);
+            assert!(small.send_queue.iter().all(|e| !e.fin));
+
+            // Drain to the server, then send the remainder with FIN.
+            let mut buf = [0u8; 2048];
+            while let Some(tx) = client.poll_transmit(&mut small.as_io(), &mut buf, now, &mut pool)
+            {
+                let pkt: heapless::Vec<u8, 2048> = {
+                    let mut v = heapless::Vec::new();
+                    let _ = v.extend_from_slice(tx.data);
+                    v
+                };
+                server
+                    .recv(&mut s_sio.as_io(), &pkt, &mut scratch, now, &mut pool)
+                    .unwrap();
+            }
+
+            let sent = client
+                .stream_send(&mut small.as_io(), stream_id, &data[16..], true)
+                .unwrap();
+            assert_eq!(sent, 4);
+
+            while let Some(tx) = client.poll_transmit(&mut small.as_io(), &mut buf, now, &mut pool)
+            {
+                let pkt: heapless::Vec<u8, 2048> = {
+                    let mut v = heapless::Vec::new();
+                    let _ = v.extend_from_slice(tx.data);
+                    v
+                };
+                server
+                    .recv(&mut s_sio.as_io(), &pkt, &mut scratch, now, &mut pool)
+                    .unwrap();
+            }
+
+            // Server sees the full 20 bytes with FIN at the true end.
+            let mut received = std::vec::Vec::new();
+            let mut got_fin = false;
+            let mut recv_buf = [0u8; 64];
+            while let Ok((len, fin)) =
+                server.stream_recv(&mut s_sio.as_io(), stream_id, &mut recv_buf)
+            {
+                received.extend_from_slice(&recv_buf[..len]);
+                if fin {
+                    got_fin = true;
+                    break;
+                }
+                if len == 0 {
+                    break;
+                }
+            }
+            assert_eq!(received, data);
+            assert!(got_fin, "FIN should arrive with the final bytes");
         }
 
         // -------------------------------------------------------------------
