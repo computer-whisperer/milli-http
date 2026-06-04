@@ -14,7 +14,7 @@ Status legend:
 - **OPEN (reported)** — surfaced by the sweep but **not yet independently verified**; treat as a lead, confirm before acting.
 - **DESIGN** — intentional-looking trade-off awaiting an explicit decision, not a clear bug.
 
-Branch for the 2026-05-29 fixes: `fix/critical-audit-findings` (unmerged).
+The 2026-05-29 fixes are merged to `main`.
 
 ---
 

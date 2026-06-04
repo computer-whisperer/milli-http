@@ -3,7 +3,12 @@ name = "milli-http"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "A no_std HTTP/1.1, HTTP/2, HTTP/3 + QUIC implementation for embedded systems"
+description = "A no_std HTTP/1.1, HTTP/2, HTTP/3 + QUIC + TLS 1.3 stack for embedded systems"
+repository = "https://github.com/computer-whisperer/milli-http"
+readme = "README.md"
+keywords = ["no-std", "embedded", "http3", "quic", "tls"]
+categories = ["embedded", "no-std", "network-programming", "web-programming"]
+exclude = ["/rfc", "/docs", "/fuzz", "/.github", "/tests/curl_interop.sh", "/examples/*.sh", "/examples/*.py"]
 
 [features]
 default = ["quic", "h3", "rustcrypto-chacha"]

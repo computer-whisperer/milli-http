@@ -129,7 +129,7 @@ pub fn read_handshake_header(data: &[u8]) -> Result<(u8, usize), Error> {
 ///   - Random: 32 bytes
 ///   - SessionID: length-prefixed (1 byte length)
 ///   - CipherSuites: length-prefixed (2 byte length)
-///   - CompressionMethods: length-prefixed (1 byte length, always [0])
+///   - CompressionMethods: length-prefixed (1 byte length, always `[0]`)
 ///   - Extensions: length-prefixed (2 byte length)
 pub fn encode_client_hello(
     random: &[u8; 32],

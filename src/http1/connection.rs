@@ -6,8 +6,8 @@
 //! # Buffer lifecycle
 //!
 //! The connection will not begin parsing the next request/response until the
-//! application has consumed the current headers (via [`recv_headers`]) and body
-//! data (via [`recv_body`]). This prevents data from one message leaking into
+//! application has consumed the current headers (via `recv_headers`) and body
+//! data (via `recv_body`). This prevents data from one message leaking into
 //! the next on keep-alive connections.
 //!
 //! # I/O buffers
