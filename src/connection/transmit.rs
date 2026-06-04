@@ -275,9 +275,17 @@ where
             self.ack_eliciting_received[idx] = false;
         }
 
-        // CRYPTO frame from TLS engine
-        let crypto_written =
-            self.write_tls_crypto_data(level, &mut buf[reserve + frame_len..], pool);
+        // CRYPTO frame from TLS engine. RFC 9000 §14.1 requires ack-eliciting
+        // Initial datagrams to be padded to 1200 bytes, so only attach CRYPTO
+        // data when the buffer can hold a full minimum-size packet — an
+        // undersized buffer must not consume (and thereby lose) crypto stream
+        // data it cannot send. An ACK-only Initial needs no padding and may
+        // still go out below.
+        let crypto_written = if buf.len() >= MIN_INITIAL_PACKET_SIZE {
+            self.write_tls_crypto_data(level, &mut buf[reserve + frame_len..], pool)
+        } else {
+            0
+        };
         frame_len += crypto_written;
 
         if frame_len == 0 {
@@ -320,6 +328,14 @@ where
 
         let padded_frame_len = frame_len + padding_needed;
         let payload_length = pn_len + padded_frame_len + tag_len;
+
+        // Defensive bound: a buffer too small for the padded packet (e.g. a
+        // client ACK-only Initial through a sub-1200-byte buffer) must yield
+        // None, not an out-of-bounds write. CRYPTO data cannot reach this path
+        // with an undersized buffer (gated above), so nothing is lost.
+        if header_len + payload_length > buf.len() {
+            return None;
+        }
 
         // Write header directly into buf (dcid/scid borrows scoped to this block)
         let actual_header_len = {
@@ -750,70 +766,68 @@ where
             Some(s) => s,
             None => return 0,
         };
+        let tidx = level_index(target_level);
 
-        let mut tls_buf = [0u8; 2048];
-        let (tls_len, tls_level) = match pool.get_mut(slot).tls.write_handshake(&mut tls_buf) {
-            Ok((len, level)) => (len, level),
-            Err(_) => return 0,
-        };
-
-        if tls_len == 0 || tls_level != target_level {
-            // Put it back: unfortunately we can't "unwrite" from TLS,
-            // so we store it in a pending buffer
-            if tls_len > 0 && tls_level != target_level {
-                // Store for later
-                let ctx = pool.get_mut(slot);
-                ctx.pending_crypto[level_index(tls_level)].clear();
-                let _ = ctx.pending_crypto[level_index(tls_level)]
-                    .extend_from_slice(&tls_buf[..tls_len]);
-                ctx.pending_crypto_level[level_index(tls_level)] = tls_level;
-            }
-            // Check if we have pending crypto data for this level
-            let idx = level_index(target_level);
+        // Stage TLS engine output into the per-level pending buffers. The
+        // engine hands out each flight exactly once (write_handshake consumes
+        // it), so everything goes through `pending_crypto` and anything that
+        // doesn't fit the current packet is retained for the next one — a
+        // server flight can be several times larger than one datagram (e.g.
+        // EE+Cert+CertVerify+Finished vs a 1200-byte UDP payload).
+        {
             let ctx = pool.get_mut(slot);
-            if ctx.pending_crypto[idx].is_empty() {
-                return 0;
-            }
-            let offset = ctx.crypto_send_offset[idx];
-            let data_len = ctx.pending_crypto[idx].len();
-            #[cfg(feature = "std")]
-            eprintln!(
-                "[debug] sending pending CRYPTO {:?} offset={} len={}",
-                target_level, offset, data_len
-            );
-            let encode_result = {
-                let crypto = Frame::Crypto(CryptoFrame {
-                    offset,
-                    data: &ctx.pending_crypto[idx],
-                });
-                frame::encode(&crypto, buf)
-            };
-            match encode_result {
-                Ok(written) => {
-                    let ctx = pool.get_mut(slot);
-                    ctx.pending_crypto[idx].clear();
-                    ctx.crypto_send_offset[idx] += data_len as u64;
-                    return written;
+            if ctx.pending_crypto[tidx].is_empty() {
+                let mut tls_buf = [0u8; 2048];
+                if let Ok((tls_len, tls_level)) = ctx.tls.write_handshake(&mut tls_buf) {
+                    if tls_len > 0 {
+                        let lidx = level_index(tls_level);
+                        // Append (never clobber): the buffer may still hold an
+                        // unsent remainder of this level's CRYPTO stream.
+                        let _ = ctx.pending_crypto[lidx].extend_from_slice(&tls_buf[..tls_len]);
+                        ctx.pending_crypto_level[lidx] = tls_level;
+                    }
                 }
-                Err(_) => return 0,
             }
         }
 
-        let idx = level_index(target_level);
         let ctx = pool.get_mut(slot);
-        let offset = ctx.crypto_send_offset[idx];
+        if ctx.pending_crypto[tidx].is_empty() {
+            return 0;
+        }
+
+        // Send as large a prefix as fits in `buf`; keep the rest pending.
+        // Worst-case CRYPTO frame overhead — 1 (type) + 8 (offset varint) +
+        // 8 (length varint) — plus headroom for the packet's 16-byte AEAD tag,
+        // which the caller appends after the frames.
+        const FRAME_OVERHEAD: usize = 33;
+        if buf.len() <= FRAME_OVERHEAD {
+            return 0;
+        }
+        let send_len = (buf.len() - FRAME_OVERHEAD).min(ctx.pending_crypto[tidx].len());
+        let offset = ctx.crypto_send_offset[tidx];
         #[cfg(feature = "std")]
         eprintln!(
-            "[debug] sending CRYPTO {:?} offset={} len={}",
-            target_level, offset, tls_len
-        );
-        let crypto = Frame::Crypto(CryptoFrame {
+            "[debug] sending CRYPTO {:?} offset={} len={} (pending {})",
+            target_level,
             offset,
-            data: &tls_buf[..tls_len],
-        });
-        match frame::encode(&crypto, buf) {
+            send_len,
+            ctx.pending_crypto[tidx].len(),
+        );
+        let encode_result = {
+            let crypto = Frame::Crypto(CryptoFrame {
+                offset,
+                data: &ctx.pending_crypto[tidx][..send_len],
+            });
+            frame::encode(&crypto, buf)
+        };
+        match encode_result {
             Ok(written) => {
-                pool.get_mut(slot).crypto_send_offset[idx] += tls_len as u64;
+                let ctx = pool.get_mut(slot);
+                let pending = &mut ctx.pending_crypto[tidx];
+                let remaining = pending.len() - send_len;
+                pending.copy_within(send_len.., 0);
+                pending.truncate(remaining);
+                ctx.crypto_send_offset[tidx] += send_len as u64;
                 written
             }
             Err(_) => 0,

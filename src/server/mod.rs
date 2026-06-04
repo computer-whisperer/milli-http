@@ -116,6 +116,12 @@ struct QuicConn<
     >,
     peer_addr: A,
     local_cids: Vec<ConnectionId>,
+    /// The client-chosen Destination Connection ID from the first Initial.
+    /// Until the client has processed a server packet it keeps addressing us
+    /// by this CID — a ClientHello large enough to span multiple Initial
+    /// datagrams (e.g. post-quantum key shares) sends every fragment under it,
+    /// so routing must match it in addition to our own `local_cids`.
+    original_dcid: ConnectionId,
 }
 
 // ---------------------------------------------------------------------------
@@ -169,7 +175,11 @@ pub struct ServerManager<
     const SENT_PER_SPACE: usize = 16,
     const MAX_CIDS: usize = 2,
     const STREAM_BUF: usize = 256,
-    const SEND_QUEUE: usize = 4,
+    // At connection setup the H3 server queues its control + QPACK streams;
+    // a response arriving in the same poll cycle (common at 1200-byte QUIC
+    // datagram pacing) must still fit alongside them, or send_response fails
+    // with BufferTooSmall. 16 matches H3Server's own default.
+    const SEND_QUEUE: usize = 16,
     const H3_HDR_BUF: usize = 512,
     const H3_DATA_BUF: usize = 1024,
 > {
@@ -430,10 +440,17 @@ where
         // Extract DCID to route
         let dcid = decode_dcid(data, 8);
 
-        // Try to find existing connection by CID
+        // Try to find an existing connection by CID. Match our own local CIDs
+        // *and* the client's original DCID: until the client has processed a
+        // server packet it keeps addressing us by its own chosen DCID, and a
+        // multi-datagram Initial flight (large ClientHello, e.g. post-quantum
+        // key shares) sends every fragment under it. Without this, fragment 2+
+        // falls through to the new-connection path and bounces off
+        // max_quic_conns.
         if let Some(dcid) = dcid {
             for qconn in &mut self.quic_conns {
-                let matched = qconn.local_cids.iter().any(|cid| cid.as_slice() == dcid);
+                let matched = qconn.local_cids.iter().any(|cid| cid.as_slice() == dcid)
+                    || qconn.original_dcid.as_slice() == dcid;
                 if matched {
                     let mut scratch = [0u8; 2048];
                     qconn
@@ -483,6 +500,11 @@ where
             server,
             peer_addr: from,
             local_cids,
+            original_dcid: dcid.map(ConnectionId::from_slice).unwrap_or_else(|| {
+                // Unreachable for a valid Initial (long headers always carry a
+                // DCID); an empty CID matches nothing.
+                ConnectionId::empty()
+            }),
         });
 
         Ok(())

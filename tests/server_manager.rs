@@ -358,7 +358,8 @@ fn udp_quic_handshake_and_h3_request() {
         &mut pool,
     )
     .unwrap();
-    let mut client = milli_http::h3::client::H3Client::new(client_conn);
+    let mut client: milli_http::h3::client::H3Client<Aes128GcmProvider> =
+        milli_http::h3::client::H3Client::new(client_conn);
 
     let peer_addr: u32 = 42;
     let now = 1_000_000u64;
@@ -939,7 +940,8 @@ fn udp_quic_h3_streaming_response() {
         &mut pool,
     )
     .unwrap();
-    let mut client = milli_http::h3::client::H3Client::new(client_conn);
+    let mut client: milli_http::h3::client::H3Client<Aes128GcmProvider> =
+        milli_http::h3::client::H3Client::new(client_conn);
 
     let peer_addr: u32 = 43;
     let now = 1_000_000u64;
@@ -1101,4 +1103,141 @@ fn udp_quic_h3_streaming_response() {
         }
     }
     assert!(got_fin, "client should observe stream FIN");
+}
+
+#[test]
+fn udp_initial_fragments_route_to_existing_conn() {
+    // A ClientHello large enough to span multiple Initial datagrams (e.g.
+    // post-quantum key shares from real ngtcp2/OpenSSL clients) sends every
+    // fragment under the client-chosen original DCID — the server hasn't
+    // spoken yet, so the client knows no other CID. Each fragment must route
+    // to the connection created by the first one; with max_quic_conns: 1 a
+    // routing miss surfaces as StreamLimitExhausted (observed live as a
+    // handshake that stalls after one ACK).
+    let cert: &'static [u8] = test_cert_der().leak();
+    let server_config = make_h3_server_config(cert);
+    let mut manager: ServerManager<Aes128GcmProvider, u32> = ServerManager::new(
+        Aes128GcmProvider,
+        server_config,
+        ServerConfig {
+            max_quic_conns: 1,
+            ..ServerConfig::default()
+        },
+    );
+    let mut rng = TestRng(0x80);
+    let mut pool: HandshakePool<Aes128GcmProvider, 4> = HandshakePool::new();
+
+    let client_conn: milli_http::Connection<Aes128GcmProvider> = milli_http::Connection::client(
+        Aes128GcmProvider,
+        "test.local",
+        &[b"h3"],
+        TransportParams::default_params(),
+        &mut rng,
+        &mut pool,
+    )
+    .unwrap();
+    let mut client: milli_http::h3::client::H3Client<Aes128GcmProvider> =
+        milli_http::h3::client::H3Client::new(client_conn);
+
+    // First Initial datagram creates the connection.
+    let mut buf = [0u8; 4096];
+    let tx = client
+        .poll_transmit(&mut buf, 1_000_000, &mut pool)
+        .expect("client initial");
+    let initial = tx.data.to_vec();
+    manager
+        .udp_feed::<4096>(&initial, 42, 1_000_000, &mut rng, &mut pool)
+        .expect("first initial accepted");
+
+    // A second datagram under the same (client-chosen) DCID — as fragment 2
+    // of a multi-datagram flight would be — must route to that connection,
+    // not bounce off the connection limit as a new-connection attempt.
+    manager
+        .udp_feed::<4096>(&initial, 42, 1_001_000, &mut rng, &mut pool)
+        .expect("same-DCID datagram must route to the existing connection");
+}
+
+#[test]
+fn udp_quic_handshake_with_small_transmit_buffer() {
+    // The server handshake flight (EE+Cert+CertVerify+Finished) is routinely
+    // larger than one UDP datagram, and embedded drivers drain
+    // `udp_poll_transmit` through MTU-sized buffers. The CRYPTO stream must
+    // split across datagrams — pre-fix, whatever didn't fit the first packet
+    // was pulled out of the TLS engine and silently dropped, stalling the
+    // handshake after one datagram (observed live against curl/ngtcp2).
+    let cert: &'static [u8] = test_cert_der().leak();
+    let server_config = make_h3_server_config(cert);
+    let mut manager: ServerManager<Aes128GcmProvider, u32> =
+        ServerManager::new(Aes128GcmProvider, server_config, ServerConfig::default());
+    let mut rng = TestRng(0x90);
+    let mut pool: HandshakePool<Aes128GcmProvider, 4> = HandshakePool::new();
+
+    let client_conn: milli_http::Connection<Aes128GcmProvider> = milli_http::Connection::client(
+        Aes128GcmProvider,
+        "test.local",
+        &[b"h3"],
+        TransportParams::default_params(),
+        &mut rng,
+        &mut pool,
+    )
+    .unwrap();
+    let mut client: milli_http::h3::client::H3Client<Aes128GcmProvider> =
+        milli_http::h3::client::H3Client::new(client_conn);
+
+    let peer_addr: u32 = 44;
+    let now = 1_000_000u64;
+    let mut scratch = [0u8; 2048];
+
+    let mut client_connected = false;
+    let mut server_connected = false;
+    for _ in 0..30 {
+        // Client -> manager (client flights are small; 4096 is fine)
+        loop {
+            let mut buf = [0u8; 4096];
+            match client.poll_transmit(&mut buf, now, &mut pool) {
+                Some(tx) => {
+                    let data = tx.data.to_vec();
+                    let _ = manager.udp_feed::<4096>(&data, peer_addr, now, &mut rng, &mut pool);
+                }
+                None => break,
+            }
+        }
+        // Manager -> client through an MTU-sized datagram buffer (what an
+        // embedded driver uses): the padded 1200-byte Initial leaves only a
+        // few hundred bytes for the coalesced Handshake packet, forcing the
+        // server flight to fragment across datagrams.
+        loop {
+            let mut buf = [0u8; 1500];
+            match manager.udp_poll_transmit::<4096>(&mut buf, now, &mut pool) {
+                Some((_addr, len)) => {
+                    let data = buf[..len].to_vec();
+                    let mut s = [0u8; 4096];
+                    let _ = client.recv::<4096>(&data, &mut s, now, &mut pool);
+                }
+                None => break,
+            }
+        }
+        while let Some(ev) = manager.poll_event(&mut scratch) {
+            if let ServerEvent::Http {
+                event: HttpEvent::Connected,
+                ..
+            } = ev
+            {
+                server_connected = true;
+            }
+        }
+        while let Some(ev) = client.poll_event(&mut scratch) {
+            if ev == milli_http::h3::H3Event::Connected {
+                client_connected = true;
+            }
+        }
+        if client_connected && server_connected {
+            break;
+        }
+    }
+    assert!(
+        client_connected && server_connected,
+        "handshake must complete when the server flight is drained through \
+         a small transmit buffer (client={client_connected} server={server_connected})"
+    );
 }

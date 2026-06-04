@@ -71,6 +71,12 @@ pub struct ServerRunner<
     pool: &'a mut dyn HandshakePoolAccess<C, CRYPTO_BUF>,
     tcp_conns: Vec<TcpConnState<L::Stream>>,
     pending_udp_tx: Option<PendingUdpTx<A>>,
+    /// Datagrams rejected by `ServerManager::udp_feed` (malformed, conn limit,
+    /// handshake-pool exhaustion, ...). The runner drops them by design;
+    /// embedded drivers can watch this counter to surface silent failures.
+    pub udp_feed_errors: u32,
+    /// Datagrams the transport failed to send (`poll_send_to` returned `Err`).
+    pub udp_send_errors: u32,
 }
 
 impl<
@@ -143,6 +149,8 @@ where
             pool,
             tcp_conns: Vec::new(),
             pending_udp_tx: None,
+            udp_feed_errors: 0,
+            udp_send_errors: 0,
         }
     }
 
@@ -307,13 +315,13 @@ where
             match self.udp_socket.poll_recv_from(cx, &mut udp_buf) {
                 Poll::Ready(Ok((n, addr))) => {
                     udp_reads_done += 1;
-                    let _ = self.manager.udp_feed::<CRYPTO_BUF>(
-                        &udp_buf[..n],
-                        addr,
-                        now,
-                        self.rng,
-                        self.pool,
-                    );
+                    if self
+                        .manager
+                        .udp_feed::<CRYPTO_BUF>(&udp_buf[..n], addr, now, self.rng, self.pool)
+                        .is_err()
+                    {
+                        self.udp_feed_errors = self.udp_feed_errors.wrapping_add(1);
+                    }
                 }
                 _ => break,
             }
@@ -332,6 +340,7 @@ where
                     self.pending_udp_tx = None;
                 }
                 Poll::Ready(Err(_)) => {
+                    self.udp_send_errors = self.udp_send_errors.wrapping_add(1);
                     self.pending_udp_tx = None;
                 }
                 Poll::Pending => {
@@ -340,7 +349,13 @@ where
             }
         }
         if self.pending_udp_tx.is_none() {
-            let mut tx_buf = [0u8; 1500];
+            // RFC 9000 §14: a QUIC endpoint MUST NOT send UDP payloads larger
+            // than 1200 bytes until the path MTU is validated (no PMTUD here).
+            // This also keeps the IPv6 packet (payload + 48 bytes of headers)
+            // under the common 1500-byte link MTU — a larger staging buffer
+            // produces datagrams the network stack cannot emit, which drop
+            // silently after `poll_send_to` accepts them.
+            let mut tx_buf = [0u8; 1200];
             loop {
                 if let Some((addr, len)) =
                     self.manager
@@ -348,7 +363,9 @@ where
                 {
                     match self.udp_socket.poll_send_to(cx, &tx_buf[..len], &addr) {
                         Poll::Ready(Ok(())) => {}
-                        Poll::Ready(Err(_)) => {}
+                        Poll::Ready(Err(_)) => {
+                            self.udp_send_errors = self.udp_send_errors.wrapping_add(1);
+                        }
                         Poll::Pending => {
                             self.pending_udp_tx = Some(PendingUdpTx {
                                 data: tx_buf[..len].to_vec(),
