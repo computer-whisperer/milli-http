@@ -108,6 +108,9 @@ fn main() {
 
     let t0 = std::time::Instant::now();
     let mut rx_buf = [0u8; 1500];
+    // Body bytes accepted only partially by send_body; resumed each loop
+    // iteration once transmits have drained queue space.
+    let mut pending: Option<(milli_http::server::ConnId, u64, Vec<u8>, usize)> = None;
     loop {
         let now = t0.elapsed().as_micros() as u64;
 
@@ -136,6 +139,17 @@ fn main() {
         // step 6: timeouts
         manager.handle_timeouts(now);
 
+        // step 6b: resume a partially-sent body now that transmits drained
+        if let Some((conn, sid, body, offset)) = pending.take() {
+            match manager.send_body(conn, sid, &body[offset..], true) {
+                Ok(n) if offset + n < body.len() => {
+                    pending = Some((conn, sid, body, offset + n));
+                }
+                Ok(_) => println!("[send_body] resumed to completion ({} B)", body.len()),
+                Err(e) => println!("[send_body resume ERR] {e:?}"),
+            }
+        }
+
         // step 7: events
         let mut scratch = [0u8; 2048];
         while let Some(ev) = manager.poll_event(&mut scratch) {
@@ -149,7 +163,11 @@ fn main() {
                     event: HttpEvent::Headers(sid),
                 } => {
                     println!("[event] headers on conn {} stream {sid}", conn.0);
-                    let body = b"hello from manager_h3_server\n";
+                    // 3.4 KB body — the size class of the firmware's gzipped
+                    // dev page, well past the 256 B per-entry stream buffer.
+                    let body: Vec<u8> = (0..3405u32)
+                        .map(|i| b"hello from manager_h3_server\n"[(i % 29) as usize])
+                        .collect();
                     let mut cl = [0u8; 8];
                     let cl_len = {
                         use std::io::Write;
@@ -164,8 +182,13 @@ fn main() {
                     if let Err(e) = manager.send_response(conn, sid, 200, &headers, false) {
                         println!("[send_response ERR] {e:?}");
                     }
-                    if let Err(e) = manager.send_body(conn, sid, body, true) {
-                        println!("[send_body ERR] {e:?}");
+                    match manager.send_body(conn, sid, &body, true) {
+                        Ok(n) if n < body.len() => {
+                            println!("[send_body PARTIAL] {n}/{} B accepted", body.len());
+                            pending = Some((conn, sid, body, n));
+                        }
+                        Ok(_) => {}
+                        Err(e) => println!("[send_body ERR] {e:?}"),
                     }
                 }
                 ServerEvent::Closed(conn) => println!("[event] conn {} closed", conn.0),
