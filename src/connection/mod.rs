@@ -2006,6 +2006,105 @@ mod tests {
             assert!(got_fin, "FIN should arrive with the final bytes");
         }
 
+        /// ACK-only packets must not be recorded as ack-eliciting
+        /// (RFC 9002 §2). When they were, every ACK we sent reset the PTO
+        /// timer — observed on hardware as a lost server flight never being
+        /// retransmitted: each client Initial retransmit elicited an ACK,
+        /// which pushed the PTO deadline past the next check, forever.
+        #[test]
+        fn ack_only_packets_are_not_ack_eliciting() {
+            let mut pool = make_pool();
+            let (mut client, mut c_sio) = make_client(&mut pool);
+            let (mut server, mut s_sio) = make_server(&mut pool);
+            let mut scratch = [0u8; 2048];
+            let now = 1_000_000u64;
+
+            run_handshake_to_completion(
+                &mut client,
+                &mut c_sio,
+                &mut server,
+                &mut s_sio,
+                now,
+                &mut pool,
+            );
+
+            // Drain to quiescence: the helper returns at "established", before
+            // the client's ACK for HANDSHAKE_DONE has flowed back.
+            for _ in 0..5 {
+                let mut any = false;
+                let mut buf = [0u8; 4096];
+                while let Some(tx) =
+                    server.poll_transmit(&mut s_sio.as_io(), &mut buf, now, &mut pool)
+                {
+                    let pkt: heapless::Vec<u8, 4096> = {
+                        let mut v = heapless::Vec::new();
+                        let _ = v.extend_from_slice(tx.data);
+                        v
+                    };
+                    let _ = client.recv(&mut c_sio.as_io(), &pkt, &mut scratch, now, &mut pool);
+                    any = true;
+                }
+                while let Some(tx) =
+                    client.poll_transmit(&mut c_sio.as_io(), &mut buf, now, &mut pool)
+                {
+                    let pkt: heapless::Vec<u8, 4096> = {
+                        let mut v = heapless::Vec::new();
+                        let _ = v.extend_from_slice(tx.data);
+                        v
+                    };
+                    let _ = server.recv(&mut s_sio.as_io(), &pkt, &mut scratch, now, &mut pool);
+                    any = true;
+                }
+                if !any {
+                    break;
+                }
+            }
+
+            // Quiescent baseline: nothing ack-eliciting in flight server-side.
+            assert!(
+                !server
+                    .sent_tracker
+                    .has_ack_eliciting_in_flight(Level::Application),
+                "server should be quiescent after the handshake drains"
+            );
+
+            // Client sends stream data; the server receives it and owes an ACK.
+            let stream_id = client.open_stream().unwrap();
+            client
+                .stream_send(&mut c_sio.as_io(), stream_id, b"ping", false)
+                .unwrap();
+            let mut buf = [0u8; 4096];
+            while let Some(tx) = client.poll_transmit(&mut c_sio.as_io(), &mut buf, now, &mut pool)
+            {
+                let pkt: heapless::Vec<u8, 4096> = {
+                    let mut v = heapless::Vec::new();
+                    let _ = v.extend_from_slice(tx.data);
+                    v
+                };
+                server
+                    .recv(&mut s_sio.as_io(), &pkt, &mut scratch, now, &mut pool)
+                    .unwrap();
+            }
+
+            // The server has nothing of its own to send: this is ACK-only.
+            let tx = server.poll_transmit(&mut s_sio.as_io(), &mut buf, now, &mut pool);
+            assert!(tx.is_some(), "server should send an ACK");
+
+            assert!(
+                !server
+                    .sent_tracker
+                    .has_ack_eliciting_in_flight(Level::Application),
+                "an ACK-only packet must not count as ack-eliciting"
+            );
+            assert!(
+                server
+                    .loss_detector
+                    .pto_timeout(&server.sent_tracker)
+                    .is_none(),
+                "an ACK-only packet must not arm the PTO timer"
+            );
+        }
+
         // -------------------------------------------------------------------
         // PATH_CHALLENGE / PATH_RESPONSE tests (RFC 9000 §8.2.2)
         // -------------------------------------------------------------------

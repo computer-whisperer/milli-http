@@ -1634,15 +1634,28 @@ fn lost_server_flight_is_retransmitted_on_pto() {
         "server should have sent a flight (got {lost} B)"
     );
 
-    // ~1 s later the client retransmits its Initial (as curl does). This
-    // also feeds the server's anti-amplification budget.
-    let t1 = t0 + 1_000_000;
+    // ~1.5 s later the client retransmits its Initial (as curl does). This
+    // also feeds the server's anti-amplification budget. The server answers
+    // with an ACK — drain and deliver it, exactly as the firmware runner
+    // does. The ACK must NOT reset the PTO timer (it is not ack-eliciting);
+    // on hardware that mislabeling postponed the PTO forever, since every
+    // client retransmit elicited another ACK.
+    let t1 = t0 + 1_500_000;
     manager
         .udp_feed::<4096>(&ch_datagram, peer_addr, t1, &mut rng, &mut pool)
         .unwrap();
+    {
+        let mut buf = [0u8; 4096];
+        while let Some((_addr, len)) = manager.udp_poll_transmit::<4096>(&mut buf, t1, &mut pool) {
+            assert!(len < 200, "only an ACK should go out here, got {len} B");
+            let data = buf[..len].to_vec();
+            let mut rx_scratch = [0u8; 4096];
+            let _ = client.recv::<4096>(&data, &mut rx_scratch, t1, &mut pool);
+        }
+    }
 
-    // PTO fires.
-    let t2 = t0 + 2_000_000;
+    // PTO fires (deadline ≈ flight send time + ~1 s).
+    let t2 = t0 + 2_200_000;
     manager.handle_timeouts::<4096>(t2, &mut pool);
 
     // The server must now retransmit its flight; deliver it this time and

@@ -401,16 +401,26 @@ where
         match result {
             Ok(total) => {
                 self.next_pn[idx] = pn + 1;
+                // Only CRYPTO makes this packet ack-eliciting; ACK and
+                // PADDING frames do not (RFC 9002 §2). Recording ACK-only
+                // packets as ack-eliciting would reset the PTO timer on
+                // every ACK we send, so a lost flight would never be probed.
+                let ack_eliciting = has_crypto;
+                let in_flight = ack_eliciting || padding_needed > 0;
                 let _ = self.sent_tracker.on_packet_sent(SentPacket {
                     pn,
                     level,
                     time_sent: now,
                     size: total as u16,
-                    ack_eliciting: true,
-                    in_flight: true,
+                    ack_eliciting,
+                    in_flight,
                 });
-                self.loss_detector.on_ack_eliciting_sent(level, now);
-                self.congestion.on_packet_sent(total as u64);
+                if ack_eliciting {
+                    self.loss_detector.on_ack_eliciting_sent(level, now);
+                }
+                if in_flight {
+                    self.congestion.on_packet_sent(total as u64);
+                }
 
                 // NOTE: RFC 9001 §4.9.1 says a server discards Initial keys
                 // when it first sends a Handshake packet, but that makes a
@@ -513,16 +523,21 @@ where
         ) {
             Ok(total) => {
                 self.next_pn[idx] = pn + 1;
+                // ACK frames are not ack-eliciting (RFC 9002 §2); only the
+                // CRYPTO payload arms the PTO timer.
+                let ack_eliciting = crypto_written > 0;
                 let _ = self.sent_tracker.on_packet_sent(SentPacket {
                     pn,
                     level,
                     time_sent: now,
                     size: total as u16,
-                    ack_eliciting: true,
-                    in_flight: true,
+                    ack_eliciting,
+                    in_flight: ack_eliciting,
                 });
-                self.loss_detector.on_ack_eliciting_sent(level, now);
-                self.congestion.on_packet_sent(total as u64);
+                if ack_eliciting {
+                    self.loss_detector.on_ack_eliciting_sent(level, now);
+                    self.congestion.on_packet_sent(total as u64);
+                }
                 Some(total)
             }
             Err(_) => None,
@@ -558,6 +573,9 @@ where
         // Write frames directly into buf[payload_start..]
         let mut frame_len = 0;
         let mut sending_handshake_done = false;
+        // Everything this builder can write except ACK frames is
+        // ack-eliciting (RFC 9002 §2).
+        let mut ack_eliciting = false;
 
         // HANDSHAKE_DONE (server, once after handshake completes)
         if self.role == crate::tls::handshake::Role::Server
@@ -567,6 +585,7 @@ where
         {
             frame_len += written;
             sending_handshake_done = true;
+            ack_eliciting = true;
         }
 
         // PATH_RESPONSE: echo challenge data back (RFC 9000 §8.2.2)
@@ -574,6 +593,7 @@ where
             let path_resp = Frame::PathResponse(challenge_data);
             if let Ok(written) = frame::encode(&path_resp, &mut buf[payload_start + frame_len..]) {
                 frame_len += written;
+                ack_eliciting = true;
             } else {
                 // Put it back if encoding failed (buffer too small)
                 self.pending_path_response = Some(challenge_data);
@@ -600,6 +620,7 @@ where
         {
             frame_len += written;
             self.flow_control.max_data_sent();
+            ack_eliciting = true;
         }
 
         // Per-stream MAX_STREAM_DATA replenishment. Each emitted frame commits
@@ -613,6 +634,7 @@ where
                 Ok(written) => {
                     frame_len += written;
                     self.streams.mark_max_stream_data_sent(sid);
+                    ack_eliciting = true;
                 }
                 Err(_) => break,
             }
@@ -632,6 +654,9 @@ where
             0
         };
         frame_len += stream_written;
+        if stream_written > 0 {
+            ack_eliciting = true;
+        }
 
         if frame_len == 0 {
             return None;
@@ -685,11 +710,13 @@ where
                     level,
                     time_sent: now,
                     size: total as u16,
-                    ack_eliciting: true,
-                    in_flight: true,
+                    ack_eliciting,
+                    in_flight: ack_eliciting,
                 });
-                self.loss_detector.on_ack_eliciting_sent(level, now);
-                self.congestion.on_packet_sent(total as u64);
+                if ack_eliciting {
+                    self.loss_detector.on_ack_eliciting_sent(level, now);
+                    self.congestion.on_packet_sent(total as u64);
+                }
                 Some(total)
             }
             Err(_) => None,
@@ -984,16 +1011,16 @@ where
         )?;
 
         self.next_pn[idx] = pn + 1;
+        // CONNECTION_CLOSE is not ack-eliciting (RFC 9002 §2), and the
+        // connection is closed immediately after this packet anyway.
         let _ = self.sent_tracker.on_packet_sent(SentPacket {
             pn,
             level,
             time_sent: now,
             size: total_pkt_len as u16,
-            ack_eliciting: true,
-            in_flight: true,
+            ack_eliciting: false,
+            in_flight: false,
         });
-        self.loss_detector.on_ack_eliciting_sent(level, now);
-        self.congestion.on_packet_sent(total_pkt_len as u64);
 
         Ok(total_pkt_len)
     }
@@ -1080,16 +1107,16 @@ where
         if level == Level::Application {
             self.keys.key_update.packets_encrypted += 1;
         }
+        // CONNECTION_CLOSE is not ack-eliciting (RFC 9002 §2), and the
+        // connection is closed immediately after this packet anyway.
         let _ = self.sent_tracker.on_packet_sent(SentPacket {
             pn,
             level,
             time_sent: now,
             size: total_pkt_len as u16,
-            ack_eliciting: true,
-            in_flight: true,
+            ack_eliciting: false,
+            in_flight: false,
         });
-        self.loss_detector.on_ack_eliciting_sent(level, now);
-        self.congestion.on_packet_sent(total_pkt_len as u64);
 
         Ok(total_pkt_len)
     }
