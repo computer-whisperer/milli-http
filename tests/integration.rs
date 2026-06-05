@@ -1099,17 +1099,14 @@ fn post_handshake_round_trip_works() {
     assert_eq!(&buf2[..len2], b"pong");
 }
 
-/// Test 12: Idle timeout -- verify that `handle_timeout` does not
-/// incorrectly close an active connection when no idle timeout is set.
+/// Test 12: Idle timeout -- wired from the negotiated max_idle_timeout
+/// transport parameter (RFC 9000 §10.1, formerly known issue M2).
 ///
-/// NOTE: The current implementation does not wire the `max_idle_timeout`
-/// transport parameter to the internal `idle_timeout` field (known issue
-/// M2). This test documents the current behavior: `handle_timeout` is
-/// safe to call and does not close the connection unless `idle_timeout`
-/// has been explicitly set. When M2 is fixed, this test should be updated
-/// to verify that idle timeout actually closes the connection.
+/// Both default_params() sides advertise 30 s, so the effective idle
+/// timeout is 30 s: the connection survives shorter idle periods and
+/// closes once the timeout elapses with no activity.
 #[test]
-fn idle_timeout_not_set_does_not_close() {
+fn idle_timeout_wired_from_transport_params() {
     let mut pool = make_pool();
     let mut client = make_client(&mut pool);
     let mut server = make_server(&mut pool);
@@ -1136,15 +1133,19 @@ fn idle_timeout_not_set_does_not_close() {
 
     assert!(client.is_established());
 
-    // Advance time far into the future.
-    let future = now + 999_999_999;
-    client.handle_timeout(future);
-
-    // Connection should still be established because idle_timeout is None
-    // (not wired from transport params yet).
+    // Idle for less than the negotiated 30 s: still established.
+    client.handle_timeout(now + 10_000_000);
     assert!(
         client.is_established(),
-        "connection should remain active when idle_timeout is None, state={:?}",
+        "connection should survive idle shorter than the negotiated timeout, state={:?}",
+        client.state()
+    );
+
+    // Idle past the negotiated timeout: closed.
+    client.handle_timeout(now + 31_000_000);
+    assert!(
+        !client.is_established(),
+        "connection should close after the negotiated idle timeout, state={:?}",
         client.state()
     );
 }

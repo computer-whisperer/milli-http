@@ -122,6 +122,11 @@ struct QuicConn<
     /// datagrams (e.g. post-quantum key shares) sends every fragment under it,
     /// so routing must match it in addition to our own `local_cids`.
     original_dcid: ConnectionId,
+    /// When the connection was created (µs), for the handshake deadline. A
+    /// handshake that never completes (e.g. our flight was lost and the
+    /// client gave up) would otherwise pin the conn slot and its handshake
+    /// pool slot forever.
+    created_at: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -505,6 +510,7 @@ where
                 // DCID); an empty CID matches nothing.
                 ConnectionId::empty()
             }),
+            created_at: now,
         });
 
         Ok(())
@@ -585,22 +591,8 @@ where
         self.tcp_conns
             .retain(|c| !matches!(c.state, TcpState::Closed));
 
-        // Clean up closed QUIC connections
-        #[cfg(feature = "h3")]
-        {
-            let mut closed_ids = Vec::new();
-            self.quic_conns.retain(|c| {
-                if c.server.is_closed() {
-                    closed_ids.push(c.id);
-                    false
-                } else {
-                    true
-                }
-            });
-            for id in closed_ids {
-                self.push_server_event(ServerEvent::Closed(id));
-            }
-        }
+        // Closed QUIC connections are reaped in handle_timeouts(), which has
+        // the handshake pool and can release a mid-handshake conn's slot.
 
         self.events.pop_front()
     }
@@ -713,6 +705,12 @@ where
 
         #[cfg(feature = "h3")]
         for qconn in &self.quic_conns {
+            if !qconn.server.is_established() {
+                let deadline = qconn
+                    .created_at
+                    .saturating_add(self.config.handshake_timeout_us);
+                earliest = Some(earliest.map_or(deadline, |e: u64| e.min(deadline)));
+            }
             if let Some(t) = qconn.server.next_timeout() {
                 earliest = Some(earliest.map_or(t, |e: u64| e.min(t)));
             }
@@ -721,9 +719,54 @@ where
         earliest
     }
 
-    /// Handle timeouts on all connections.
+    /// Handle timeouts on all connections, and reap dead QUIC connections.
+    ///
+    /// Takes the handshake pool because a connection closed mid-handshake
+    /// still owns a pool slot (`Connection` has no `Drop` impl); reaping it
+    /// without releasing the slot would leak the pool dry.
+    #[cfg(feature = "h3")]
+    pub fn handle_timeouts<const CRYPTO_BUF: usize>(
+        &mut self,
+        now: u64,
+        pool: &mut dyn crate::connection::HandshakePoolAccess<C, CRYPTO_BUF>,
+    ) {
+        self.handle_tcp_timeouts(now);
+
+        let mut reaped = Vec::new();
+        self.quic_conns.retain_mut(|qconn| {
+            qconn.server.handle_timeout(now);
+
+            // A handshake that hasn't completed by the deadline is dead:
+            // the peer has long stopped retrying. Same deadline as TCP
+            // TLS handshakes.
+            let handshake_expired = !qconn.server.is_established()
+                && now
+                    >= qconn
+                        .created_at
+                        .saturating_add(self.config.handshake_timeout_us);
+
+            if qconn.server.is_closed() || handshake_expired {
+                qconn.server.release_handshake_slot::<CRYPTO_BUF>(pool);
+                reaped.push(qconn.id);
+                false
+            } else {
+                true
+            }
+        });
+        for id in reaped {
+            self.push_server_event(ServerEvent::Closed(id));
+        }
+    }
+
+    /// Handle timeouts on all connections (TCP-only build).
+    #[cfg(not(feature = "h3"))]
     pub fn handle_timeouts(&mut self, now: u64) {
-        // Check handshake timeouts on TCP connections.
+        self.handle_tcp_timeouts(now);
+    }
+
+    /// Expire TCP TLS handshakes past their deadline and drive HTTP-level
+    /// timers on established connections.
+    fn handle_tcp_timeouts(&mut self, now: u64) {
         // Collect timed-out IDs first (can't push events while iterating).
         let mut timed_out = Vec::new();
         for conn in &mut self.tcp_conns {
@@ -746,10 +789,6 @@ where
         }
         for id in timed_out {
             self.push_server_event(ServerEvent::Closed(id));
-        }
-        #[cfg(feature = "h3")]
-        for qconn in &mut self.quic_conns {
-            qconn.server.handle_timeout(now);
         }
     }
 

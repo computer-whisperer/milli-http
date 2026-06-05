@@ -136,6 +136,19 @@ where
             }),
         }
     }
+
+    /// Number of slots currently claimed. Useful for telemetry and for
+    /// verifying that abandoned handshakes release their slots.
+    pub fn slots_in_use(&self) -> usize {
+        #[cfg(not(feature = "alloc"))]
+        {
+            self.slots.iter().filter(|s| s.in_use).count()
+        }
+        #[cfg(feature = "alloc")]
+        {
+            self.slots.iter().filter(|s| s.ctx.is_some()).count()
+        }
+    }
 }
 
 impl<C: CryptoProvider, const N: usize, const CRYPTO_BUF: usize> HandshakePoolAccess<C, CRYPTO_BUF>

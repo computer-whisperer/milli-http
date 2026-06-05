@@ -136,8 +136,8 @@ fn main() {
             let _ = sock.send_to(&tx_buf[..len], addr);
         }
 
-        // step 6: timeouts
-        manager.handle_timeouts(now);
+        // step 6: timeouts (reaps dead QUIC conns + their handshake slots)
+        manager.handle_timeouts::<CRYPTO_BUF>(now, &mut pool);
 
         // step 6b: resume a partially-sent body now that transmits drained
         if let Some((conn, sid, body, offset)) = pending.take() {

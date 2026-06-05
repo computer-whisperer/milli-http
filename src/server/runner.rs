@@ -381,8 +381,9 @@ where
             }
         }
 
-        // 6. Handle timeouts
-        self.manager.handle_timeouts(now);
+        // 6. Handle timeouts (also reaps dead QUIC conns, releasing any
+        //    handshake pool slot they still hold)
+        self.manager.handle_timeouts::<CRYPTO_BUF>(now, self.pool);
 
         // 7. Drain manager events
         let mut scratch = [0u8; 2048];

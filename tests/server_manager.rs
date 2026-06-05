@@ -1419,3 +1419,159 @@ fn udp_quic_h3_large_body_response() {
     assert_eq!(received.len(), body.len(), "body length must match");
     assert_eq!(received, body, "body must arrive intact");
 }
+
+/// Regression: a QUIC handshake that never completes must be reaped at the
+/// handshake deadline, releasing both the conn slot and the handshake pool
+/// slot.
+///
+/// Previously a stalled handshake (e.g. the server flight was dropped by the
+/// network and the client gave up) pinned the conn slot and its handshake
+/// pool slot forever — with max_quic_conns=1 the server silently ignored
+/// every subsequent connection attempt until reboot.
+#[test]
+fn stalled_quic_handshake_is_reaped_and_releases_pool_slot() {
+    let cert: &'static [u8] = test_cert_der().leak();
+    let server_config = make_h3_server_config(cert);
+    let mut manager: ServerManager<Aes128GcmProvider, u32> = ServerManager::new(
+        Aes128GcmProvider,
+        server_config,
+        ServerConfig {
+            max_quic_conns: 1,
+            ..ServerConfig::default()
+        },
+    );
+    let mut rng = TestRng(0xA0);
+    let mut pool: HandshakePool<Aes128GcmProvider, 4> = HandshakePool::new();
+    let now = 1_000_000u64;
+
+    // Client sends its Initial flight; the manager processes it (claiming a
+    // handshake slot) but its response is never delivered, so the handshake
+    // can never complete.
+    let mut client_conn: milli_http::Connection<Aes128GcmProvider> =
+        milli_http::Connection::client(
+            Aes128GcmProvider,
+            "test.local",
+            &[b"h3"],
+            TransportParams::default_params(),
+            &mut rng,
+            &mut pool,
+        )
+        .unwrap();
+    let mut sio = milli_http::connection::io::QuicStreamIoBufs::<32, 1024, 16>::new();
+    let mut buf = [0u8; 4096];
+    while let Some(tx) = client_conn.poll_transmit(&mut sio.as_io(), &mut buf, now, &mut pool) {
+        let data = tx.data.to_vec();
+        manager
+            .udp_feed::<4096>(&data, 7u32, now, &mut rng, &mut pool)
+            .unwrap();
+    }
+    assert_eq!(pool.slots_in_use(), 2, "client + stalled server handshake");
+
+    // Before the deadline: the conn stays.
+    manager.handle_timeouts::<4096>(now + 1_000_000, &mut pool);
+    assert_eq!(pool.slots_in_use(), 2);
+
+    // Past the deadline (default 10 s): reaped, slot released, Closed emitted.
+    manager.handle_timeouts::<4096>(now + 10_000_001, &mut pool);
+    assert_eq!(pool.slots_in_use(), 1, "server handshake slot released");
+    let mut scratch = [0u8; 2048];
+    let mut got_closed = false;
+    while let Some(ev) = manager.poll_event(&mut scratch) {
+        if matches!(ev, ServerEvent::Closed(_)) {
+            got_closed = true;
+        }
+    }
+    assert!(got_closed, "reaped conn should emit Closed");
+
+    // The conn slot is free again: a new connection attempt is accepted
+    // rather than bouncing off max_quic_conns.
+    let mut client2: milli_http::Connection<Aes128GcmProvider> = milli_http::Connection::client(
+        Aes128GcmProvider,
+        "test.local",
+        &[b"h3"],
+        TransportParams::default_params(),
+        &mut rng,
+        &mut pool,
+    )
+    .unwrap();
+    let mut sio2 = milli_http::connection::io::QuicStreamIoBufs::<32, 1024, 16>::new();
+    let later = now + 11_000_000;
+    while let Some(tx) = client2.poll_transmit(&mut sio2.as_io(), &mut buf, later, &mut pool) {
+        let data = tx.data.to_vec();
+        manager
+            .udp_feed::<4096>(&data, 8u32, later, &mut rng, &mut pool)
+            .expect("new connection must be accepted after reaping");
+    }
+}
+
+/// Regression: an established QUIC connection whose peer disappears without
+/// a CONNECTION_CLOSE must be reaped by the idle timeout (RFC 9000 §10.1).
+///
+/// Previously `idle_timeout` was never wired from the negotiated
+/// max_idle_timeout transport params, so abandoned connections lived forever.
+#[test]
+fn idle_quic_connection_is_reaped() {
+    let cert: &'static [u8] = test_cert_der().leak();
+    let server_config = make_h3_server_config(cert);
+    let mut manager: ServerManager<Aes128GcmProvider, u32> =
+        ServerManager::new(Aes128GcmProvider, server_config, ServerConfig::default());
+    let mut rng = TestRng(0xB0);
+    let mut pool: HandshakePool<Aes128GcmProvider, 4> = HandshakePool::new();
+
+    let client_conn: milli_http::Connection<Aes128GcmProvider> = milli_http::Connection::client(
+        Aes128GcmProvider,
+        "test.local",
+        &[b"h3"],
+        TransportParams::default_params(),
+        &mut rng,
+        &mut pool,
+    )
+    .unwrap();
+    let mut client: milli_http::h3::client::H3Client<Aes128GcmProvider> =
+        milli_http::h3::client::H3Client::new(client_conn);
+
+    let peer_addr: u32 = 9;
+    let now = 1_000_000u64;
+    let mut scratch = [0u8; 2048];
+
+    // Complete the handshake.
+    let mut conn_id = None;
+    for _ in 0..20 {
+        exchange_udp(
+            &mut client,
+            &mut manager,
+            peer_addr,
+            now,
+            &mut rng,
+            &mut pool,
+        );
+        while let Some(ev) = manager.poll_event(&mut scratch) {
+            if let ServerEvent::Http {
+                conn,
+                event: HttpEvent::Connected,
+            } = ev
+            {
+                conn_id = Some(conn);
+            }
+        }
+        while let Some(_) = client.poll_event(&mut scratch) {}
+        if conn_id.is_some() {
+            break;
+        }
+    }
+    let conn_id = conn_id.expect("handshake should complete");
+
+    // Idle for less than the negotiated 30 s: conn stays.
+    manager.handle_timeouts::<4096>(now + 10_000_000, &mut pool);
+    assert!(!manager.is_closed(conn_id));
+
+    // Idle past it: reaped with a Closed event.
+    manager.handle_timeouts::<4096>(now + 31_000_000, &mut pool);
+    let mut got_closed = false;
+    while let Some(ev) = manager.poll_event(&mut scratch) {
+        if matches!(ev, ServerEvent::Closed(id) if id == conn_id) {
+            got_closed = true;
+        }
+    }
+    assert!(got_closed, "idle conn should be reaped with Closed event");
+}

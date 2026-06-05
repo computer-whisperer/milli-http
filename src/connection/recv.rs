@@ -998,6 +998,23 @@ where
                     .handle_max_streams(true, peer_params.initial_max_streams_bidi);
                 self.flow_control
                     .handle_max_streams(false, peer_params.initial_max_streams_uni);
+
+                // RFC 9000 §10.1: the effective idle timeout is the minimum
+                // of the two advertised non-zero max_idle_timeout values
+                // (0 = that endpoint imposes no timeout). Params carry
+                // milliseconds; connection timers run on microseconds.
+                let effective_ms = match (
+                    self.local_params.max_idle_timeout,
+                    peer_params.max_idle_timeout,
+                ) {
+                    (0, p) => p,
+                    (l, 0) => l,
+                    (l, p) => l.min(p),
+                };
+                if effective_ms != 0 {
+                    self.idle_timeout = Some(effective_ms.saturating_mul(1000));
+                }
+
                 self.peer_params = Some(peer_params.clone());
             }
         }
