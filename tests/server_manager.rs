@@ -1575,3 +1575,123 @@ fn idle_quic_connection_is_reaped() {
     }
     assert!(got_closed, "idle conn should be reaped with Closed event");
 }
+
+/// Regression: a lost server flight must be retransmitted on PTO.
+///
+/// This replays the field failure: the server's Initial+Handshake flight is
+/// dropped by the network (on hardware, a neighbor-cache miss ate it), while
+/// the client keeps retransmitting its Initial. Previously the server never
+/// re-sent CRYPTO data — one lost flight deadlocked the handshake forever.
+#[test]
+fn lost_server_flight_is_retransmitted_on_pto() {
+    let cert: &'static [u8] = test_cert_der().leak();
+    let server_config = make_h3_server_config(cert);
+    let mut manager: ServerManager<Aes128GcmProvider, u32> =
+        ServerManager::new(Aes128GcmProvider, server_config, ServerConfig::default());
+    let mut rng = TestRng(0xC0);
+    let mut pool: HandshakePool<Aes128GcmProvider, 4> = HandshakePool::new();
+
+    let client_conn: milli_http::Connection<Aes128GcmProvider> = milli_http::Connection::client(
+        Aes128GcmProvider,
+        "test.local",
+        &[b"h3"],
+        TransportParams::default_params(),
+        &mut rng,
+        &mut pool,
+    )
+    .unwrap();
+    let mut client: milli_http::h3::client::H3Client<Aes128GcmProvider> =
+        milli_http::h3::client::H3Client::new(client_conn);
+
+    let peer_addr: u32 = 13;
+    let t0 = 1_000_000u64;
+    let mut scratch = [0u8; 4096];
+
+    // Client sends its Initial; the manager processes it and queues its
+    // flight.
+    let mut ch_datagram = Vec::new();
+    {
+        let mut buf = [0u8; 4096];
+        while let Some(tx) = client.poll_transmit(&mut buf, t0, &mut pool) {
+            ch_datagram = tx.data.to_vec();
+            manager
+                .udp_feed::<4096>(&ch_datagram, peer_addr, t0, &mut rng, &mut pool)
+                .unwrap();
+        }
+    }
+    assert!(!ch_datagram.is_empty());
+
+    // The server's flight is LOST: drain its transmits into the void.
+    let mut lost = 0;
+    {
+        let mut buf = [0u8; 4096];
+        while let Some((_addr, len)) = manager.udp_poll_transmit::<4096>(&mut buf, t0, &mut pool) {
+            lost += len;
+        }
+    }
+    assert!(
+        lost > 1000,
+        "server should have sent a flight (got {lost} B)"
+    );
+
+    // ~1 s later the client retransmits its Initial (as curl does). This
+    // also feeds the server's anti-amplification budget.
+    let t1 = t0 + 1_000_000;
+    manager
+        .udp_feed::<4096>(&ch_datagram, peer_addr, t1, &mut rng, &mut pool)
+        .unwrap();
+
+    // PTO fires.
+    let t2 = t0 + 2_000_000;
+    manager.handle_timeouts::<4096>(t2, &mut pool);
+
+    // The server must now retransmit its flight; deliver it this time and
+    // run the exchange to completion.
+    let mut client_connected = false;
+    let mut server_connected = false;
+    for _ in 0..20 {
+        let mut retransmitted = 0;
+        {
+            let mut buf = [0u8; 4096];
+            while let Some((_addr, len)) =
+                manager.udp_poll_transmit::<4096>(&mut buf, t2, &mut pool)
+            {
+                retransmitted += len;
+                let data = buf[..len].to_vec();
+                let mut rx_scratch = [0u8; 4096];
+                let _ = client.recv::<4096>(&data, &mut rx_scratch, t2, &mut pool);
+            }
+        }
+        {
+            let mut buf = [0u8; 4096];
+            while let Some(tx) = client.poll_transmit(&mut buf, t2, &mut pool) {
+                let data = tx.data.to_vec();
+                let _ = manager.udp_feed::<4096>(&data, peer_addr, t2, &mut rng, &mut pool);
+            }
+        }
+        while let Some(ev) = manager.poll_event(&mut scratch) {
+            if let ServerEvent::Http {
+                event: HttpEvent::Connected,
+                ..
+            } = ev
+            {
+                server_connected = true;
+            }
+        }
+        while let Some(ev) = client.poll_event(&mut scratch) {
+            if ev == milli_http::h3::H3Event::Connected {
+                client_connected = true;
+            }
+        }
+        if client_connected && server_connected {
+            break;
+        }
+        let _ = retransmitted;
+    }
+
+    assert!(
+        client_connected && server_connected,
+        "handshake must complete after the lost flight is retransmitted on PTO \
+         (client={client_connected} server={server_connected})"
+    );
+}

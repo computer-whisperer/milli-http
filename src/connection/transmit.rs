@@ -116,6 +116,18 @@ where
             }
         }
 
+        // PTO fired during the handshake: rewind the CRYPTO send offsets so
+        // unacknowledged flights are rebuilt below. Levels whose keys have
+        // been dropped no longer transmit, and the peer discards duplicate
+        // CRYPTO ranges, so rewinding everything still retained is safe.
+        if self.crypto_rewind_pending {
+            self.crypto_rewind_pending = false;
+            if let Some(slot) = self.handshake_slot {
+                let ctx = pool.get_mut(slot);
+                ctx.crypto_send_offset = [0; 3];
+            }
+        }
+
         let mut total_written = 0;
 
         // Try to send at each level, coalescing into one datagram.
@@ -400,14 +412,14 @@ where
                 self.loss_detector.on_ack_eliciting_sent(level, now);
                 self.congestion.on_packet_sent(total as u64);
 
-                // Server: drop Initial keys once Handshake keys are installed
-                if self.role == crate::tls::handshake::Role::Server
-                    && self.keys.has_send_keys(Level::Handshake)
-                {
-                    self.keys.drop_initial();
-                    self.sent_tracker.drop_space(Level::Initial);
-                    self.loss_detector.drop_space(Level::Initial);
-                }
+                // NOTE: RFC 9001 §4.9.1 says a server discards Initial keys
+                // when it first sends a Handshake packet, but that makes a
+                // lost ServerHello unrecoverable — it could never be
+                // retransmitted and the handshake would deadlock. We instead
+                // drop Initial keys when the first Handshake-level packet is
+                // *received* (see recv.rs), which proves the client has the
+                // ServerHello. Initial keys are derived from public values,
+                // so retaining them costs nothing security-wise.
                 Some(total)
             }
             Err(_) => None,
@@ -770,20 +782,27 @@ where
 
         // Stage TLS engine output into the per-level pending buffers. The
         // engine hands out each flight exactly once (write_handshake consumes
-        // it), so everything goes through `pending_crypto` and anything that
-        // doesn't fit the current packet is retained for the next one — a
-        // server flight can be several times larger than one datagram (e.g.
-        // EE+Cert+CertVerify+Finished vs a 1200-byte UDP payload).
+        // it), so everything goes through `pending_crypto`. The buffer
+        // retains the level's entire CRYPTO stream (index == stream offset)
+        // until the handshake slot is released: anything past
+        // `crypto_send_offset` is unsent, and a PTO rewinds the offset to 0
+        // to retransmit a lost flight (see `crypto_rewind_pending`).
         {
             let ctx = pool.get_mut(slot);
-            if ctx.pending_crypto[tidx].is_empty() {
+            let sent = ctx.crypto_send_offset[tidx] as usize;
+            if sent == ctx.pending_crypto[tidx].len() {
                 let mut tls_buf = [0u8; 2048];
                 if let Ok((tls_len, tls_level)) = ctx.tls.write_handshake(&mut tls_buf) {
                     if tls_len > 0 {
                         let lidx = level_index(tls_level);
-                        // Append (never clobber): the buffer may still hold an
-                        // unsent remainder of this level's CRYPTO stream.
-                        let _ = ctx.pending_crypto[lidx].extend_from_slice(&tls_buf[..tls_len]);
+                        // Append (never clobber): the buffer holds the whole
+                        // level stream for retransmission.
+                        let appended =
+                            ctx.pending_crypto[lidx].extend_from_slice(&tls_buf[..tls_len]);
+                        debug_assert!(
+                            appended.is_ok(),
+                            "per-level CRYPTO stream exceeds retention buffer"
+                        );
                         ctx.pending_crypto_level[lidx] = tls_level;
                     }
                 }
@@ -791,11 +810,13 @@ where
         }
 
         let ctx = pool.get_mut(slot);
-        if ctx.pending_crypto[tidx].is_empty() {
+        let offset = ctx.crypto_send_offset[tidx];
+        let unsent = ctx.pending_crypto[tidx].len() - offset as usize;
+        if unsent == 0 {
             return 0;
         }
 
-        // Send as large a prefix as fits in `buf`; keep the rest pending.
+        // Send as large a prefix of the unsent region as fits in `buf`.
         // Worst-case CRYPTO frame overhead — 1 (type) + 8 (offset varint) +
         // 8 (length varint) — plus headroom for the packet's 16-byte AEAD tag,
         // which the caller appends after the frames.
@@ -803,30 +824,23 @@ where
         if buf.len() <= FRAME_OVERHEAD {
             return 0;
         }
-        let send_len = (buf.len() - FRAME_OVERHEAD).min(ctx.pending_crypto[tidx].len());
-        let offset = ctx.crypto_send_offset[tidx];
+        let send_len = (buf.len() - FRAME_OVERHEAD).min(unsent);
         #[cfg(feature = "std")]
         eprintln!(
-            "[debug] sending CRYPTO {:?} offset={} len={} (pending {})",
-            target_level,
-            offset,
-            send_len,
-            ctx.pending_crypto[tidx].len(),
+            "[debug] sending CRYPTO {:?} offset={} len={} (unsent {})",
+            target_level, offset, send_len, unsent,
         );
         let encode_result = {
+            let start = offset as usize;
             let crypto = Frame::Crypto(CryptoFrame {
                 offset,
-                data: &ctx.pending_crypto[tidx][..send_len],
+                data: &ctx.pending_crypto[tidx][start..start + send_len],
             });
             frame::encode(&crypto, buf)
         };
         match encode_result {
             Ok(written) => {
                 let ctx = pool.get_mut(slot);
-                let pending = &mut ctx.pending_crypto[tidx];
-                let remaining = pending.len() - send_len;
-                pending.copy_within(send_len.., 0);
-                pending.truncate(remaining);
                 ctx.crypto_send_offset[tidx] += send_len as u64;
                 written
             }

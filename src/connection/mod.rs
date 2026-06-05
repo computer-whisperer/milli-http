@@ -400,6 +400,13 @@ pub struct Connection<
     pub(crate) idle_timeout: Option<u64>,
     pub(crate) last_activity: Instant,
 
+    /// Set when a PTO fires during the handshake: the next `poll_transmit`
+    /// rewinds the CRYPTO send offsets to 0 so unacknowledged handshake
+    /// flights are retransmitted (a lost server flight is otherwise fatal —
+    /// the client cannot make progress and never acknowledges anything).
+    /// Duplicate CRYPTO data is harmless: the peer reassembles by offset.
+    pub(crate) crypto_rewind_pending: bool,
+
     // Server needs to send HANDSHAKE_DONE
     pub(crate) need_handshake_done: bool,
 
@@ -512,6 +519,7 @@ where
             close_frame: None,
             idle_timeout: None,
             last_activity: 0,
+            crypto_rewind_pending: false,
             need_handshake_done: false,
             pending_path_response: None,
             anti_amplification_bytes_received: 0,
@@ -583,6 +591,7 @@ where
             close_frame: None,
             idle_timeout: None,
             last_activity: 0,
+            crypto_rewind_pending: false,
             need_handshake_done: true,
             pending_path_response: None,
             anti_amplification_bytes_received: 0,
@@ -605,11 +614,9 @@ where
         if matches!(self.state, ConnectionState::Closed) {
             return None;
         }
-        // Draining connections need a drain timer.
+        // Draining connections need a drain timer (3x PTO, §10.2.1).
         if matches!(self.state, ConnectionState::Draining) {
-            return self
-                .idle_timeout
-                .map(|idle| self.last_activity.saturating_add(idle));
+            return Some(self.last_activity.saturating_add(self.drain_period()));
         }
         let mut earliest = self.loss_detector.next_timeout(&self.sent_tracker);
         // Also consider idle timeout for active connections.
@@ -620,18 +627,18 @@ where
         earliest
     }
 
+    /// Drain period per RFC 9000 §10.2.1: three times the PTO. Using the
+    /// (much longer) idle timeout here would pin the connection slot for
+    /// tens of seconds after the peer already closed.
+    fn drain_period(&self) -> u64 {
+        3 * self.loss_detector.pto_duration()
+    }
+
     /// Handle a timer expiration.
     pub fn handle_timeout(&mut self, now: Instant) {
-        // Draining connections transition to Closed after idle timeout.
-        // Per RFC 9000 §10.2.1, the drain period should be at least 3x PTO.
-        // We reuse the idle timeout which is a conservative upper bound.
+        // Draining connections transition to Closed after the drain period.
         if matches!(self.state, ConnectionState::Draining) {
-            if let Some(idle) = self.idle_timeout {
-                if now.saturating_sub(self.last_activity) >= idle {
-                    self.state = ConnectionState::Closed;
-                }
-            } else {
-                // No idle timeout configured — close immediately.
+            if now.saturating_sub(self.last_activity) >= self.drain_period() {
                 self.state = ConnectionState::Closed;
             }
             return;
@@ -649,8 +656,20 @@ where
             return;
         }
 
-        // PTO expired
-        self.loss_detector.on_pto();
+        // PTO: act only when the loss-detector deadline has actually
+        // passed (this method is also called for idle-timeout polling).
+        if let Some(deadline) = self.loss_detector.next_timeout(&self.sent_tracker)
+            && now >= deadline
+        {
+            self.loss_detector.on_pto();
+            // Handshake data may have been lost. Rewind the CRYPTO send
+            // offsets so the next poll_transmit retransmits unacked flights;
+            // without this a lost server flight deadlocks the handshake
+            // (the client retransmits its Initial but we never re-send ours).
+            if self.handshake_slot.is_some() {
+                self.crypto_rewind_pending = true;
+            }
+        }
     }
 
     /// Open a new bidirectional stream.

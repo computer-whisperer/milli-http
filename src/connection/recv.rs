@@ -422,6 +422,20 @@ where
             now,
             pool,
         )?;
+
+        // Server: a Handshake-level packet from the client proves it has the
+        // ServerHello, so the Initial space is done. (We deliberately defer
+        // this past RFC 9001 §4.9.1's "on first Handshake packet sent" —
+        // dropping then would make a lost ServerHello unretransmittable and
+        // deadlock the handshake.)
+        if self.role == crate::tls::handshake::Role::Server
+            && self.keys.has_send_keys(Level::Initial)
+        {
+            self.keys.drop_initial();
+            self.sent_tracker.drop_space(Level::Initial);
+            self.loss_detector.drop_space(Level::Initial);
+        }
+
         Ok(PacketResult {
             ack_eliciting,
             level,
