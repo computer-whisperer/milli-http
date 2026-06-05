@@ -179,32 +179,30 @@ where
         //    listener per cycle to avoid starving established connections).
         //    The TLS listener's connections handshake; the cleartext listener's
         //    start as plaintext HTTP/1.1. Both feed the same manager.
-        if let Some(listener) = self.tls_listener.as_mut() {
-            if let Poll::Ready(Ok(stream)) = listener.poll_accept(cx) {
-                if let Ok(id) = self.manager.accept_tcp(self.rng, now) {
-                    self.tcp_conns.push(TcpConnState {
-                        id,
-                        stream,
-                        pending_write: Vec::new(),
-                        write_offset: 0,
-                        eof: false,
-                    });
-                }
-            }
+        if let Some(listener) = self.tls_listener.as_mut()
+            && let Poll::Ready(Ok(stream)) = listener.poll_accept(cx)
+            && let Ok(id) = self.manager.accept_tcp(self.rng, now)
+        {
+            self.tcp_conns.push(TcpConnState {
+                id,
+                stream,
+                pending_write: Vec::new(),
+                write_offset: 0,
+                eof: false,
+            });
         }
         #[cfg(feature = "http1")]
-        if let Some(listener) = self.cleartext_listener.as_mut() {
-            if let Poll::Ready(Ok(stream)) = listener.poll_accept(cx) {
-                if let Ok(id) = self.manager.accept_tcp_cleartext(now) {
-                    self.tcp_conns.push(TcpConnState {
-                        id,
-                        stream,
-                        pending_write: Vec::new(),
-                        write_offset: 0,
-                        eof: false,
-                    });
-                }
-            }
+        if let Some(listener) = self.cleartext_listener.as_mut()
+            && let Poll::Ready(Ok(stream)) = listener.poll_accept(cx)
+            && let Ok(id) = self.manager.accept_tcp_cleartext(now)
+        {
+            self.tcp_conns.push(TcpConnState {
+                id,
+                stream,
+                pending_write: Vec::new(),
+                write_offset: 0,
+                eof: false,
+            });
         }
 
         // 2. Read existing TCP streams + handle EOF (bounded per connection).
@@ -364,27 +362,23 @@ where
             // produces datagrams the network stack cannot emit, which drop
             // silently after `poll_send_to` accepts them.
             let mut tx_buf = [0u8; 1200];
-            loop {
-                if let Some((addr, len)) =
-                    self.manager
-                        .udp_poll_transmit::<CRYPTO_BUF>(&mut tx_buf, now, self.pool)
-                {
-                    match self.udp_socket.poll_send_to(cx, &tx_buf[..len], &addr) {
-                        Poll::Ready(Ok(())) => {}
-                        Poll::Ready(Err(_)) => {
-                            self.udp_send_errors = self.udp_send_errors.wrapping_add(1);
-                        }
-                        Poll::Pending => {
-                            self.pending_udp_tx = Some(PendingUdpTx {
-                                data: tx_buf[..len].to_vec(),
-                                addr,
-                            });
-                            has_pending_output = true;
-                            break;
-                        }
+            while let Some((addr, len)) =
+                self.manager
+                    .udp_poll_transmit::<CRYPTO_BUF>(&mut tx_buf, now, self.pool)
+            {
+                match self.udp_socket.poll_send_to(cx, &tx_buf[..len], &addr) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(_)) => {
+                        self.udp_send_errors = self.udp_send_errors.wrapping_add(1);
                     }
-                } else {
-                    break;
+                    Poll::Pending => {
+                        self.pending_udp_tx = Some(PendingUdpTx {
+                            data: tx_buf[..len].to_vec(),
+                            addr,
+                        });
+                        has_pending_output = true;
+                        break;
+                    }
                 }
             }
         }

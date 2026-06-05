@@ -109,11 +109,9 @@ where
         // RFC 9001 §6.6: automatic key update before AEAD confidentiality limit.
         // If the key update fails, we must not continue sending with exhausted keys.
         #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
-        if self.keys.needs_key_update() {
-            if self.keys.perform_key_update(&self.crypto).is_err() {
-                self.state = ConnectionState::Closed;
-                return None;
-            }
+        if self.keys.needs_key_update() && self.keys.perform_key_update(&self.crypto).is_err() {
+            self.state = ConnectionState::Closed;
+            return None;
         }
 
         // PTO fired during the handshake: rewind the CRYPTO send offsets so
@@ -819,19 +817,18 @@ where
             let sent = ctx.crypto_send_offset[tidx] as usize;
             if sent == ctx.pending_crypto[tidx].len() {
                 let mut tls_buf = [0u8; 2048];
-                if let Ok((tls_len, tls_level)) = ctx.tls.write_handshake(&mut tls_buf) {
-                    if tls_len > 0 {
-                        let lidx = level_index(tls_level);
-                        // Append (never clobber): the buffer holds the whole
-                        // level stream for retransmission.
-                        let appended =
-                            ctx.pending_crypto[lidx].extend_from_slice(&tls_buf[..tls_len]);
-                        debug_assert!(
-                            appended.is_ok(),
-                            "per-level CRYPTO stream exceeds retention buffer"
-                        );
-                        ctx.pending_crypto_level[lidx] = tls_level;
-                    }
+                if let Ok((tls_len, tls_level)) = ctx.tls.write_handshake(&mut tls_buf)
+                    && tls_len > 0
+                {
+                    let lidx = level_index(tls_level);
+                    // Append (never clobber): the buffer holds the whole
+                    // level stream for retransmission.
+                    let appended = ctx.pending_crypto[lidx].extend_from_slice(&tls_buf[..tls_len]);
+                    debug_assert!(
+                        appended.is_ok(),
+                        "per-level CRYPTO stream exceeds retention buffer"
+                    );
+                    ctx.pending_crypto_level[lidx] = tls_level;
                 }
             }
         }
