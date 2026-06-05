@@ -1708,3 +1708,67 @@ fn lost_server_flight_is_retransmitted_on_pto() {
          (client={client_connected} server={server_connected})"
     );
 }
+
+/// Regression: a new connection attempt that bounces off max_quic_conns
+/// must first reap an expired predecessor inline, without waiting for a
+/// handle_timeouts call.
+///
+/// An idle server only wakes on traffic, so after a conn dies there may be
+/// no wakeup until the next client Initial — previously that very Initial
+/// was refused (slot "occupied"), costing the client a full retransmit
+/// timeout before its retry found the freed slot.
+#[test]
+fn new_connection_reaps_expired_predecessor_inline() {
+    let cert: &'static [u8] = test_cert_der().leak();
+    let server_config = make_h3_server_config(cert);
+    let mut manager: ServerManager<Aes128GcmProvider, u32> = ServerManager::new(
+        Aes128GcmProvider,
+        server_config,
+        ServerConfig {
+            max_quic_conns: 1,
+            ..ServerConfig::default()
+        },
+    );
+    let mut rng = TestRng(0xD0);
+    let mut pool: HandshakePool<Aes128GcmProvider, 4> = HandshakePool::new();
+    let t0 = 1_000_000u64;
+
+    // First client stalls mid-handshake (its flight is never answered).
+    let mut client1: milli_http::Connection<Aes128GcmProvider> = milli_http::Connection::client(
+        Aes128GcmProvider,
+        "test.local",
+        &[b"h3"],
+        TransportParams::default_params(),
+        &mut rng,
+        &mut pool,
+    )
+    .unwrap();
+    let mut sio1 = milli_http::connection::io::QuicStreamIoBufs::<32, 1024, 16>::new();
+    let mut buf = [0u8; 4096];
+    while let Some(tx) = client1.poll_transmit(&mut sio1.as_io(), &mut buf, t0, &mut pool) {
+        let data = tx.data.to_vec();
+        manager
+            .udp_feed::<4096>(&data, 21u32, t0, &mut rng, &mut pool)
+            .unwrap();
+    }
+
+    // 11 s later (past the 10 s handshake deadline) a second client knocks.
+    // No handle_timeouts has run — udp_feed itself must reap and accept.
+    let t1 = t0 + 11_000_000;
+    let mut client2: milli_http::Connection<Aes128GcmProvider> = milli_http::Connection::client(
+        Aes128GcmProvider,
+        "test.local",
+        &[b"h3"],
+        TransportParams::default_params(),
+        &mut rng,
+        &mut pool,
+    )
+    .unwrap();
+    let mut sio2 = milli_http::connection::io::QuicStreamIoBufs::<32, 1024, 16>::new();
+    while let Some(tx) = client2.poll_transmit(&mut sio2.as_io(), &mut buf, t1, &mut pool) {
+        let data = tx.data.to_vec();
+        manager
+            .udp_feed::<4096>(&data, 22u32, t1, &mut rng, &mut pool)
+            .expect("udp_feed must reap the expired conn and accept the new one");
+    }
+}

@@ -330,7 +330,15 @@ where
             has_pending_output = true; // budget exhausted, may have more datagrams
         }
 
-        // 5. Write pending UDP transmits.
+        // 5. Handle timeouts BEFORE draining transmits: an expired PTO sets a
+        //    CRYPTO-rewind flag that the next packet build acts on, so this
+        //    ordering retransmits a lost flight in the same wake instead of
+        //    waiting for the next one (which, on an idle link, only comes
+        //    when the peer probes again). Also reaps dead QUIC conns,
+        //    releasing any handshake pool slot they still hold.
+        self.manager.handle_timeouts::<CRYPTO_BUF>(now, self.pool);
+
+        // 6. Write pending UDP transmits.
         if let Some(pending) = &self.pending_udp_tx {
             match self
                 .udp_socket
@@ -380,10 +388,6 @@ where
                 }
             }
         }
-
-        // 6. Handle timeouts (also reaps dead QUIC conns, releasing any
-        //    handshake pool slot they still hold)
-        self.manager.handle_timeouts::<CRYPTO_BUF>(now, self.pool);
 
         // 7. Drain manager events
         let mut scratch = [0u8; 2048];

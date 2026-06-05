@@ -466,7 +466,14 @@ where
             }
         }
 
-        // New connection: create QUIC server + H3
+        // New connection: create QUIC server + H3. At capacity, first reap
+        // any conn that has already expired — on an otherwise idle server
+        // nothing has called handle_timeouts since the predecessor died, and
+        // bouncing this Initial would cost the client a full retransmit
+        // timeout before its retry finds the freed slot.
+        if self.quic_conns.len() >= self.config.max_quic_conns {
+            self.reap_quic_conns::<CRYPTO_BUF>(now, pool);
+        }
         if self.quic_conns.len() >= self.config.max_quic_conns {
             return Err(Error::StreamLimitExhausted);
         }
@@ -731,7 +738,24 @@ where
         pool: &mut dyn crate::connection::HandshakePoolAccess<C, CRYPTO_BUF>,
     ) {
         self.handle_tcp_timeouts(now);
+        self.reap_quic_conns::<CRYPTO_BUF>(now, pool);
+    }
 
+    /// Drive QUIC connection timers and remove dead connections, releasing
+    /// any handshake pool slot a mid-handshake conn still owns.
+    ///
+    /// Called from `handle_timeouts` each poll cycle, and from `udp_feed`
+    /// when a new connection bounces off `max_quic_conns` — the predecessor
+    /// may have expired long ago with no wakeup since (an idle server only
+    /// wakes on traffic), and the very datagram being refused is what would
+    /// have triggered the reap one step later.
+    #[cfg(feature = "h3")]
+    fn reap_quic_conns<const CRYPTO_BUF: usize>(
+        &mut self,
+        now: u64,
+        pool: &mut dyn crate::connection::HandshakePoolAccess<C, CRYPTO_BUF>,
+    ) {
+        let handshake_timeout_us = self.config.handshake_timeout_us;
         let mut reaped = Vec::new();
         self.quic_conns.retain_mut(|qconn| {
             qconn.server.handle_timeout(now);
@@ -740,10 +764,7 @@ where
             // the peer has long stopped retrying. Same deadline as TCP
             // TLS handshakes.
             let handshake_expired = !qconn.server.is_established()
-                && now
-                    >= qconn
-                        .created_at
-                        .saturating_add(self.config.handshake_timeout_us);
+                && now >= qconn.created_at.saturating_add(handshake_timeout_us);
 
             if qconn.server.is_closed() || handshake_expired {
                 qconn.server.release_handshake_slot::<CRYPTO_BUF>(pool);
