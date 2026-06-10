@@ -242,6 +242,15 @@ where
             let hdr = record::decode_record_header(&io.recv_buf[..RECORD_HEADER_LEN])?;
             let total = RECORD_HEADER_LEN + hdr.length as usize;
 
+            // A record larger than the receive buffer can never be assembled —
+            // fail fast instead of waiting forever for bytes that will be
+            // rejected by `feed_data`'s capacity check. (Should not happen once
+            // BUF holds a full 16 KiB record, but turns a misconfigured BUF
+            // from a silent hang into a clean connection error.)
+            if total > BUF {
+                return Err(Error::BufferTooSmall { needed: total });
+            }
+
             if io.recv_buf.len() < total {
                 return Ok(());
             }

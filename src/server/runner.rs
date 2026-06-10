@@ -224,7 +224,14 @@ where
                     Poll::Ready(Ok(n)) => {
                         reads_done += 1;
                         if self.manager.tcp_feed(conn.id, &tcp_buf[..n], now).is_err() {
+                            // Reap the connection like the EOF/read-error arms
+                            // do. Without tcp_eof the manager-side conn stays
+                            // Established forever: no Closed event, the TcpSlot
+                            // is never freed, and the peer just hangs (no GOAWAY
+                            // /alert is emitted on a buffer error). That wedged
+                            // the single TLS slot until reboot.
                             conn.eof = true;
+                            self.manager.tcp_eof(conn.id);
                             break;
                         }
                     }

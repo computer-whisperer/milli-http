@@ -694,6 +694,14 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                 return Err(Error::Http2(crate::error::H2Error::FrameSizeError));
             }
 
+            // A frame that cannot fit the receive buffer can never be assembled.
+            // With the advertised MAX_FRAME_SIZE floor of 16384 this requires
+            // BUF >= ~16393; fail fast rather than waiting forever for bytes
+            // `feed_data` will reject.
+            if total > BUF {
+                return Err(Error::Http2(crate::error::H2Error::FrameSizeError));
+            }
+
             if io.recv_buf.len() < total {
                 break;
             }
