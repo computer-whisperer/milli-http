@@ -31,6 +31,12 @@ pub struct H2Stream<const HDRBUF: usize = 2048, const DATABUF: usize = 4096> {
     pub data_available: bool,
     pub fin_received: bool,
     pub fin_sent: bool,
+    /// Receive-window credit (bytes consumed via `recv_body`) that could not
+    /// be sent yet because the send buffer was full. The WINDOW_UPDATE is
+    /// retried from `generate_output`; `recv_window` is only raised once the
+    /// frame is actually queued, so the advertised window never desyncs from
+    /// what the peer has been told.
+    pub pending_recv_credit: u32,
 }
 
 impl<const HDRBUF: usize, const DATABUF: usize> H2Stream<HDRBUF, DATABUF> {
@@ -46,6 +52,7 @@ impl<const HDRBUF: usize, const DATABUF: usize> H2Stream<HDRBUF, DATABUF> {
             data_available: false,
             fin_received: false,
             fin_sent: false,
+            pending_recv_credit: 0,
         }
     }
 
