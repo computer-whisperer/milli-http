@@ -512,6 +512,13 @@ where
 
         self.negotiated_alpn = parsed.alpn;
         self.peer_transport_params = parsed.transport_params;
+        // RFC 8446 §4.2: a server may only send record_size_limit in reply to
+        // our offer; an unsolicited one is a protocol violation. (Also keeps
+        // the QUIC path clean — RFC 9001 forbids the extension there, and a
+        // QUIC client never offers it.)
+        if parsed.record_size_limit.is_some() && self.local_record_size_limit.is_none() {
+            return Err(Error::Tls);
+        }
         self.peer_record_size_limit = parsed.record_size_limit;
 
         self.state = HandshakeState::WaitCertificate;
