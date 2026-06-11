@@ -81,3 +81,45 @@ pub trait UdpSocket {
         addr: &Self::Addr,
     ) -> Poll<Result<(), Self::Error>>;
 }
+
+/// A [`UdpSocket`] that never receives and discards sends.
+///
+/// TCP-only server builds (`h3` feature disabled) still name a UDP socket type
+/// in the server runner's generics; this zero-sized placeholder is the
+/// canonical choice. The runner never polls UDP when `h3` is off, so neither
+/// method is reached in practice.
+pub struct NoUdp<A>(core::marker::PhantomData<A>);
+
+impl<A> NoUdp<A> {
+    pub const fn new() -> Self {
+        Self(core::marker::PhantomData)
+    }
+}
+
+impl<A> Default for NoUdp<A> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<A: Address> UdpSocket for NoUdp<A> {
+    type Addr = A;
+    type Error = core::convert::Infallible;
+
+    fn poll_recv_from(
+        &mut self,
+        _cx: &mut Context<'_>,
+        _buf: &mut [u8],
+    ) -> Poll<Result<(usize, Self::Addr), Self::Error>> {
+        Poll::Pending
+    }
+
+    fn poll_send_to(
+        &mut self,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+        _addr: &Self::Addr,
+    ) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}

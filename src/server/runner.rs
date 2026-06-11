@@ -9,6 +9,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::task::{Context, Poll};
 
+#[cfg(feature = "h3")]
 use crate::connection::HandshakePoolAccess;
 use crate::crypto::CryptoProvider;
 use crate::transport::{Address, Rng, TcpAccept, TcpStream, UdpSocket};
@@ -28,6 +29,7 @@ struct TcpConnState<S> {
 }
 
 /// Pending UDP transmit that couldn't be sent due to backpressure.
+#[cfg(feature = "h3")]
 struct PendingUdpTx<A> {
     data: Vec<u8>,
     addr: A,
@@ -35,8 +37,10 @@ struct PendingUdpTx<A> {
 
 /// Async I/O wrapper around [`ServerManager`].
 ///
-/// Drives TCP accept, TCP read/write, and UDP recv/send, forwarding
-/// everything through the pure-logic manager.
+/// Drives TCP accept, TCP read/write, and (with the `h3` feature) UDP
+/// recv/send, forwarding everything through the pure-logic manager. Without
+/// `h3` the runner is TCP-only: name [`NoUdp`](crate::transport::NoUdp) as the
+/// `U` type parameter.
 pub struct ServerRunner<
     'a,
     C,
@@ -66,17 +70,25 @@ pub struct ServerRunner<
     /// Cleartext listener. Accepted connections start as plaintext HTTP/1.1.
     #[cfg_attr(not(feature = "http1"), allow(dead_code))]
     cleartext_listener: Option<&'a mut L>,
+    #[cfg(feature = "h3")]
     udp_socket: &'a mut U,
     rng: &'a mut R,
+    #[cfg(feature = "h3")]
     pool: &'a mut dyn HandshakePoolAccess<C, CRYPTO_BUF>,
     tcp_conns: Vec<TcpConnState<L::Stream>>,
+    #[cfg(feature = "h3")]
     pending_udp_tx: Option<PendingUdpTx<A>>,
     /// Datagrams rejected by `ServerManager::udp_feed` (malformed, conn limit,
     /// handshake-pool exhaustion, ...). The runner drops them by design;
     /// embedded drivers can watch this counter to surface silent failures.
+    /// Always 0 without the `h3` feature.
     pub udp_feed_errors: u32,
     /// Datagrams the transport failed to send (`poll_send_to` returned `Err`).
+    /// Always 0 without the `h3` feature.
     pub udp_send_errors: u32,
+    /// Binds the otherwise-unused `U` parameter in TCP-only builds.
+    #[cfg(not(feature = "h3"))]
+    _udp: core::marker::PhantomData<U>,
 }
 
 impl<
@@ -123,6 +135,7 @@ where
     /// pass both for standard dual HTTP/HTTPS (e.g. port 80 cleartext + 443
     /// TLS), or just one for single-mode operation. Both feed the same manager
     /// and event stream.
+    #[cfg(feature = "h3")]
     pub fn new(
         manager: ServerManager<
             C,
@@ -154,9 +167,46 @@ where
         }
     }
 
+    /// Create a new TCP-only server runner (`h3` feature disabled — no UDP
+    /// socket or QUIC handshake pool). `U` is unconstrained by any argument;
+    /// name [`NoUdp`](crate::transport::NoUdp) via a type annotation.
+    ///
+    /// `tls_listener` and `cleartext_listener` are independent and optional:
+    /// pass both for standard dual HTTP/HTTPS (e.g. port 80 cleartext + 443
+    /// TLS), or just one for single-mode operation. Both feed the same manager
+    /// and event stream.
+    #[cfg(not(feature = "h3"))]
+    pub fn new(
+        manager: ServerManager<
+            C,
+            A,
+            BUF,
+            MAX_STREAMS,
+            SENT_PER_SPACE,
+            MAX_CIDS,
+            STREAM_BUF,
+            SEND_QUEUE,
+        >,
+        tls_listener: Option<&'a mut L>,
+        cleartext_listener: Option<&'a mut L>,
+        rng: &'a mut R,
+    ) -> Self {
+        Self {
+            manager,
+            tls_listener,
+            cleartext_listener,
+            rng,
+            tcp_conns: Vec::new(),
+            udp_feed_errors: 0,
+            udp_send_errors: 0,
+            _udp: core::marker::PhantomData,
+        }
+    }
+
     /// Maximum reads per TCP connection per poll cycle to avoid starvation.
     const MAX_READS_PER_CONN: usize = 4;
     /// Maximum UDP datagrams to process per poll cycle.
+    #[cfg(feature = "h3")]
     const MAX_UDP_READS: usize = 8;
     /// Maximum pending write buffer per TCP connection. Matches BUF to stay
     /// consistent with TLS record sizes. Once hit, we stop pulling from the
@@ -330,25 +380,28 @@ where
 
         // 4. Read UDP datagrams (bounded).
         //    If budget exhausted, self-wake to avoid missed waker.
-        let mut udp_buf = [0u8; 1500];
-        let mut udp_reads_done = 0u32;
-        for _ in 0..Self::MAX_UDP_READS {
-            match self.udp_socket.poll_recv_from(cx, &mut udp_buf) {
-                Poll::Ready(Ok((n, addr))) => {
-                    udp_reads_done += 1;
-                    if self
-                        .manager
-                        .udp_feed::<CRYPTO_BUF>(&udp_buf[..n], addr, now, self.rng, self.pool)
-                        .is_err()
-                    {
-                        self.udp_feed_errors = self.udp_feed_errors.wrapping_add(1);
+        #[cfg(feature = "h3")]
+        {
+            let mut udp_buf = [0u8; 1500];
+            let mut udp_reads_done = 0u32;
+            for _ in 0..Self::MAX_UDP_READS {
+                match self.udp_socket.poll_recv_from(cx, &mut udp_buf) {
+                    Poll::Ready(Ok((n, addr))) => {
+                        udp_reads_done += 1;
+                        if self
+                            .manager
+                            .udp_feed::<CRYPTO_BUF>(&udp_buf[..n], addr, now, self.rng, self.pool)
+                            .is_err()
+                        {
+                            self.udp_feed_errors = self.udp_feed_errors.wrapping_add(1);
+                        }
                     }
+                    _ => break,
                 }
-                _ => break,
             }
-        }
-        if udp_reads_done as usize >= Self::MAX_UDP_READS {
-            has_pending_output = true; // budget exhausted, may have more datagrams
+            if udp_reads_done as usize >= Self::MAX_UDP_READS {
+                has_pending_output = true; // budget exhausted, may have more datagrams
+            }
         }
 
         // 5. Handle timeouts BEFORE draining transmits: an expired PTO sets a
@@ -357,50 +410,56 @@ where
         //    waiting for the next one (which, on an idle link, only comes
         //    when the peer probes again). Also reaps dead QUIC conns,
         //    releasing any handshake pool slot they still hold.
+        #[cfg(feature = "h3")]
         self.manager.handle_timeouts::<CRYPTO_BUF>(now, self.pool);
+        #[cfg(not(feature = "h3"))]
+        self.manager.handle_timeouts(now);
 
         // 6. Write pending UDP transmits.
-        if let Some(pending) = &self.pending_udp_tx {
-            match self
-                .udp_socket
-                .poll_send_to(cx, &pending.data, &pending.addr)
-            {
-                Poll::Ready(Ok(())) => {
-                    self.pending_udp_tx = None;
-                }
-                Poll::Ready(Err(_)) => {
-                    self.udp_send_errors = self.udp_send_errors.wrapping_add(1);
-                    self.pending_udp_tx = None;
-                }
-                Poll::Pending => {
-                    has_pending_output = true;
-                }
-            }
-        }
-        if self.pending_udp_tx.is_none() {
-            // RFC 9000 §14: a QUIC endpoint MUST NOT send UDP payloads larger
-            // than 1200 bytes until the path MTU is validated (no PMTUD here).
-            // This also keeps the IPv6 packet (payload + 48 bytes of headers)
-            // under the common 1500-byte link MTU — a larger staging buffer
-            // produces datagrams the network stack cannot emit, which drop
-            // silently after `poll_send_to` accepts them.
-            let mut tx_buf = [0u8; 1200];
-            while let Some((addr, len)) =
-                self.manager
-                    .udp_poll_transmit::<CRYPTO_BUF>(&mut tx_buf, now, self.pool)
-            {
-                match self.udp_socket.poll_send_to(cx, &tx_buf[..len], &addr) {
-                    Poll::Ready(Ok(())) => {}
+        #[cfg(feature = "h3")]
+        {
+            if let Some(pending) = &self.pending_udp_tx {
+                match self
+                    .udp_socket
+                    .poll_send_to(cx, &pending.data, &pending.addr)
+                {
+                    Poll::Ready(Ok(())) => {
+                        self.pending_udp_tx = None;
+                    }
                     Poll::Ready(Err(_)) => {
                         self.udp_send_errors = self.udp_send_errors.wrapping_add(1);
+                        self.pending_udp_tx = None;
                     }
                     Poll::Pending => {
-                        self.pending_udp_tx = Some(PendingUdpTx {
-                            data: tx_buf[..len].to_vec(),
-                            addr,
-                        });
                         has_pending_output = true;
-                        break;
+                    }
+                }
+            }
+            if self.pending_udp_tx.is_none() {
+                // RFC 9000 §14: a QUIC endpoint MUST NOT send UDP payloads larger
+                // than 1200 bytes until the path MTU is validated (no PMTUD here).
+                // This also keeps the IPv6 packet (payload + 48 bytes of headers)
+                // under the common 1500-byte link MTU — a larger staging buffer
+                // produces datagrams the network stack cannot emit, which drop
+                // silently after `poll_send_to` accepts them.
+                let mut tx_buf = [0u8; 1200];
+                while let Some((addr, len)) =
+                    self.manager
+                        .udp_poll_transmit::<CRYPTO_BUF>(&mut tx_buf, now, self.pool)
+                {
+                    match self.udp_socket.poll_send_to(cx, &tx_buf[..len], &addr) {
+                        Poll::Ready(Ok(())) => {}
+                        Poll::Ready(Err(_)) => {
+                            self.udp_send_errors = self.udp_send_errors.wrapping_add(1);
+                        }
+                        Poll::Pending => {
+                            self.pending_udp_tx = Some(PendingUdpTx {
+                                data: tx_buf[..len].to_vec(),
+                                addr,
+                            });
+                            has_pending_output = true;
+                            break;
+                        }
                     }
                 }
             }
