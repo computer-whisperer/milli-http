@@ -537,6 +537,14 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
 
         if stream.data_buf.is_empty() {
             if stream.fin_received {
+                // The body is fully drained. Clear `data_available` so the
+                // Closed-stream retain in `process_recv` can reap this slot —
+                // a body terminated by an empty END_STREAM DATA frame (the
+                // normal curl/nghttp2 streaming-upload ending) sets
+                // `data_available` on completion but leaves nothing for the
+                // copy path below to clear, so without this the slot leaked
+                // and `MAX_STREAMS` requests wedged a persistent connection.
+                stream.data_available = false;
                 return Ok((0, true));
             }
             return Err(Error::WouldBlock);
@@ -2231,6 +2239,74 @@ mod tests {
             "entire body delivered across backpressured pumps"
         );
         assert!(!server.has_partial_data(), "frame fully consumed");
+    }
+
+    #[test]
+    fn stream_slot_reaped_after_empty_end_stream_data_frame() {
+        // Regression: a body terminated by an empty END_STREAM DATA frame (the
+        // standard curl/nghttp2/browser streaming-upload ending) sets
+        // `data_available` on pump completion, but recv_body's empty-buffer
+        // early return never cleared it — so the Closed-stream retain kept the
+        // slot forever and MAX_STREAMS requests wedged a persistent connection.
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<16384>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<16384>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+
+        let stream_id = client
+            .open_stream(
+                &mut cio.as_io(),
+                &[
+                    (b":method", b"POST"),
+                    (b":path", b"/upload"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"example.com"),
+                ],
+                false,
+            )
+            .unwrap();
+        // Deliver the body and drain it FULLY before the fin frame arrives:
+        // the copy path clears `data_available`, so the empty END_STREAM frame
+        // below re-sets it with nothing left for the copy path to clear — the
+        // (0, true) early return is then the only place it can be cleared.
+        client
+            .send_data(&mut cio.as_io(), stream_id, b"body bytes", false)
+            .unwrap();
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
+        while server.poll_event().is_some() {}
+        let mut buf = [0u8; 64];
+        loop {
+            match server.recv_body(&mut sio.as_io(), stream_id, &mut buf) {
+                Ok((0, _)) | Err(Error::WouldBlock) => break,
+                Ok((_, _)) => {}
+                Err(e) => panic!("recv_body: {e:?}"),
+            }
+        }
+
+        // Now the empty DATA frame carrying only END_STREAM.
+        client
+            .send_data(&mut cio.as_io(), stream_id, &[], true)
+            .unwrap();
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
+        while server.poll_event().is_some() {}
+
+        // End of stream surfaces via the empty-buffer early return.
+        let got = server.recv_body(&mut sio.as_io(), stream_id, &mut buf);
+        assert_eq!(got, Ok((0, true)), "server should observe end of stream");
+
+        // Respond and close our side -> stream state Closed.
+        server
+            .send_headers(&mut sio.as_io(), stream_id, &[(b":status", b"200")], true)
+            .unwrap();
+        exchange(&mut server, &mut sio, &mut client, &mut cio);
+
+        // Any subsequent receive processing runs the Closed-stream retain.
+        server.feed_data(&mut sio.as_io(), &[]).unwrap();
+        assert!(
+            server.streams.is_empty(),
+            "drained Closed stream must be reaped, not leak its slot"
+        );
     }
 
     // ====== Item 3: RST_STREAM Reception ======
