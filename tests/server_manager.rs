@@ -581,6 +581,122 @@ fn close_tcp_connection() {
     assert!(got_closed, "manager should emit Closed event");
 }
 
+/// The `'static` buffer kit lent to a TLS connection is reclaimed on teardown
+/// and reused by the next connection — the large I/O buffers live in donated
+/// `.bss`, never the heap, and survive across connections. This is the
+/// fragmentation-avoiding fix for memory-tight targets (TLS_SLOTS = 1): one
+/// kit suffices because it is recycled.
+#[test]
+fn tls_buffer_kit_is_reclaimed_and_reused() {
+    use milli_http::tcp_tls::TlsBufKit;
+
+    const BUF: usize = 32768;
+    // Leak three `'static mut` slices (>= BUF) to form one kit. Record the
+    // net_recv pointer so we can prove the SAME region is handed to conn 2.
+    fn leak_slice() -> &'static mut [u8] {
+        Vec::leak(vec![0u8; BUF])
+    }
+    let net_recv = leak_slice();
+    let net_recv_ptr = net_recv.as_ptr();
+    let kit = TlsBufKit {
+        net_recv,
+        net_send: leak_slice(),
+        app_send: leak_slice(),
+    };
+
+    let cert: &'static [u8] = test_cert_der().leak();
+    let server_config = make_server_config(cert);
+    let mut manager: ServerManager<Aes128GcmProvider, (), BUF> =
+        ServerManager::new(Aes128GcmProvider, server_config, ServerConfig::default());
+    manager.add_tls_buffer_kit(kit);
+    assert_eq!(manager.free_tls_buffer_kits(), 1, "kit donated");
+
+    let mut rng = TestRng(0x70);
+
+    // Drive one full TLS+H2 handshake on a connection built from the kit.
+    let run_handshake = |manager: &mut ServerManager<Aes128GcmProvider, (), BUF>,
+                         conn_id: milli_http::server::ConnId| {
+        let client_config = TlsConfig {
+            server_name: heapless::String::try_from("test.local").unwrap(),
+            alpn_protocols: &[b"h2"],
+            transport_params: TransportParams::default_params(),
+            pinned_certs: &[],
+        };
+        let mut client = milli_http::h2_tls::H2TlsClient::<Aes128GcmProvider, BUF>::new(
+            Aes128GcmProvider,
+            client_config,
+            [0xCC; 32],
+            [0xDD; 32],
+        );
+        for _ in 0..20 {
+            let mut buf = [0u8; BUF];
+            let mut progress = false;
+            while let Some(data) = client.poll_output(&mut buf) {
+                let copy = data.to_vec();
+                manager.tcp_feed(conn_id, &copy, 1_000_000).unwrap();
+                progress = true;
+            }
+            let mut buf2 = [0u8; BUF];
+            while let Some(data) = manager.tcp_poll_output(conn_id, &mut buf2) {
+                let copy = data.to_vec();
+                client.feed_data(&copy).unwrap();
+                progress = true;
+            }
+            if !progress {
+                break;
+            }
+        }
+        assert!(client.is_established(), "H2 client should establish");
+    };
+
+    // Connection 1: pops the kit (free pool empties).
+    let conn1 = manager.accept_tcp(&mut rng, 0).unwrap();
+    assert_eq!(
+        manager.free_tls_buffer_kits(),
+        0,
+        "kit lent to conn 1 on accept"
+    );
+    run_handshake(&mut manager, conn1);
+
+    let mut scratch = [0u8; 2048];
+    while manager.poll_event(&mut scratch).is_some() {} // drain Connected
+
+    // Tear conn 1 down (peer EOF) — the reclaim funnel must return the kit.
+    manager.tcp_eof(conn1);
+    while manager.poll_event(&mut scratch).is_some() {} // drain Closed + retain
+    assert_eq!(
+        manager.free_tls_buffer_kits(),
+        1,
+        "kit reclaimed on teardown, not leaked"
+    );
+
+    // Connection 2: must reuse the SAME kit, not heap-allocate.
+    let conn2 = manager.accept_tcp(&mut rng, 0).unwrap();
+    assert_eq!(
+        manager.free_tls_buffer_kits(),
+        0,
+        "conn 2 reused the reclaimed kit (free pool empty again)"
+    );
+    run_handshake(&mut manager, conn2);
+
+    // Prove it is the very same `.bss` region: tear conn 2 down, reclaim, and
+    // check the net_recv slice pointer matches the one we donated.
+    while manager.poll_event(&mut scratch).is_some() {}
+    manager.tcp_eof(conn2);
+    while manager.poll_event(&mut scratch).is_some() {}
+    assert_eq!(
+        manager.free_tls_buffer_kits(),
+        1,
+        "kit reclaimed after conn 2"
+    );
+    let reclaimed = manager.take_tls_buffer_kit().expect("kit available");
+    assert_eq!(
+        reclaimed.net_recv.as_ptr(),
+        net_recv_ptr,
+        "the reused kit is the same donated `.bss` region"
+    );
+}
+
 #[test]
 fn unknown_connection_returns_error() {
     let cert: &'static [u8] = test_cert_der().leak();

@@ -1,7 +1,8 @@
 //! HTTP/2 over TLS 1.3 composed connection with shared buffers.
 //!
-//! Same buffer-sharing pattern as [`https1`](crate::https1): four buffers
-//! instead of six, with TLS `app_recv`/`app_send` shared with H2 `recv`/`send`.
+//! Same buffer-sharing pattern as [`https1`](crate::https1): three buffers
+//! instead of six. TLS decrypts records in place, so H2 parses frames straight
+//! out of `net_recv`'s plaintext prefix; `app_send` is shared with H2 `send`.
 
 use crate::buf::Buf;
 use crate::crypto::CryptoProvider;
@@ -24,7 +25,6 @@ pub struct H2TlsClient<
     h2: H2Connection<MAX_STREAMS, HDRBUF, DATABUF>,
     net_recv: Buf<BUF>,
     net_send: Buf<BUF>,
-    app_recv: Buf<BUF>,
     app_send: Buf<BUF>,
 }
 
@@ -45,7 +45,6 @@ where
             h2: H2Connection::new_client(),
             net_recv: Buf::new(),
             net_send: Buf::new(),
-            app_recv: Buf::new(),
             app_send: Buf::new(),
         }
     }
@@ -56,16 +55,15 @@ where
             let mut tls_io: TlsIo<'_, BUF> = TlsIo {
                 recv_buf: &mut self.net_recv,
                 send_buf: &mut self.net_send,
-                app_recv_buf: &mut self.app_recv,
                 app_send_buf: &mut self.app_send,
             };
             self.tls.feed_data(&mut tls_io, data)?;
         }
 
         // Feed decrypted plaintext to H2
-        if !self.app_recv.is_empty() {
+        if !self.net_recv.is_empty() {
             let mut h2_io: H2Io<'_, BUF> = H2Io {
-                recv_buf: &mut self.app_recv,
+                recv_buf: &mut self.net_recv,
                 send_buf: &mut self.app_send,
             };
             self.h2.feed_data(&mut h2_io, &[])?;
@@ -85,7 +83,7 @@ where
         // to drain the buffer — TLS will consume it via flush_app_send.
         {
             let mut h2_io: H2Io<'_, BUF> = H2Io {
-                recv_buf: &mut self.app_recv,
+                recv_buf: &mut self.net_recv,
                 send_buf: &mut self.app_send,
             };
             self.h2.generate_output(&mut h2_io);
@@ -95,7 +93,6 @@ where
         let mut tls_io: TlsIo<'_, BUF> = TlsIo {
             recv_buf: &mut self.net_recv,
             send_buf: &mut self.net_send,
-            app_recv_buf: &mut self.app_recv,
             app_send_buf: &mut self.app_send,
         };
         self.tls.poll_output(&mut tls_io, buf)
@@ -141,7 +138,7 @@ where
             let _ = headers.push((name, value));
         }
         let mut h2_io: H2Io<'_, BUF> = H2Io {
-            recv_buf: &mut self.app_recv,
+            recv_buf: &mut self.net_recv,
             send_buf: &mut self.app_send,
         };
         self.h2.open_stream(&mut h2_io, &headers, end_stream)
@@ -155,7 +152,7 @@ where
         end_stream: bool,
     ) -> Result<usize, Error> {
         let mut h2_io: H2Io<'_, BUF> = H2Io {
-            recv_buf: &mut self.app_recv,
+            recv_buf: &mut self.net_recv,
             send_buf: &mut self.app_send,
         };
         self.h2.send_data(&mut h2_io, stream_id, data, end_stream)
@@ -173,7 +170,7 @@ where
     /// Read response body.
     pub fn recv_body(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
         let mut h2_io: H2Io<'_, BUF> = H2Io {
-            recv_buf: &mut self.app_recv,
+            recv_buf: &mut self.net_recv,
             send_buf: &mut self.app_send,
         };
         self.h2.recv_body(&mut h2_io, stream_id, buf)
@@ -192,7 +189,7 @@ where
     /// Check timeouts and emit events if they fire.
     pub fn handle_timeout(&mut self, now: u64) {
         let mut h2_io: H2Io<'_, BUF> = H2Io {
-            recv_buf: &mut self.app_recv,
+            recv_buf: &mut self.net_recv,
             send_buf: &mut self.app_send,
         };
         self.h2.handle_timeout(&mut h2_io, now);
@@ -204,15 +201,14 @@ where
             let mut tls_io: TlsIo<'_, BUF> = TlsIo {
                 recv_buf: &mut self.net_recv,
                 send_buf: &mut self.net_send,
-                app_recv_buf: &mut self.app_recv,
                 app_send_buf: &mut self.app_send,
             };
             self.tls.feed_data(&mut tls_io, data)?;
         }
 
-        if !self.app_recv.is_empty() {
+        if !self.net_recv.is_empty() {
             let mut h2_io: H2Io<'_, BUF> = H2Io {
-                recv_buf: &mut self.app_recv,
+                recv_buf: &mut self.net_recv,
                 send_buf: &mut self.app_send,
             };
             self.h2.feed_data_timed(&mut h2_io, &[], now)?;
@@ -231,7 +227,6 @@ where
         let mut tls_io: TlsIo<'_, BUF> = TlsIo {
             recv_buf: &mut self.net_recv,
             send_buf: &mut self.net_send,
-            app_recv_buf: &mut self.app_recv,
             app_send_buf: &mut self.app_send,
         };
         self.tls.close(&mut tls_io)
@@ -244,13 +239,22 @@ pub struct H2TlsServer<
     const BUF: usize = 18432,
     const MAX_STREAMS: usize = 8,
     const HDRBUF: usize = 2048,
+    // Per-stream body buffer. DATA frames are consumed incrementally (see
+    // H2Connection::process_recv / pump_partial_data), so this need NOT hold a
+    // whole max-size (16384) frame: the pump fills it, stops, and the runner
+    // applies TCP backpressure (see HttpServerConn::recv_blocked) until the
+    // consumer drains via recv_body. Keeping it small (4 KB) bounds per-stream
+    // heap — a full-size data_buf was the allocation that OOM'd a memory-tight
+    // h2 upload. The advertised stream receive window equals DATABUF, so the
+    // peer is paced to our drain rate once it has processed our SETTINGS; a
+    // legal pre-SETTINGS-ack burst (RFC 9113 §6.9.2) is absorbed by the same
+    // backpressure rather than rejected.
     const DATABUF: usize = 4096,
 > {
     tls: TlsConnection<C>,
     h2: H2Connection<MAX_STREAMS, HDRBUF, DATABUF>,
     net_recv: Buf<BUF>,
     net_send: Buf<BUF>,
-    app_recv: Buf<BUF>,
     app_send: Buf<BUF>,
 }
 
@@ -271,7 +275,6 @@ where
             h2: H2Connection::new_server(),
             net_recv: Buf::new(),
             net_send: Buf::new(),
-            app_recv: Buf::new(),
             app_send: Buf::new(),
         }
     }
@@ -284,7 +287,6 @@ where
             h2: H2Connection::new_server(),
             net_recv: parts.net_recv,
             net_send: parts.net_send,
-            app_recv: parts.app_recv,
             app_send: parts.app_send,
         }
     }
@@ -295,15 +297,14 @@ where
             let mut tls_io: TlsIo<'_, BUF> = TlsIo {
                 recv_buf: &mut self.net_recv,
                 send_buf: &mut self.net_send,
-                app_recv_buf: &mut self.app_recv,
                 app_send_buf: &mut self.app_send,
             };
             self.tls.feed_data(&mut tls_io, data)?;
         }
 
-        if !self.app_recv.is_empty() {
+        if !self.net_recv.is_empty() {
             let mut h2_io: H2Io<'_, BUF> = H2Io {
-                recv_buf: &mut self.app_recv,
+                recv_buf: &mut self.net_recv,
                 send_buf: &mut self.app_send,
             };
             self.h2.feed_data(&mut h2_io, &[])?;
@@ -316,7 +317,7 @@ where
     pub fn poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
         {
             let mut h2_io: H2Io<'_, BUF> = H2Io {
-                recv_buf: &mut self.app_recv,
+                recv_buf: &mut self.net_recv,
                 send_buf: &mut self.app_send,
             };
             self.h2.generate_output(&mut h2_io);
@@ -325,7 +326,6 @@ where
         let mut tls_io: TlsIo<'_, BUF> = TlsIo {
             recv_buf: &mut self.net_recv,
             send_buf: &mut self.net_send,
-            app_recv_buf: &mut self.app_recv,
             app_send_buf: &mut self.app_send,
         };
         self.tls.poll_output(&mut tls_io, buf)
@@ -358,7 +358,7 @@ where
     /// Read request body.
     pub fn recv_body(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<(usize, bool), Error> {
         let mut h2_io: H2Io<'_, BUF> = H2Io {
-            recv_buf: &mut self.app_recv,
+            recv_buf: &mut self.net_recv,
             send_buf: &mut self.app_send,
         };
         self.h2.recv_body(&mut h2_io, stream_id, buf)
@@ -383,7 +383,7 @@ where
             let _ = all_headers.push((name, value));
         }
         let mut h2_io: H2Io<'_, BUF> = H2Io {
-            recv_buf: &mut self.app_recv,
+            recv_buf: &mut self.net_recv,
             send_buf: &mut self.app_send,
         };
         self.h2
@@ -398,7 +398,7 @@ where
         end_stream: bool,
     ) -> Result<usize, Error> {
         let mut h2_io: H2Io<'_, BUF> = H2Io {
-            recv_buf: &mut self.app_recv,
+            recv_buf: &mut self.net_recv,
             send_buf: &mut self.app_send,
         };
         self.h2.send_data(&mut h2_io, stream_id, data, end_stream)
@@ -417,7 +417,7 @@ where
     /// Check timeouts and emit events if they fire.
     pub fn handle_timeout(&mut self, now: u64) {
         let mut h2_io: H2Io<'_, BUF> = H2Io {
-            recv_buf: &mut self.app_recv,
+            recv_buf: &mut self.net_recv,
             send_buf: &mut self.app_send,
         };
         self.h2.handle_timeout(&mut h2_io, now);
@@ -429,15 +429,14 @@ where
             let mut tls_io: TlsIo<'_, BUF> = TlsIo {
                 recv_buf: &mut self.net_recv,
                 send_buf: &mut self.net_send,
-                app_recv_buf: &mut self.app_recv,
                 app_send_buf: &mut self.app_send,
             };
             self.tls.feed_data(&mut tls_io, data)?;
         }
 
-        if !self.app_recv.is_empty() {
+        if !self.net_recv.is_empty() {
             let mut h2_io: H2Io<'_, BUF> = H2Io {
-                recv_buf: &mut self.app_recv,
+                recv_buf: &mut self.net_recv,
                 send_buf: &mut self.app_send,
             };
             self.h2.feed_data_timed(&mut h2_io, &[], now)?;
@@ -449,7 +448,7 @@ where
     /// Send GOAWAY.
     pub fn send_goaway(&mut self, error_code: u32) -> Result<(), Error> {
         let mut h2_io: H2Io<'_, BUF> = H2Io {
-            recv_buf: &mut self.app_recv,
+            recv_buf: &mut self.net_recv,
             send_buf: &mut self.app_send,
         };
         self.h2.send_goaway(&mut h2_io, error_code)
@@ -465,7 +464,6 @@ where
         let mut tls_io: TlsIo<'_, BUF> = TlsIo {
             recv_buf: &mut self.net_recv,
             send_buf: &mut self.net_send,
-            app_recv_buf: &mut self.app_recv,
             app_send_buf: &mut self.app_send,
         };
         self.tls.close(&mut tls_io)
@@ -552,6 +550,32 @@ where
 
     fn tcp_poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
         H2TlsServer::poll_output(self, buf)
+    }
+
+    fn recv_blocked(&self) -> bool {
+        // A DATA frame is mid-flight (pump stalled on a full data_buf) AND
+        // there is still unprocessed plaintext parked in net_recv's visible
+        // prefix. Reading more TCP now would only grow net_recv toward the
+        // BUF ceiling; instead the runner should re-drive the pump so the body
+        // consumer can drain. Once the plaintext is consumed we resume reading
+        // to fetch the rest of the frame.
+        self.h2.has_partial_data() && !self.net_recv.is_empty()
+    }
+
+    fn reclaim_buffers(&mut self) -> Option<crate::tcp_tls::TlsBufKit> {
+        // Recover the three I/O buffers' `'static` slices only if all three
+        // are static-backed (they are constructed uniformly via `from_parts`).
+        let net_recv = self.net_recv.take_static();
+        let net_send = self.net_send.take_static();
+        let app_send = self.app_send.take_static();
+        match (net_recv, net_send, app_send) {
+            (Some(net_recv), Some(net_send), Some(app_send)) => Some(crate::tcp_tls::TlsBufKit {
+                net_recv,
+                net_send,
+                app_send,
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -680,6 +704,167 @@ mod tests {
                 break;
             }
         }
+    }
+
+    /// Reproduce the firmware OTA failure: server with hardware buffer sizes
+    /// (BUF=18432, DATABUF=16384), client that bursts DATA before processing
+    /// the server's SETTINGS (like curl/nghttp2 does), fed in runner-style
+    /// 1500-byte chunks with one event drained per "poll cycle".
+    #[test]
+    fn h2_tls_hw_sized_upload_burst() {
+        extern crate std;
+        use std::println;
+        use std::vec::Vec;
+
+        type HwServer = H2TlsServer<Aes128GcmProvider, 18432, 8, 2048, 16384>;
+        // Client gets a big BUF so it can stage full records.
+        type BigClient = H2TlsClient<Aes128GcmProvider, 65536, 8, 2048, 4096>;
+
+        let cert: &'static [u8] = test_cert_der().leak();
+        let config = TlsConfig {
+            server_name: heapless::String::try_from("test.local").unwrap(),
+            alpn_protocols: &[b"h2"],
+            transport_params: TransportParams::default_params(),
+            pinned_certs: &[],
+        };
+        let mut client = BigClient::new(Aes128GcmProvider, config, [0xAA; 32], [0xBB; 32]);
+        let server_config = ServerTlsConfig {
+            cert_der: cert,
+            private_key_der: &TEST_SEED,
+            alpn_protocols: &[b"h2"],
+            transport_params: TransportParams::default_params(),
+        };
+        let mut server = HwServer::new(Aes128GcmProvider, server_config, [0xCC; 32], [0xDD; 32]);
+
+        // TLS handshake: full exchange, but capture server->client bytes and
+        // STOP delivering them to the client as soon as the client's TLS layer
+        // is active — emulating curl, which has the server's h2 SETTINGS still
+        // in flight when it starts sending DATA.
+        for _ in 0..40 {
+            let mut buf = [0u8; 65536];
+            let mut progress = false;
+            while let Some(data) = client.poll_output(&mut buf) {
+                let copy = data.to_vec();
+                server.feed_data(&copy).unwrap();
+                progress = true;
+            }
+            let mut buf2 = [0u8; 65536];
+            while let Some(data) = server.poll_output(&mut buf2) {
+                let copy = data.to_vec();
+                if !client.tls.is_active() {
+                    client.feed_data(&copy).unwrap();
+                }
+                // else: drop — still "in flight" from the client's perspective
+                progress = true;
+            }
+            if !progress {
+                break;
+            }
+        }
+        assert!(client.tls.is_active(), "client TLS should be active");
+        assert!(server.tls.is_active(), "server TLS should be active");
+
+        // Client sends HEADERS then bursts DATA under the assumed RFC default
+        // windows (65535 stream / 65535 conn), since it never processed the
+        // server's SETTINGS (initial_window = DATABUF = 16384).
+        let stream_id = client
+            .send_request("POST", "/system/update", "test.local", &[], false)
+            .unwrap();
+
+        let payload = [0xA5u8; 16384];
+        let mut sent_total = 0usize;
+        let mut backlog: Vec<u8> = Vec::new();
+        let mut out = [0u8; 4096];
+        // Interleave send_body and poll_output until the client's view of the
+        // windows is exhausted.
+        loop {
+            match client.send_body(stream_id, &payload, false) {
+                Ok(n) if n > 0 => {
+                    sent_total += n;
+                }
+                _ => {
+                    // Drain staged output; if still can't send, windows are dry.
+                    let mut drained = false;
+                    while let Some(data) = client.poll_output(&mut out) {
+                        backlog.extend_from_slice(data);
+                        drained = true;
+                    }
+                    if !drained {
+                        break;
+                    }
+                    match client.send_body(stream_id, &payload, false) {
+                        Ok(n) if n > 0 => sent_total += n,
+                        _ => break,
+                    }
+                }
+            }
+        }
+        while let Some(data) = client.poll_output(&mut out) {
+            backlog.extend_from_slice(data);
+        }
+        println!(
+            "client burst: {} h2 body bytes, {} TLS wire bytes",
+            sent_total,
+            backlog.len()
+        );
+        assert!(sent_total > 16384, "burst should exceed the server window");
+
+        // Now replay the firmware runner: 4 reads x 1500 bytes per cycle, then
+        // pop ONE event; on Data, drain recv_body fully (1024-byte chunks) the
+        // way UpdateService::feed does. Track where it dies.
+        let mut consumed = 0usize;
+        let mut offset = 0usize;
+        let mut sink = [0u8; 4096];
+        let mut cycle = 0usize;
+        let mut feed_err: Option<Error> = None;
+        'outer: while offset < backlog.len() || consumed < sent_total {
+            cycle += 1;
+            if cycle > 10_000 {
+                println!("stalled: consumed {} of {}", consumed, sent_total);
+                break;
+            }
+            for _ in 0..4 {
+                if offset >= backlog.len() {
+                    break;
+                }
+                let end = (offset + 1500).min(backlog.len());
+                if let Err(e) = server.feed_data(&backlog[offset..end]) {
+                    println!(
+                        "server.feed_data FAILED at wire offset {} (consumed {} body bytes): {:?}",
+                        offset, consumed, e
+                    );
+                    feed_err = Some(e);
+                    break 'outer;
+                }
+                offset = end;
+            }
+            // Server output (SETTINGS, WINDOW_UPDATE, ...) drains to nowhere —
+            // the client never processes it, same as curl mid-burst.
+            let mut obuf = [0u8; 4096];
+            while server.poll_output(&mut obuf).is_some() {}
+            if let Some(ev) = server.poll_event() {
+                if let H2Event::Data(sid) = ev {
+                    loop {
+                        match server.recv_body(sid, &mut sink) {
+                            Ok((0, _)) => break,
+                            Ok((n, _)) => consumed += n,
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "result: consumed {} of {} body bytes; feed_err = {:?}",
+            consumed, sent_total, feed_err
+        );
+        assert!(
+            feed_err.is_none() && consumed == sent_total,
+            "server must absorb a legal pre-SETTINGS-ack burst: consumed {} of {}, err {:?}",
+            consumed,
+            sent_total,
+            feed_err
+        );
     }
 
     #[test]

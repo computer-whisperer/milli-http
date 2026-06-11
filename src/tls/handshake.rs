@@ -148,6 +148,16 @@ pub struct TlsEngine<C: CryptoProvider> {
     transport_params: TransportParams,
     peer_transport_params: Option<TransportParams>,
 
+    // RFC 8449 record_size_limit we offer/advertise: the max plaintext-plus-
+    // content-type bytes per record we are willing to receive. Set by the TCP
+    // record layer from its receive-buffer size; never set in QUIC mode,
+    // where the TLS record layer (and thus the extension) does not apply.
+    local_record_size_limit: Option<u16>,
+    // RFC 8449 record_size_limit advertised by the peer. The record layer
+    // must cap every record it protects under handshake/application keys to
+    // at most this many plaintext-plus-content-type bytes.
+    peer_record_size_limit: Option<u16>,
+
     // Negotiated ALPN
     negotiated_alpn: Option<heapless::Vec<u8, 16>>,
 
@@ -222,6 +232,8 @@ where
             alpn_protocols: config.alpn_protocols,
             transport_params: config.transport_params,
             peer_transport_params: None,
+            local_record_size_limit: None,
+            peer_record_size_limit: None,
             negotiated_alpn: None,
             pinned_certs: config.pinned_certs,
             server_cert_data: Buf::new(),
@@ -266,6 +278,8 @@ where
             alpn_protocols: config.alpn_protocols,
             transport_params: config.transport_params,
             peer_transport_params: None,
+            local_record_size_limit: None,
+            peer_record_size_limit: None,
             negotiated_alpn: None,
             pinned_certs: &[],
             server_cert_data: Buf::new(),
@@ -330,6 +344,8 @@ where
             alpn_protocols: &[],
             transport_params: TransportParams::default_params(),
             peer_transport_params: None,
+            local_record_size_limit: None,
+            peer_record_size_limit: None,
             negotiated_alpn: None,
             pinned_certs: &[],
             server_cert_data: Buf::new(),
@@ -340,6 +356,24 @@ where
             legacy_session_id: [0u8; 32],
             _crypto: core::marker::PhantomData,
         }
+    }
+
+    /// Set the RFC 8449 record_size_limit we offer/advertise to the peer.
+    ///
+    /// Called by the TCP record layer (which knows its receive-buffer size)
+    /// before the engine builds its ClientHello (client) or
+    /// EncryptedExtensions (server). Must not be used in QUIC mode.
+    pub fn set_local_record_size_limit(&mut self, limit: u16) {
+        self.local_record_size_limit = Some(limit);
+    }
+
+    /// The RFC 8449 record_size_limit the peer advertised, if any.
+    ///
+    /// The record layer must cap every record it protects under
+    /// handshake/application keys to `limit - 1` plaintext bytes (the
+    /// advertised value counts the inner content-type byte).
+    pub fn peer_record_size_limit(&self) -> Option<u16> {
+        self.peer_record_size_limit
     }
 
     /// Update the CID-related transport parameters (original_destination_connection_id
@@ -374,6 +408,7 @@ where
             self.public_key.as_bytes(),
             self.alpn_protocols,
             tp,
+            self.local_record_size_limit,
             &mut ext_buf,
         )?;
 
@@ -477,6 +512,7 @@ where
 
         self.negotiated_alpn = parsed.alpn;
         self.peer_transport_params = parsed.transport_params;
+        self.peer_record_size_limit = parsed.record_size_limit;
 
         self.state = HandshakeState::WaitCertificate;
         Ok(())
@@ -721,6 +757,10 @@ where
         // Store peer transport params
         self.peer_transport_params = ext.transport_params;
 
+        // Store the client's RFC 8449 record-size limit; the record layer
+        // enforces it on everything we send under handshake/app keys.
+        self.peer_record_size_limit = ext.record_size_limit;
+
         // Store negotiated ALPN
         self.negotiated_alpn = selected_alpn.clone();
 
@@ -798,7 +838,20 @@ where
             } else {
                 None
             };
-            let ee_ext_len = encode_encrypted_extensions_data(alpn_bytes, tp, &mut ee_ext_buf)?;
+            // RFC 8446 §4.2: we may only answer with record_size_limit if the
+            // client offered it (and only if the record layer gave us a limit
+            // to advertise — never in QUIC mode).
+            let record_size_limit = if self.peer_record_size_limit.is_some() {
+                self.local_record_size_limit
+            } else {
+                None
+            };
+            let ee_ext_len = encode_encrypted_extensions_data(
+                alpn_bytes,
+                tp,
+                record_size_limit,
+                &mut ee_ext_buf,
+            )?;
             let ee_len =
                 encode_encrypted_extensions(&ee_ext_buf[..ee_ext_len], &mut hs_buf[hs_off..])?;
             self.transcript.update(&hs_buf[hs_off..hs_off + ee_len]);

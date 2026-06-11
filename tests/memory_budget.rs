@@ -88,7 +88,7 @@ fn https1_estimate(
 
     // Post-handshake: TlsEngine bufs shrunk to 0
     let http1_heap = http1_hdr_buf + http1_data_buf;
-    let tls_io_heap = 4 * tls_io_buf; // recv, send, app_recv, app_send
+    let tls_io_heap = 3 * tls_io_buf; // net_recv (in-place decrypt), net_send, app_send
     (struc, http1_heap + tls_io_heap)
 }
 
@@ -105,8 +105,8 @@ fn h2_tls_estimate(
     let streams_heap = active_streams * (48 + hdrbuf + databuf);
     // H2 events: VecDeque<H2Event>, typically small
     let events_heap = 8 * size_of::<H2Event>();
-    // 4 shared TLS/H2 buffers (net_recv, net_send, app_recv, app_send)
-    let tls_io_heap = 4 * tls_buf_size;
+    // 3 shared TLS/H2 buffers (net_recv with in-place decrypt, net_send, app_send)
+    let tls_io_heap = 3 * tls_buf_size;
     (h2_tls_struct, streams_heap + events_heap + tls_io_heap)
 }
 
