@@ -341,13 +341,18 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         self.events.pop_front()
     }
 
-    /// Push an event into the queue, enforcing a capacity limit for the alloc
-    /// path. When the queue is full the oldest event is dropped so that new
-    /// events are never silently lost.
+    /// Push an event into the queue. When the queue is full (consumer is
+    /// lagging) the oldest event is dropped to make room, so the most recent
+    /// events are never silently lost. (heapless `push_back` on a full deque
+    /// silently drops the NEW event — the opposite policy — so the no-alloc
+    /// path must evict explicitly too.)
     fn push_event(&mut self, event: H2Event) {
         #[cfg(feature = "alloc")]
         if self.events.len() >= 64 {
-            // Consumer is lagging — drop the oldest event to make room.
+            let _ = self.events.pop_front();
+        }
+        #[cfg(not(feature = "alloc"))]
+        if self.events.is_full() {
             let _ = self.events.pop_front();
         }
         let _ = self.events.push_back(event);
@@ -1130,12 +1135,16 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                         io.recv_buf[ps + 2],
                         io.recv_buf[ps + 3],
                     ]);
-                    // If a DATA frame is mid-flight on this stream, abandon it:
-                    // switch the pump to discard mode so it drains the remaining
-                    // payload off recv_buf (crediting the connection window)
-                    // instead of stalling forever on the now-dead stream's full
-                    // data_buf — which would wedge the (single) connection with
-                    // no timeout to recover it.
+                    // Defense in depth: if a DATA frame were mid-flight on this
+                    // stream, switch the pump to discard mode (drain the payload
+                    // off recv_buf, crediting the connection window). NOTE: with
+                    // the current loop structure this cannot fire — process_recv
+                    // never parses frames while partial_data is Some, so an RST
+                    // behind a stalled pump is not reached until the app drains
+                    // the body. An application that never drains therefore still
+                    // wedges the connection; the recovery path for that (a body
+                    // cancel/discard API or manager-wired timeouts) is an open
+                    // follow-up.
                     if let Some(pd) = self.partial_data.as_mut() {
                         if pd.stream_id == stream_id {
                             pd.deliver = false;
