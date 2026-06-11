@@ -118,7 +118,7 @@ const CLIENT_BUF: usize = BUF;
 // drains as it encrypts, the receiver compacts in place — so the real peak is
 // well below the naive 6 x 18432 sum.
 //
-// Empirically the measured peak is ~113 KB (printed by the test). The budget is
+// Empirically the measured peak is ~116 KB (printed by the test). The budget is
 // chosen against the actual measurement, not the upper-bound estimate:
 //
 //   measured peak (P)            ~ 116 KB

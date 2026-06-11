@@ -67,7 +67,7 @@ where
     }
 
     /// Create new server-side TLS parts backed by a caller-provided
-    /// [`TlsBufKit`] (`'static` slices) instead of the heap. The four I/O
+    /// [`TlsBufKit`] (`'static` slices) instead of the heap. The three I/O
     /// buffers never touch the allocator for this connection's lifetime.
     ///
     /// # Panics
