@@ -1,7 +1,12 @@
 //! I/O buffers for TLS connections.
 //!
-//! `TlsIo` holds borrowed references to the four buffers a TLS connection
+//! `TlsIo` holds borrowed references to the three buffers a TLS connection
 //! needs.  `TlsIoBufs` is a convenience owning wrapper for standalone use.
+//!
+//! There is deliberately no separate decrypted-plaintext buffer: records are
+//! decrypted **in place** inside `recv_buf`, which holds the plaintext ready
+//! for the application as its visible prefix and any not-yet-decrypted
+//! ciphertext as a hidden tail (see [`crate::buf::Buf::hide_tail`]).
 
 use crate::buf::Buf;
 use crate::error::Error;
@@ -10,12 +15,11 @@ use crate::error::Error;
 ///
 /// `BUF`: buffer capacity (should be >= 18432 for one max-size TLS record + header).
 pub struct TlsIo<'a, const BUF: usize> {
-    /// Raw encrypted data received from the network.
+    /// Network receive buffer. Visible prefix: decrypted plaintext for the
+    /// application. Hidden tail: encrypted data not yet decrypted.
     pub recv_buf: &'a mut Buf<BUF>,
     /// Encrypted data to send to the network.
     pub send_buf: &'a mut Buf<BUF>,
-    /// Decrypted application data received from the peer.
-    pub app_recv_buf: &'a mut Buf<BUF>,
     /// Application data queued for encryption and sending.
     pub app_send_buf: &'a mut Buf<BUF>,
 }
@@ -46,7 +50,6 @@ impl<'a, const BUF: usize> TlsIo<'a, BUF> {
 pub struct TlsIoBufs<const BUF: usize = 18432> {
     pub recv_buf: Buf<BUF>,
     pub send_buf: Buf<BUF>,
-    pub app_recv_buf: Buf<BUF>,
     pub app_send_buf: Buf<BUF>,
 }
 
@@ -56,7 +59,6 @@ impl<const BUF: usize> TlsIoBufs<BUF> {
         Self {
             recv_buf: Buf::new(),
             send_buf: Buf::new(),
-            app_recv_buf: Buf::new(),
             app_send_buf: Buf::new(),
         }
     }
@@ -66,7 +68,6 @@ impl<const BUF: usize> TlsIoBufs<BUF> {
         TlsIo {
             recv_buf: &mut self.recv_buf,
             send_buf: &mut self.send_buf,
-            app_recv_buf: &mut self.app_recv_buf,
             app_send_buf: &mut self.app_send_buf,
         }
     }

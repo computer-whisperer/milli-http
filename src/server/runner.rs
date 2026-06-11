@@ -213,6 +213,22 @@ where
             if conn.eof {
                 continue;
             }
+            // Receive backpressure: the connection is holding undelivered body
+            // data behind a full application buffer (e.g. an h2 upload arriving
+            // faster than flash can absorb it). Reading more TCP now would only
+            // grow the connection's receive buffer toward its ceiling and
+            // eventually error. Instead leave the bytes in the socket (TCP
+            // window closes, pacing the peer) and re-drive processing with an
+            // empty feed so the pump resumes once the consumer has drained via
+            // recv_body. Self-wake to keep draining until it clears.
+            if self.manager.conn_recv_blocked(conn.id) {
+                if self.manager.tcp_feed(conn.id, &[], now).is_err() {
+                    conn.eof = true;
+                    self.manager.tcp_eof(conn.id);
+                }
+                has_pending_output = true;
+                continue;
+            }
             let mut reads_done = 0u32;
             for _ in 0..Self::MAX_READS_PER_CONN {
                 match conn.stream.poll_read(cx, &mut tcp_buf) {
@@ -224,7 +240,14 @@ where
                     Poll::Ready(Ok(n)) => {
                         reads_done += 1;
                         if self.manager.tcp_feed(conn.id, &tcp_buf[..n], now).is_err() {
+                            // Reap the connection like the EOF/read-error arms
+                            // do. Without tcp_eof the manager-side conn stays
+                            // Established forever: no Closed event, the TcpSlot
+                            // is never freed, and the peer just hangs (no GOAWAY
+                            // /alert is emitted on a buffer error). That wedged
+                            // the single TLS slot until reboot.
                             conn.eof = true;
+                            self.manager.tcp_eof(conn.id);
                             break;
                         }
                     }

@@ -83,4 +83,28 @@ pub trait HttpServerConn {
     /// Only meaningful for TCP-based connections.
     /// H3 connections should return `None`.
     fn tcp_poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]>;
+
+    /// Whether the connection is holding undelivered receive data behind a
+    /// full application buffer — i.e. the runner should stop reading more TCP
+    /// for it (apply TCP-window backpressure) and instead re-drive processing
+    /// (feed an empty slice) so the consumer can drain and the pump resumes.
+    ///
+    /// Default `false`: connections without internal receive backpressure
+    /// (e.g. HTTP/1.1, where the socket RX buffer is the backpressure point)
+    /// are always read.
+    fn recv_blocked(&self) -> bool {
+        false
+    }
+
+    /// Reclaim the `'static` I/O buffer kit backing this connection, if it was
+    /// built from one (see [`TlsParts::new_server_in`]). Called once on
+    /// teardown so the manager can return the `.bss`-backed buffers to its free
+    /// pool for the next connection. Returns `None` for heap-backed or
+    /// non-TLS (e.g. H3/UDP) connections — they own no static kit.
+    ///
+    /// [`TlsParts::new_server_in`]: crate::tcp_tls::TlsParts::new_server_in
+    #[cfg(all(feature = "tcp-tls", feature = "alloc"))]
+    fn reclaim_buffers(&mut self) -> Option<crate::tcp_tls::TlsBufKit> {
+        None
+    }
 }

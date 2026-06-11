@@ -2,16 +2,15 @@
 //!
 //! This wrapper composes [`TlsConnection`] and [`Http1Connection`] into a
 //! single type that shares application-layer buffers between the two protocol
-//! layers. Instead of 6 separate buffers (4 TLS + 2 HTTP), this uses only 4:
+//! layers. Instead of 6 separate buffers (4 TLS + 2 HTTP), this uses only 3:
 //!
 //! | Buffer | Purpose |
 //! |--------|---------|
-//! | `net_recv` | Accumulates encrypted TLS records from the network |
+//! | `net_recv` | Encrypted TLS records, decrypted in place = HTTP recv buffer |
 //! | `net_send` | Holds encrypted TLS records to send to the network |
-//! | `app_recv` | TLS decrypted plaintext = HTTP recv buffer |
 //! | `app_send` | HTTP send buffer = TLS plaintext to encrypt |
 //!
-//! The receive path: `feed_data(encrypted)` → TLS decrypt → `app_recv` → HTTP parse → events
+//! The receive path: `feed_data(encrypted)` → TLS decrypt in place → HTTP parse → events
 //!
 //! The send path: HTTP frame → `app_send` → TLS encrypt → `net_send` → `poll_output()`
 
@@ -41,7 +40,6 @@ pub struct Https1Client<
     http: Http1Connection<HDRBUF, DATABUF>,
     net_recv: Buf<BUF>,
     net_send: Buf<BUF>,
-    app_recv: Buf<BUF>,
     app_send: Buf<BUF>,
 }
 
@@ -57,7 +55,6 @@ where
             http: Http1Connection::new_client(),
             net_recv: Buf::new(),
             net_send: Buf::new(),
-            app_recv: Buf::new(),
             app_send: Buf::new(),
         }
     }
@@ -71,17 +68,16 @@ where
             let mut tls_io: TlsIo<'_, BUF> = TlsIo {
                 recv_buf: &mut self.net_recv,
                 send_buf: &mut self.net_send,
-                app_recv_buf: &mut self.app_recv,
                 app_send_buf: &mut self.app_send,
             };
             self.tls.feed_data(&mut tls_io, data)?;
         }
 
-        // TLS may have decrypted plaintext into app_recv.
-        // Since app_recv IS HTTP's recv_buf, trigger HTTP processing.
-        if !self.app_recv.is_empty() {
+        // TLS may have decrypted plaintext in place: net_recv's visible
+        // prefix IS HTTP's recv_buf, so trigger HTTP processing.
+        if !self.net_recv.is_empty() {
             let mut http_io: Http1Io<'_, BUF> = Http1Io {
-                recv_buf: &mut self.app_recv,
+                recv_buf: &mut self.net_recv,
                 send_buf: &mut self.app_send,
             };
             self.http.feed_data(&mut http_io, &[])?;
@@ -98,7 +94,6 @@ where
         let mut tls_io: TlsIo<'_, BUF> = TlsIo {
             recv_buf: &mut self.net_recv,
             send_buf: &mut self.net_send,
-            app_recv_buf: &mut self.app_recv,
             app_send_buf: &mut self.app_send,
         };
         self.tls.poll_output(&mut tls_io, buf)
@@ -147,7 +142,7 @@ where
             let _ = headers.push((name, value));
         }
         let mut http_io: Http1Io<'_, BUF> = Http1Io {
-            recv_buf: &mut self.app_recv,
+            recv_buf: &mut self.net_recv,
             send_buf: &mut self.app_send,
         };
         self.http.open_stream(&mut http_io, &headers, end_stream)
@@ -164,7 +159,7 @@ where
             return Err(Error::InvalidState);
         }
         let mut http_io: Http1Io<'_, BUF> = Http1Io {
-            recv_buf: &mut self.app_recv,
+            recv_buf: &mut self.net_recv,
             send_buf: &mut self.app_send,
         };
         self.http
@@ -206,15 +201,14 @@ where
             let mut tls_io: TlsIo<'_, BUF> = TlsIo {
                 recv_buf: &mut self.net_recv,
                 send_buf: &mut self.net_send,
-                app_recv_buf: &mut self.app_recv,
                 app_send_buf: &mut self.app_send,
             };
             self.tls.feed_data(&mut tls_io, data)?;
         }
 
-        if !self.app_recv.is_empty() {
+        if !self.net_recv.is_empty() {
             let mut http_io: Http1Io<'_, BUF> = Http1Io {
-                recv_buf: &mut self.app_recv,
+                recv_buf: &mut self.net_recv,
                 send_buf: &mut self.app_send,
             };
             self.http.feed_data_timed(&mut http_io, &[], now)?;
@@ -233,7 +227,6 @@ where
         let mut tls_io: TlsIo<'_, BUF> = TlsIo {
             recv_buf: &mut self.net_recv,
             send_buf: &mut self.net_send,
-            app_recv_buf: &mut self.app_recv,
             app_send_buf: &mut self.app_send,
         };
         self.tls.close(&mut tls_io)
@@ -251,7 +244,6 @@ pub struct Https1Server<
     http: Http1Connection<HDRBUF, DATABUF>,
     net_recv: Buf<BUF>,
     net_send: Buf<BUF>,
-    app_recv: Buf<BUF>,
     app_send: Buf<BUF>,
 }
 
@@ -267,7 +259,6 @@ where
             http: Http1Connection::new_server(),
             net_recv: Buf::new(),
             net_send: Buf::new(),
-            app_recv: Buf::new(),
             app_send: Buf::new(),
         }
     }
@@ -280,7 +271,6 @@ where
             http: Http1Connection::new_server(),
             net_recv: parts.net_recv,
             net_send: parts.net_send,
-            app_recv: parts.app_recv,
             app_send: parts.app_send,
         }
     }
@@ -291,15 +281,14 @@ where
             let mut tls_io: TlsIo<'_, BUF> = TlsIo {
                 recv_buf: &mut self.net_recv,
                 send_buf: &mut self.net_send,
-                app_recv_buf: &mut self.app_recv,
                 app_send_buf: &mut self.app_send,
             };
             self.tls.feed_data(&mut tls_io, data)?;
         }
 
-        if !self.app_recv.is_empty() {
+        if !self.net_recv.is_empty() {
             let mut http_io: Http1Io<'_, BUF> = Http1Io {
-                recv_buf: &mut self.app_recv,
+                recv_buf: &mut self.net_recv,
                 send_buf: &mut self.app_send,
             };
             self.http.feed_data(&mut http_io, &[])?;
@@ -313,7 +302,6 @@ where
         let mut tls_io: TlsIo<'_, BUF> = TlsIo {
             recv_buf: &mut self.net_recv,
             send_buf: &mut self.net_send,
-            app_recv_buf: &mut self.app_recv,
             app_send_buf: &mut self.app_send,
         };
         self.tls.poll_output(&mut tls_io, buf)
@@ -370,7 +358,7 @@ where
             let _ = all_headers.push((name, value));
         }
         let mut http_io: Http1Io<'_, BUF> = Http1Io {
-            recv_buf: &mut self.app_recv,
+            recv_buf: &mut self.net_recv,
             send_buf: &mut self.app_send,
         };
         self.http
@@ -388,7 +376,7 @@ where
             return Err(Error::InvalidState);
         }
         let mut http_io: Http1Io<'_, BUF> = Http1Io {
-            recv_buf: &mut self.app_recv,
+            recv_buf: &mut self.net_recv,
             send_buf: &mut self.app_send,
         };
         self.http
@@ -416,15 +404,14 @@ where
             let mut tls_io: TlsIo<'_, BUF> = TlsIo {
                 recv_buf: &mut self.net_recv,
                 send_buf: &mut self.net_send,
-                app_recv_buf: &mut self.app_recv,
                 app_send_buf: &mut self.app_send,
             };
             self.tls.feed_data(&mut tls_io, data)?;
         }
 
-        if !self.app_recv.is_empty() {
+        if !self.net_recv.is_empty() {
             let mut http_io: Http1Io<'_, BUF> = Http1Io {
-                recv_buf: &mut self.app_recv,
+                recv_buf: &mut self.net_recv,
                 send_buf: &mut self.app_send,
             };
             self.http.feed_data_timed(&mut http_io, &[], now)?;
@@ -443,7 +430,6 @@ where
         let mut tls_io: TlsIo<'_, BUF> = TlsIo {
             recv_buf: &mut self.net_recv,
             send_buf: &mut self.net_send,
-            app_recv_buf: &mut self.app_recv,
             app_send_buf: &mut self.app_send,
         };
         self.tls.close(&mut tls_io)
@@ -518,6 +504,22 @@ where
 
     fn tcp_poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
         Https1Server::poll_output(self, buf)
+    }
+
+    fn reclaim_buffers(&mut self) -> Option<crate::tcp_tls::TlsBufKit> {
+        // Recover the three I/O buffers' `'static` slices only if all three
+        // are static-backed (they are constructed uniformly via `from_parts`).
+        let net_recv = self.net_recv.take_static();
+        let net_send = self.net_send.take_static();
+        let app_send = self.app_send.take_static();
+        match (net_recv, net_send, app_send) {
+            (Some(net_recv), Some(net_send), Some(app_send)) => Some(crate::tcp_tls::TlsBufKit {
+                net_recv,
+                net_send,
+                app_send,
+            }),
+            _ => None,
+        }
     }
 }
 

@@ -174,6 +174,10 @@ pub struct H2Connection<
     // Flow control
     conn_send_fc: FlowController,
     conn_recv_fc: FlowController,
+    /// Connection-level receive-window credit not yet sent because the send
+    /// buffer was full (see `H2Stream::pending_recv_credit`). Retried from
+    /// `generate_output`.
+    pending_conn_credit: u32,
     // Event queue
     #[cfg(not(feature = "alloc"))]
     events: heapless::Deque<H2Event, 32>,
@@ -195,6 +199,33 @@ pub struct H2Connection<
     last_activity: u64,
     connection_start: u64,
     headers_phase_complete: bool,
+    /// A DATA frame whose payload has not fully arrived. Its 9-byte header (and
+    /// pad-length byte, if PADDED) have already been drained; the remaining
+    /// payload is streamed into the stream's `data_buf` as records arrive. See
+    /// [`pump_partial_data`](Self::pump_partial_data). This decouples the
+    /// receive buffer size from the h2 frame size: a max-size DATA frame is
+    /// 16393 bytes but a TLS record holds at most 16384, so every full-size
+    /// frame straddles a record boundary. Buffering the whole frame before
+    /// processing it would require `recv_buf` to hold the leftover plus the
+    /// next record at once (~32 KB), overflowing the shared TLS app buffer.
+    partial_data: Option<PartialData>,
+}
+
+/// In-progress receive of a DATA frame's payload (see
+/// [`H2Connection::partial_data`]).
+#[derive(Clone, Copy)]
+struct PartialData {
+    stream_id: u64,
+    /// END_STREAM flag — apply once the whole payload (and padding) is consumed.
+    end_stream: bool,
+    /// Payload bytes still to deliver into the stream's `data_buf`.
+    data_remaining: usize,
+    /// Trailing padding bytes still to discard after the payload.
+    pad_remaining: usize,
+    /// Whether a matching stream exists. If not, payload bytes are still drained
+    /// off `recv_buf` to stay frame-aligned, but discarded (matching the prior
+    /// lenient handling of DATA on an unknown stream).
+    deliver: bool,
 }
 
 impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
@@ -215,10 +246,20 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
             Role::Client => 1,
             Role::Server => 2,
         };
+        // Advertise a receive window equal to our per-stream body buffer
+        // (`DATABUF`) instead of the RFC default of 65535. `recv_body` credits
+        // WINDOW_UPDATE on consumption (see that fn), so capping the initial
+        // window at the buffer size means a peer can never have more DATA in
+        // flight than `data_buf` can hold — the overflow path below would
+        // otherwise silently drop body bytes and corrupt large request bodies.
+        let local_settings = H2Settings {
+            initial_window_size: DATABUF as u32,
+            ..H2Settings::default()
+        };
         Self {
             role,
             state: H2ConnState::WaitingPreface,
-            local_settings: H2Settings::default(),
+            local_settings,
             peer_settings: H2Settings::default(),
             #[cfg(not(feature = "alloc"))]
             streams: heapless::Vec::new(),
@@ -229,6 +270,7 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
             send_offset: 0,
             conn_send_fc: FlowController::new(DEFAULT_CONNECTION_WINDOW_SIZE),
             conn_recv_fc: FlowController::new(DEFAULT_CONNECTION_WINDOW_SIZE),
+            pending_conn_credit: 0,
             #[cfg(not(feature = "alloc"))]
             events: heapless::Deque::new(),
             #[cfg(feature = "alloc")]
@@ -247,6 +289,7 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
             last_activity: 0,
             connection_start: 0,
             headers_phase_complete: false,
+            partial_data: None,
         }
     }
 
@@ -474,6 +517,15 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         Ok(())
     }
 
+    /// Whether a DATA frame's payload is still being received incrementally
+    /// (see [`partial_data`](Self::partial_data)). Combined with a non-empty
+    /// receive buffer at the transport layer, this signals that the peer is
+    /// sending faster than the body is being consumed and the runner should
+    /// apply backpressure rather than read more.
+    pub fn has_partial_data(&self) -> bool {
+        self.partial_data.is_some()
+    }
+
     /// Read received body data for a stream.
     pub fn recv_body<const BUF: usize>(
         &mut self,
@@ -543,6 +595,8 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
             let _ = self.send_initial_settings(io);
             self.preface_sent = true;
         }
+        // Retry WINDOW_UPDATE credit that a previously-full send buffer deferred.
+        self.flush_window_updates(io);
     }
 
     fn send_initial_settings<const BUF: usize>(
@@ -583,6 +637,17 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         io.queue_send(&buf[..n])
     }
 
+    /// Record receive-window credit for a stream (or the connection, id 0) and
+    /// try to emit the WINDOW_UPDATE. The credit is accumulated into a pending
+    /// counter and only applied to the advertised window once the frame is
+    /// actually queued — if the send buffer is full the frame is deferred and
+    /// retried from `flush_window_updates`/`generate_output`, never dropped.
+    ///
+    /// Previously this queued the frame with the result ignored while crediting
+    /// the window unconditionally: a full send buffer silently dropped the
+    /// WINDOW_UPDATE but still advanced `recv_window`, desyncing the peer's view
+    /// from ours and stalling the upload forever (the peer waits for credit it
+    /// never receives, so no further DATA arrives to drive a retry).
     fn send_window_update<const BUF: usize>(
         &mut self,
         io: &mut H2Io<'_, BUF>,
@@ -592,25 +657,145 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         if increment == 0 {
             return;
         }
-        let frame = H2Frame::WindowUpdate {
-            stream_id,
-            increment,
-        };
-        let mut buf = [0u8; 16];
-        if let Ok(n) = frame::encode_frame(&frame, &mut buf) {
-            let _ = io.queue_send(&buf[..n]);
-        }
         if stream_id == 0 {
-            let _ = self.conn_recv_fc.replenish(increment);
+            self.pending_conn_credit = self.pending_conn_credit.saturating_add(increment);
         } else if let Some(stream) = self.get_stream_mut(stream_id) {
-            let new_window = stream.recv_window as i64 + increment as i64;
-            stream.recv_window = new_window.min(0x7fff_ffff) as i32;
+            stream.pending_recv_credit = stream.pending_recv_credit.saturating_add(increment);
+        }
+        self.flush_window_updates(io);
+    }
+
+    /// Emit any deferred WINDOW_UPDATE credit (connection + per-stream) that
+    /// fits in the send buffer, applying the credit to the advertised window
+    /// only on a successful queue. Pending credit coalesces, so a backlog
+    /// drains as one larger increment once buffer space frees. Called from
+    /// `generate_output`, so it retries on every `poll_output` cycle.
+    fn flush_window_updates<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>) {
+        let mut buf = [0u8; 16];
+        if self.pending_conn_credit > 0 {
+            let inc = self.pending_conn_credit;
+            let frame = H2Frame::WindowUpdate {
+                stream_id: 0,
+                increment: inc,
+            };
+            if let Ok(n) = frame::encode_frame(&frame, &mut buf)
+                && io.queue_send(&buf[..n]).is_ok()
+            {
+                let _ = self.conn_recv_fc.replenish(inc);
+                self.pending_conn_credit = 0;
+            }
+        }
+        for stream in self.streams.iter_mut() {
+            if stream.pending_recv_credit == 0 {
+                continue;
+            }
+            let inc = stream.pending_recv_credit;
+            let frame = H2Frame::WindowUpdate {
+                stream_id: stream.id,
+                increment: inc,
+            };
+            if let Ok(n) = frame::encode_frame(&frame, &mut buf)
+                && io.queue_send(&buf[..n]).is_ok()
+            {
+                let new_window = stream.recv_window as i64 + inc as i64;
+                stream.recv_window = new_window.min(0x7fff_ffff) as i32;
+                stream.pending_recv_credit = 0;
+            }
         }
     }
 
     // ------------------------------------------------------------------
     // Internal: receive processing
     // ------------------------------------------------------------------
+
+    /// Stream as much of the in-progress DATA frame's payload (then its
+    /// padding) as `recv_buf` currently holds and the stream's `data_buf` can
+    /// accept. Clears `partial_data` once the whole frame is consumed; otherwise
+    /// leaves it for the next call — either because `recv_buf` ran dry (need
+    /// more network bytes) or because `data_buf` is full (backpressure until the
+    /// consumer drains via `recv_body`). Never errors: the connection-level
+    /// receive window was already committed when the frame header was parsed,
+    /// and buffer pressure is handled by leaving bytes unconsumed in `recv_buf`.
+    fn pump_partial_data<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>) {
+        let Some(mut pd) = self.partial_data.take() else {
+            return;
+        };
+
+        // 1. Deliver payload into the stream's data_buf (or discard if the
+        //    stream is gone), bounded by available bytes and buffer space.
+        while pd.data_remaining > 0 {
+            let avail = io.recv_buf.len();
+            if avail == 0 {
+                break; // need more bytes from the network
+            }
+            if pd.deliver {
+                let n = {
+                    let Some(stream) = self.streams.iter_mut().find(|s| s.id == pd.stream_id)
+                    else {
+                        // Stream vanished mid-frame (e.g. reset): discard the rest.
+                        pd.deliver = false;
+                        continue;
+                    };
+                    let free = stream.data_buf.capacity() - stream.data_buf.len();
+                    if free == 0 {
+                        break; // data_buf full → backpressure until recv_body drains
+                    }
+                    let n = pd.data_remaining.min(avail).min(free);
+                    // n <= free, so this never overflows the buffer.
+                    let _ = stream.data_buf.extend_from_slice(&io.recv_buf[..n]);
+                    stream.data_available = true;
+                    stream.recv_window -= n as i32;
+                    n
+                };
+                io.drain_recv(n);
+                pd.data_remaining -= n;
+                self.push_event(H2Event::Data(pd.stream_id));
+            } else {
+                // Stream gone (unknown or reset mid-frame): drain the bytes off
+                // recv_buf to stay frame-aligned, discard them, and credit the
+                // connection window so it doesn't leak (RFC 9113 §6.9.1 — a
+                // reset stream's bytes still count against the connection).
+                let n = pd.data_remaining.min(avail);
+                io.drain_recv(n);
+                pd.data_remaining -= n;
+                if n > 0 {
+                    self.send_window_update(io, 0, n as u32);
+                }
+            }
+        }
+
+        // 2. Discard trailing padding once all payload has been delivered.
+        if pd.data_remaining == 0 && pd.pad_remaining > 0 {
+            let n = pd.pad_remaining.min(io.recv_buf.len());
+            io.drain_recv(n);
+            pd.pad_remaining -= n;
+        }
+
+        // 3. Frame fully consumed → apply END_STREAM and signal completion.
+        if pd.data_remaining == 0 && pd.pad_remaining == 0 {
+            if pd.deliver {
+                if let Some(stream) = self.streams.iter_mut().find(|s| s.id == pd.stream_id) {
+                    // Mark the stream readable so `process_recv`'s retain keeps
+                    // it alive for the application even when this DATA frame
+                    // carried no bytes (e.g. a 0-length END_STREAM frame closing
+                    // the stream): the app still needs to read the response
+                    // headers/status. A non-empty frame already set this while
+                    // delivering payload.
+                    stream.data_available = true;
+                    if pd.end_stream {
+                        stream.recv_end_stream();
+                    }
+                }
+                if pd.end_stream {
+                    self.push_event(H2Event::Finished(pd.stream_id));
+                }
+            }
+            // A discarded (reset/unknown-stream) frame signals nothing.
+            // partial_data remains None (taken at the top).
+        } else {
+            self.partial_data = Some(pd);
+        }
+    }
 
     fn process_recv<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>) -> Result<(), Error> {
         if self.role == Role::Server && !self.preface_validated {
@@ -621,6 +806,19 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         }
 
         loop {
+            // Resume an in-progress DATA frame whose payload spans receive
+            // buffers / TLS records before parsing the next frame header.
+            if self.partial_data.is_some() {
+                self.pump_partial_data(io);
+                if self.partial_data.is_some() {
+                    // Couldn't finish: either recv_buf is drained (need more
+                    // bytes) or the stream's data_buf is full (backpressure
+                    // until the consumer drains via recv_body). Stop this round.
+                    break;
+                }
+                continue;
+            }
+
             if io.recv_buf.len() < 9 {
                 break;
             }
@@ -635,10 +833,6 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                 return Err(Error::Http2(crate::error::H2Error::FrameSizeError));
             }
 
-            if io.recv_buf.len() < total {
-                break;
-            }
-
             let frame_type = io.recv_buf[3];
             let flags = io.recv_buf[4];
             let stream_id = u32::from_be_bytes([
@@ -647,8 +841,6 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                 io.recv_buf[7],
                 io.recv_buf[8],
             ]) as u64;
-            let ps = 9;
-            let pe = total;
 
             if let Some(expected_sid) = self.continuation_stream_id {
                 if frame_type != FRAME_CONTINUATION || stream_id != expected_sid {
@@ -656,49 +848,81 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                 }
             }
 
-            match frame_type {
-                FRAME_DATA => {
-                    if stream_id == 0 {
-                        return Err(Error::Http2(crate::error::H2Error::ProtocolError));
-                    }
-                    let end_stream = flags & FLAG_END_STREAM != 0;
-                    let (data_start, data_end) = if flags & FLAG_PADDED != 0 {
-                        if payload_len == 0 {
-                            return Err(Error::BufferTooSmall { needed: 1 });
-                        }
-                        let pad_len = io.recv_buf[ps] as usize;
-                        if pad_len >= payload_len {
-                            return Err(Error::InvalidState);
-                        }
-                        (ps + 1, pe - pad_len)
-                    } else {
-                        (ps, pe)
-                    };
-                    let data_len = data_end - data_start;
-
-                    self.conn_recv_fc.consume(data_len as u32)?;
-
-                    if let Some(stream) = self.streams.iter_mut().find(|s| s.id == stream_id) {
-                        // RFC 9113 §6.9.1: a peer exceeding the stream-level
-                        // flow-control window is a FLOW_CONTROL_ERROR (previously
-                        // recv_window was driven silently negative).
-                        if (data_len as i32) > stream.recv_window {
-                            return Err(Error::Http2(crate::error::H2Error::FlowControlError));
-                        }
-                        let _ = stream
-                            .data_buf
-                            .extend_from_slice(&io.recv_buf[data_start..data_end]);
-                        stream.data_available = true;
-                        stream.recv_window -= data_len as i32;
-                        if end_stream {
-                            stream.recv_end_stream();
-                        }
-                    }
-                    self.push_event(H2Event::Data(stream_id));
-                    if end_stream {
-                        self.push_event(H2Event::Finished(stream_id));
-                    }
+            // DATA frames are consumed incrementally: only the 9-byte header
+            // (plus the pad-length byte, if PADDED) needs to be present now. The
+            // payload is streamed into the stream's data_buf as it arrives (see
+            // pump_partial_data), so a record-straddling max-size frame never
+            // requires the whole frame to sit in recv_buf at once. The
+            // flow-control bound is the data_buf capacity, applied as
+            // backpressure, not a hard window check — this also tolerates the
+            // legal pre-SETTINGS-ack burst a peer may send under the RFC-default
+            // window (RFC 9113 §6.9.2).
+            if frame_type == FRAME_DATA {
+                if stream_id == 0 {
+                    return Err(Error::Http2(crate::error::H2Error::ProtocolError));
                 }
+                let padded = flags & FLAG_PADDED != 0;
+                let header_len = if padded { 10 } else { 9 };
+                if io.recv_buf.len() < header_len {
+                    break; // need the pad-length byte before the frame can be sized
+                }
+                let (data_total, pad_total) = if padded {
+                    if payload_len == 0 {
+                        return Err(Error::BufferTooSmall { needed: 1 });
+                    }
+                    // payload = 1 (pad-length byte) + data + pad_len (padding)
+                    let pad_len = io.recv_buf[9] as usize;
+                    if pad_len >= payload_len {
+                        return Err(Error::InvalidState);
+                    }
+                    (payload_len - 1 - pad_len, pad_len)
+                } else {
+                    (payload_len, 0)
+                };
+
+                // RFC 9113 §6.9.1: once the peer has acknowledged our SETTINGS
+                // it must honor the receive window we advertised; exceeding it
+                // is a FLOW_CONTROL_ERROR. Before the ack the peer is entitled to
+                // the RFC-default window (§6.9.2) and may legally send more than
+                // we advertised — that burst is absorbed by data_buf
+                // backpressure (see pump_partial_data), not rejected.
+                if self.settings_ack_received
+                    && let Some(stream) = self.streams.iter().find(|s| s.id == stream_id)
+                    && (data_total as i32) > stream.recv_window
+                {
+                    return Err(Error::Http2(crate::error::H2Error::FlowControlError));
+                }
+
+                // Commit the frame's data length against the connection-level
+                // receive window up front; recv_body replenishes it on drain.
+                self.conn_recv_fc.consume(data_total as u32)?;
+                let deliver = self.streams.iter().any(|s| s.id == stream_id);
+
+                io.drain_recv(header_len);
+                self.partial_data = Some(PartialData {
+                    stream_id,
+                    end_stream: flags & FLAG_END_STREAM != 0,
+                    data_remaining: data_total,
+                    pad_remaining: pad_total,
+                    deliver,
+                });
+                continue;
+            }
+
+            // All other frame types are bounded by MAX_FRAME_SIZE and processed
+            // whole. A frame that cannot fit the receive buffer can never be
+            // assembled — fail fast rather than waiting forever.
+            if total > BUF {
+                return Err(Error::Http2(crate::error::H2Error::FrameSizeError));
+            }
+            if io.recv_buf.len() < total {
+                break;
+            }
+
+            let ps = 9;
+            let pe = total;
+
+            match frame_type {
                 FRAME_HEADERS => {
                     if stream_id == 0 {
                         return Err(Error::Http2(crate::error::H2Error::ProtocolError));
@@ -898,8 +1122,32 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                         io.recv_buf[ps + 2],
                         io.recv_buf[ps + 3],
                     ]);
-                    if let Some(stream) = self.get_stream_mut(stream_id) {
-                        stream.reset();
+                    // If a DATA frame is mid-flight on this stream, abandon it:
+                    // switch the pump to discard mode so it drains the remaining
+                    // payload off recv_buf (crediting the connection window)
+                    // instead of stalling forever on the now-dead stream's full
+                    // data_buf — which would wedge the (single) connection with
+                    // no timeout to recover it.
+                    if let Some(pd) = self.partial_data.as_mut() {
+                        if pd.stream_id == stream_id {
+                            pd.deliver = false;
+                        }
+                    }
+                    // Drop any buffered-but-undrained body and credit the
+                    // connection window for it (RFC 9113 §6.9.1), then reset.
+                    let buffered = {
+                        if let Some(stream) = self.get_stream_mut(stream_id) {
+                            let b = stream.data_buf.len() as u32;
+                            stream.data_buf.clear();
+                            stream.data_available = false;
+                            stream.reset();
+                            b
+                        } else {
+                            0
+                        }
+                    };
+                    if buffered > 0 {
+                        self.send_window_update(io, 0, buffered);
                     }
                     self.push_event(H2Event::StreamReset(stream_id, error_code));
                 }
@@ -1553,10 +1801,14 @@ mod tests {
         exchange(&mut client, &mut cio, &mut server, &mut sio);
         while let Some(_) = server.poll_event() {}
 
+        // The client's stream send window equals the server's advertised
+        // SETTINGS_INITIAL_WINDOW_SIZE, which is now DATABUF (see
+        // H2Connection::new), not the RFC default of 65535.
+        const WINDOW: usize = 4096;
         let chunk = [0u8; 16384];
         let mut total_sent = 0usize;
-        while total_sent < 65535 {
-            let remaining = 65535 - total_sent;
+        while total_sent < WINDOW {
+            let remaining = WINDOW - total_sent;
             let to_send = remaining.min(16384);
             let n = client
                 .send_data(&mut cio.as_io(), stream_id, &chunk[..to_send], false)
@@ -1564,7 +1816,7 @@ mod tests {
             total_sent += n;
             exchange(&mut client, &mut cio, &mut server, &mut sio);
         }
-        assert_eq!(total_sent, 65535);
+        assert_eq!(total_sent, WINDOW);
 
         let result = client.send_data(&mut cio.as_io(), stream_id, &[0u8; 1], false);
         assert_eq!(result, Err(Error::WouldBlock));
@@ -1593,10 +1845,13 @@ mod tests {
         exchange(&mut client, &mut cio, &mut server, &mut sio);
         while let Some(_) = server.poll_event() {}
 
+        // Stream send window = server's advertised window = DATABUF (see
+        // H2Connection::new), not the RFC default of 65535.
+        const WINDOW: usize = 4096;
         let chunk = [0u8; 16384];
         let mut total_sent = 0usize;
-        while total_sent < 65535 {
-            let remaining = 65535 - total_sent;
+        while total_sent < WINDOW {
+            let remaining = WINDOW - total_sent;
             let to_send = remaining.min(16384);
             let n = client
                 .send_data(&mut cio.as_io(), stream_id, &chunk[..to_send], false)
@@ -1628,6 +1883,354 @@ mod tests {
 
         let result = client.send_data(&mut cio.as_io(), stream_id, &[0u8; 1024], true);
         assert_eq!(result, Ok(1024));
+    }
+
+    #[test]
+    fn large_body_paced_by_flow_control_no_drops() {
+        // A request body several times larger than the per-stream receive
+        // window must arrive intact. The server advertises a window equal to
+        // its per-stream `data_buf` (see H2Connection::new) and credits
+        // WINDOW_UPDATE only as it drains via `recv_body`, so the client is
+        // paced to the server's consumption rate and never overruns the
+        // buffer. Before the window/DATABUF fix, the client would send up to
+        // the 65535 default and the server silently dropped everything past
+        // 4 KB.
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<16384>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<16384>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+
+        let stream_id = client
+            .open_stream(
+                &mut cio.as_io(),
+                &[
+                    (b":method", b"POST"),
+                    (b":path", b"/system/update"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"example.com"),
+                ],
+                false,
+            )
+            .unwrap();
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
+        while server.poll_event().is_some() {}
+
+        // Position-dependent payload spanning multiple windows so a drop or
+        // reorder is caught by the content comparison.
+        const TOTAL: usize = 4096 * 3 + 1234;
+        let payload: alloc::vec::Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+
+        let mut sent = 0usize;
+        let mut closed = false;
+        let mut finished = false;
+        let mut received: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        let mut drain = [0u8; 1024];
+
+        // Pump: client sends as the window allows; server drains (crediting
+        // WINDOW_UPDATE); credits flow back via exchange. The iteration bound
+        // guards against a regression where the window never reopens (deadlock).
+        for _ in 0..2000 {
+            if sent < TOTAL {
+                match client.send_data(&mut cio.as_io(), stream_id, &payload[sent..], false) {
+                    Ok(n) => sent += n,
+                    Err(Error::WouldBlock) => {}
+                    Err(e) => panic!("send_data failed: {:?}", e),
+                }
+            } else if !closed {
+                client
+                    .send_data(&mut cio.as_io(), stream_id, &[], true)
+                    .unwrap();
+                closed = true;
+            }
+
+            exchange(&mut client, &mut cio, &mut server, &mut sio);
+            while server.poll_event().is_some() {}
+
+            loop {
+                match server.recv_body(&mut sio.as_io(), stream_id, &mut drain) {
+                    Ok((0, true)) => {
+                        finished = true;
+                        break;
+                    }
+                    Ok((0, false)) => break,
+                    Ok((n, fin)) => {
+                        received.extend_from_slice(&drain[..n]);
+                        if fin {
+                            finished = true;
+                            break;
+                        }
+                    }
+                    Err(Error::WouldBlock) => break,
+                    Err(e) => panic!("recv_body failed: {:?}", e),
+                }
+            }
+
+            // Deliver WINDOW_UPDATE credits (and anything else) back to client.
+            exchange(&mut server, &mut sio, &mut client, &mut cio);
+
+            if finished && closed {
+                break;
+            }
+        }
+
+        assert!(finished, "server never observed end of stream");
+        assert_eq!(sent, TOTAL, "client did not send the whole body");
+        assert_eq!(
+            received.len(),
+            TOTAL,
+            "received byte count != sent (data dropped under flow control)"
+        );
+        assert_eq!(received, payload, "received body content mismatch");
+    }
+
+    #[test]
+    fn window_update_deferred_when_send_buffer_full_not_dropped() {
+        // Regression: with a full send buffer, recv_body must DEFER the
+        // WINDOW_UPDATE (leaving the advertised recv_window unchanged) rather
+        // than drop the frame while crediting the window anyway. The old code
+        // ignored the queue_send result but still advanced recv_window, so a
+        // full buffer desynced our window from the peer's view and stalled the
+        // upload forever (peer waits for credit it never receives -> no more
+        // DATA -> nothing drives a retry). The deferred credit must flush from
+        // generate_output once the buffer drains.
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<16384>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<16384>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+
+        let stream_id = client
+            .open_stream(
+                &mut cio.as_io(),
+                &[
+                    (b":method", b"POST"),
+                    (b":path", b"/system/update"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"example.com"),
+                ],
+                false,
+            )
+            .unwrap();
+        let chunk = [0xABu8; 1000];
+        client
+            .send_data(&mut cio.as_io(), stream_id, &chunk, false)
+            .unwrap();
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
+        while server.poll_event().is_some() {}
+
+        let recv_window_before = server
+            .streams
+            .iter()
+            .find(|s| s.id == stream_id)
+            .unwrap()
+            .recv_window;
+
+        // Fill the server's send buffer so the WINDOW_UPDATE cannot be queued.
+        let filler = [0u8; 16384];
+        let used = sio.send_buf.len();
+        sio.send_buf
+            .extend_from_slice(&filler[..16384 - used])
+            .unwrap();
+
+        // Drain the body. The credit wants to go out but the buffer is full.
+        let mut buf = [0u8; 2048];
+        let (n, _fin) = server
+            .recv_body(&mut sio.as_io(), stream_id, &mut buf)
+            .unwrap();
+        assert_eq!(n, 1000);
+
+        // Credit deferred, advertised window unchanged, nothing silently dropped.
+        let stream = server.streams.iter().find(|s| s.id == stream_id).unwrap();
+        assert_eq!(
+            stream.recv_window, recv_window_before,
+            "recv_window must not advance while the WINDOW_UPDATE is deferred"
+        );
+        assert!(
+            stream.pending_recv_credit >= 1000,
+            "stream credit should be pending"
+        );
+        assert!(
+            server.pending_conn_credit >= 1000,
+            "conn credit should be pending"
+        );
+
+        // Drain the buffer; generate_output should now emit the deferred credit.
+        sio.send_buf.clear();
+        server.generate_output(&mut sio.as_io());
+
+        let stream = server.streams.iter().find(|s| s.id == stream_id).unwrap();
+        assert_eq!(
+            stream.pending_recv_credit, 0,
+            "pending stream credit flushed"
+        );
+        assert_eq!(server.pending_conn_credit, 0, "pending conn credit flushed");
+        assert_eq!(
+            stream.recv_window,
+            recv_window_before + 1000,
+            "window advances only after the WINDOW_UPDATE is actually sent"
+        );
+        assert!(
+            !sio.send_buf.is_empty(),
+            "WINDOW_UPDATE emitted after buffer drained"
+        );
+    }
+
+    #[test]
+    fn server_accepts_eager_max_size_data_frame() {
+        // A client may legally send a full SETTINGS_MAX_FRAME_SIZE (16384) DATA
+        // frame on a freshly opened stream before it has processed our SETTINGS
+        // — RFC 9113 §6.9.2 lets it assume the 65535 default stream window. The
+        // server advertises stream window = DATABUF (H2Connection::new), so
+        // DATABUF must be >= 16384 to accept that eager in-flight data instead
+        // of rejecting it with FLOW_CONTROL_ERROR. A 4096 DATABUF reproduced the
+        // observed h2-firmware-upload death on hardware (curl/nghttp2 sends a
+        // ~16 KB DATA frame up front). Model the production server's buffer
+        // sizing: DATABUF = 16384 (matches H2TlsServer's default).
+        let mut client = H2Connection::<16, 2048, 16384>::new_client();
+        let mut cio = H2IoBufs::<32768>::new();
+        let mut server = H2Connection::<16, 2048, 16384>::new_server();
+        let mut sio = H2IoBufs::<32768>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+
+        let sid = client
+            .open_stream(
+                &mut cio.as_io(),
+                &[
+                    (b":method", b"POST"),
+                    (b":path", b"/system/update"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"x"),
+                ],
+                false,
+            )
+            .unwrap();
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
+        while server.poll_event().is_some() {}
+
+        // Hand-craft a raw 16384-byte DATA frame on the stream (bypasses the
+        // client's own send-window check, modelling the pre-SETTINGS race).
+        const PAYLOAD: usize = 16384;
+        let mut frame: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(9 + PAYLOAD);
+        frame.push((PAYLOAD >> 16) as u8);
+        frame.push((PAYLOAD >> 8) as u8);
+        frame.push(PAYLOAD as u8);
+        frame.push(0); // type = DATA
+        frame.push(0); // flags
+        frame.extend_from_slice(&(sid as u32).to_be_bytes());
+        frame.extend_from_slice(&[0xAAu8; PAYLOAD]);
+
+        let result = server.feed_data(&mut sio.as_io(), &frame);
+        assert_eq!(
+            result,
+            Ok(()),
+            "server accepts a max-size (16384) DATA frame within its advertised window"
+        );
+
+        // The full payload is buffered and drainable via recv_body. The frame
+        // carried no END_STREAM, so recv_body yields WouldBlock once drained.
+        let mut sink = alloc::vec::Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match server.recv_body(&mut sio.as_io(), sid, &mut chunk) {
+                Ok((0, _)) => break,
+                Ok((n, _)) => sink.extend_from_slice(&chunk[..n]),
+                Err(Error::WouldBlock) => break,
+                Err(e) => panic!("recv_body failed: {e:?}"),
+            }
+        }
+        assert_eq!(sink.len(), PAYLOAD, "all 16384 body bytes delivered");
+        assert!(sink.iter().all(|&b| b == 0xAA), "body bytes intact");
+    }
+
+    #[test]
+    fn incremental_data_backpressures_small_databuf_and_delivers_all() {
+        // With a small DATABUF (4096) the pump must stream a max-size (16384)
+        // DATA frame into data_buf incrementally: fill to capacity, stop
+        // (leaving the rest parked in recv_buf), and resume once the consumer
+        // drains via recv_body. This is the runner's TCP-backpressure path —
+        // here we model it by re-driving with feed_data(&[]) after each drain.
+        // data_buf must never exceed DATABUF, and the whole body must arrive.
+        const DATABUF: usize = 4096;
+        let mut client = H2Connection::<16, 2048, DATABUF>::new_client();
+        let mut cio = H2IoBufs::<40960>::new();
+        let mut server = H2Connection::<16, 2048, DATABUF>::new_server();
+        let mut sio = H2IoBufs::<40960>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+
+        let sid = client
+            .open_stream(
+                &mut cio.as_io(),
+                &[
+                    (b":method", b"POST"),
+                    (b":path", b"/system/update"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"x"),
+                ],
+                false,
+            )
+            .unwrap();
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
+        while server.poll_event().is_some() {}
+
+        // Model the pre-SETTINGS-ack state: a peer that has not yet processed
+        // our SETTINGS may use the RFC-default 65535 window and burst a
+        // full-size (16384) DATA frame that exceeds our advertised DATABUF
+        // window (RFC 9113 §6.9.2). Our stream-window enforcement is gated on
+        // settings_ack_received, so clear it to exercise that legal burst — the
+        // backpressure path, not a FLOW_CONTROL_ERROR.
+        server.settings_ack_received = false;
+
+        // Hand-craft one max-size (16384) DATA frame and feed it whole, as a
+        // 16 KB TLS record would deliver it.
+        const PAYLOAD: usize = 16384;
+        let mut frame: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(9 + PAYLOAD);
+        frame.push((PAYLOAD >> 16) as u8);
+        frame.push((PAYLOAD >> 8) as u8);
+        frame.push(PAYLOAD as u8);
+        frame.push(0); // DATA
+        frame.push(0); // flags
+        frame.extend_from_slice(&(sid as u32).to_be_bytes());
+        frame.extend_from_slice(&[0x5Au8; PAYLOAD]);
+        server.feed_data(&mut sio.as_io(), &frame).unwrap();
+
+        // Drain + re-drive until the frame is fully consumed. data_buf is
+        // bounded by DATABUF the entire time (backpressure), and recv_buf holds
+        // the parked remainder.
+        let mut total = 0usize;
+        let mut chunk = [0u8; 1024];
+        for _ in 0..1000 {
+            let max_seen = server
+                .streams
+                .iter()
+                .find(|s| s.id == sid)
+                .unwrap()
+                .data_buf
+                .len();
+            assert!(
+                max_seen <= DATABUF,
+                "data_buf {max_seen} exceeded DATABUF {DATABUF} — backpressure failed"
+            );
+            // Fully drain whatever is buffered.
+            loop {
+                match server.recv_body(&mut sio.as_io(), sid, &mut chunk) {
+                    Ok((0, _)) => break,
+                    Ok((n, _)) => total += n,
+                    Err(Error::WouldBlock) => break,
+                    Err(e) => panic!("recv_body: {e:?}"),
+                }
+            }
+            if !server.has_partial_data() {
+                break;
+            }
+            // Re-drive the pump (models the runner's empty feed after a drain).
+            server.feed_data(&mut sio.as_io(), &[]).unwrap();
+        }
+        assert_eq!(
+            total, PAYLOAD,
+            "entire body delivered across backpressured pumps"
+        );
+        assert!(!server.has_partial_data(), "frame fully consumed");
     }
 
     // ====== Item 3: RST_STREAM Reception ======

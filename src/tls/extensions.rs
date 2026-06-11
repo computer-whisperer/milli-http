@@ -12,6 +12,7 @@ const EXT_ALPN: u16 = 0x0010;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 const EXT_KEY_SHARE: u16 = 0x0033;
 const EXT_QUIC_TRANSPORT_PARAMS: u16 = 0x0039;
+const EXT_RECORD_SIZE_LIMIT: u16 = 0x001c;
 
 // Named group for X25519
 const GROUP_X25519: u16 = 0x001d;
@@ -30,6 +31,8 @@ pub struct EncryptedExtensionsData {
     pub alpn: Option<heapless::Vec<u8, 16>>,
     /// Peer's QUIC transport parameters.
     pub transport_params: Option<TransportParams>,
+    /// RFC 8449 record_size_limit advertised by the server, if any.
+    pub record_size_limit: Option<u16>,
 }
 
 /// Parsed extensions from ClientHello.
@@ -42,6 +45,23 @@ pub struct ClientHelloExtensions {
     pub alpn_protocols: heapless::Vec<heapless::Vec<u8, 16>, 4>,
     /// Client's QUIC transport parameters.
     pub transport_params: Option<TransportParams>,
+    /// RFC 8449 record_size_limit advertised by the client, if any.
+    pub record_size_limit: Option<u16>,
+}
+
+/// Parse an RFC 8449 record_size_limit extension body.
+///
+/// The body is exactly a 2-byte big-endian value; RFC 8449 §4 makes any
+/// value below 64 illegal.
+fn parse_record_size_limit(ext_data: &[u8]) -> Result<u16, Error> {
+    if ext_data.len() != 2 {
+        return Err(Error::Tls);
+    }
+    let limit = u16::from_be_bytes([ext_data[0], ext_data[1]]);
+    if limit < 64 {
+        return Err(Error::Tls);
+    }
+    Ok(limit)
 }
 
 /// Write a 2-byte big-endian value.
@@ -74,6 +94,7 @@ pub fn encode_client_hello_extensions(
     public_key: &[u8; 32],
     alpn: &[&[u8]],
     transport_params: Option<&TransportParams>,
+    record_size_limit: Option<u16>,
     buf: &mut [u8],
 ) -> Result<usize, Error> {
     let mut off = 0;
@@ -181,6 +202,13 @@ pub fn encode_client_hello_extensions(
         off += tp_len;
     }
 
+    // --- record_size_limit (RFC 8449) ---
+    if let Some(limit) = record_size_limit {
+        put_u16(buf, &mut off, EXT_RECORD_SIZE_LIMIT)?;
+        put_u16(buf, &mut off, 2)?; // extension data length
+        put_u16(buf, &mut off, limit)?;
+    }
+
     Ok(off)
 }
 
@@ -241,6 +269,7 @@ pub fn parse_encrypted_extensions_data(data: &[u8]) -> Result<EncryptedExtension
     let mut result = EncryptedExtensionsData {
         alpn: None,
         transport_params: None,
+        record_size_limit: None,
     };
 
     let mut off = 0;
@@ -282,6 +311,9 @@ pub fn parse_encrypted_extensions_data(data: &[u8]) -> Result<EncryptedExtension
             EXT_QUIC_TRANSPORT_PARAMS => {
                 result.transport_params = Some(TransportParams::decode(ext_data)?);
             }
+            EXT_RECORD_SIZE_LIMIT => {
+                result.record_size_limit = Some(parse_record_size_limit(ext_data)?);
+            }
             _ => {
                 // Ignore unknown extensions
             }
@@ -298,6 +330,7 @@ pub fn parse_client_hello_extensions(data: &[u8]) -> Result<ClientHelloExtension
         supports_tls13: false,
         alpn_protocols: heapless::Vec::new(),
         transport_params: None,
+        record_size_limit: None,
     };
 
     let mut off = 0;
@@ -383,6 +416,9 @@ pub fn parse_client_hello_extensions(data: &[u8]) -> Result<ClientHelloExtension
             EXT_QUIC_TRANSPORT_PARAMS => {
                 result.transport_params = Some(TransportParams::decode(ext_data)?);
             }
+            EXT_RECORD_SIZE_LIMIT => {
+                result.record_size_limit = Some(parse_record_size_limit(ext_data)?);
+            }
             _ => {
                 // Ignore unknown extensions (SNI, signature_algorithms, etc.)
             }
@@ -425,10 +461,13 @@ pub fn encode_server_hello_extensions(
 
 /// Encode EncryptedExtensions data for the server.
 ///
-/// Includes: ALPN (selected protocol) and QUIC transport parameters.
+/// Includes: ALPN (selected protocol), QUIC transport parameters, and the
+/// RFC 8449 record_size_limit (the max plaintext-plus-content-type bytes
+/// per record that WE are willing to receive).
 pub fn encode_encrypted_extensions_data(
     selected_alpn: &[u8],
     transport_params: Option<&TransportParams>,
+    record_size_limit: Option<u16>,
     buf: &mut [u8],
 ) -> Result<usize, Error> {
     let mut off = 0;
@@ -466,6 +505,13 @@ pub fn encode_encrypted_extensions_data(
         off += tp_len;
     }
 
+    // --- record_size_limit (RFC 8449) ---
+    if let Some(limit) = record_size_limit {
+        put_u16(buf, &mut off, EXT_RECORD_SIZE_LIMIT)?;
+        put_u16(buf, &mut off, 2)?; // extension data length
+        put_u16(buf, &mut off, limit)?;
+    }
+
     Ok(off)
 }
 
@@ -483,6 +529,7 @@ mod tests {
             &public_key,
             &[b"h3"],
             Some(&params),
+            None,
             &mut buf,
         )
         .unwrap();
@@ -592,9 +639,15 @@ mod tests {
         let params = TransportParams::default_params();
         let public_key = [0x42u8; 32];
         let mut buf = [0u8; 1024];
-        let len =
-            encode_client_hello_extensions("", &public_key, &[b"h3"], Some(&params), &mut buf)
-                .unwrap();
+        let len = encode_client_hello_extensions(
+            "",
+            &public_key,
+            &[b"h3"],
+            Some(&params),
+            None,
+            &mut buf,
+        )
+        .unwrap();
 
         // Walk through and verify no SNI
         let mut off = 0;
@@ -617,6 +670,7 @@ mod tests {
             &public_key,
             &[b"h3", b"hq-29"],
             Some(&params),
+            None,
             &mut buf,
         )
         .unwrap();
@@ -629,6 +683,56 @@ mod tests {
         assert_eq!(parsed.alpn_protocols[1].as_slice(), b"hq-29");
         assert!(parsed.transport_params.is_some());
         assert_eq!(parsed.transport_params.unwrap(), params);
+        assert_eq!(parsed.record_size_limit, None);
+    }
+
+    #[test]
+    fn client_hello_record_size_limit_roundtrip() {
+        let public_key = [0x42u8; 32];
+        let mut buf = [0u8; 1024];
+        let len = encode_client_hello_extensions(
+            "example.com",
+            &public_key,
+            &[b"h2"],
+            None,
+            Some(8192),
+            &mut buf,
+        )
+        .unwrap();
+
+        let parsed = parse_client_hello_extensions(&buf[..len]).unwrap();
+        assert_eq!(parsed.record_size_limit, Some(8192));
+    }
+
+    #[test]
+    fn record_size_limit_below_64_rejected() {
+        // RFC 8449 §4: values smaller than 64 are illegal.
+        let mut data = [0u8; 8];
+        let mut off = 0;
+        put_u16(&mut data, &mut off, EXT_RECORD_SIZE_LIMIT).unwrap();
+        put_u16(&mut data, &mut off, 2).unwrap();
+        put_u16(&mut data, &mut off, 63).unwrap();
+
+        assert!(matches!(
+            parse_client_hello_extensions(&data[..off]),
+            Err(Error::Tls)
+        ));
+        assert!(parse_encrypted_extensions_data(&data[..off]).is_err());
+    }
+
+    #[test]
+    fn record_size_limit_wrong_length_rejected() {
+        // The extension body is exactly 2 bytes.
+        let mut data = [0u8; 8];
+        let mut off = 0;
+        put_u16(&mut data, &mut off, EXT_RECORD_SIZE_LIMIT).unwrap();
+        put_u16(&mut data, &mut off, 3).unwrap();
+        data[off] = 0x00;
+        data[off + 1] = 0x40;
+        data[off + 2] = 0x00;
+        off += 3;
+
+        assert!(parse_client_hello_extensions(&data[..off]).is_err());
     }
 
     #[test]
@@ -646,10 +750,36 @@ mod tests {
     fn encode_parse_encrypted_extensions_data_roundtrip() {
         let params = TransportParams::default_params();
         let mut buf = [0u8; 512];
-        let len = encode_encrypted_extensions_data(b"h3", Some(&params), &mut buf).unwrap();
+        let len = encode_encrypted_extensions_data(b"h3", Some(&params), None, &mut buf).unwrap();
 
         let parsed = parse_encrypted_extensions_data(&buf[..len]).unwrap();
         assert_eq!(parsed.alpn.as_ref().unwrap().as_slice(), b"h3");
         assert_eq!(parsed.transport_params.unwrap(), params);
+        assert_eq!(parsed.record_size_limit, None);
+    }
+
+    #[test]
+    fn encrypted_extensions_record_size_limit_roundtrip() {
+        let mut buf = [0u8; 128];
+        let len = encode_encrypted_extensions_data(b"h2", None, Some(2048), &mut buf).unwrap();
+
+        // The extension must be present on the wire as type 0x001c, length 2.
+        let mut off = 0;
+        let mut found = false;
+        while off + 4 <= len {
+            let ext_type = u16::from_be_bytes([buf[off], buf[off + 1]]);
+            let ext_len = u16::from_be_bytes([buf[off + 2], buf[off + 3]]) as usize;
+            off += 4;
+            if ext_type == EXT_RECORD_SIZE_LIMIT {
+                assert_eq!(ext_len, 2);
+                assert_eq!(u16::from_be_bytes([buf[off], buf[off + 1]]), 2048);
+                found = true;
+            }
+            off += ext_len;
+        }
+        assert!(found, "record_size_limit extension missing");
+
+        let parsed = parse_encrypted_extensions_data(&buf[..len]).unwrap();
+        assert_eq!(parsed.record_size_limit, Some(2048));
     }
 }

@@ -210,6 +210,15 @@ pub struct ServerManager<
 
     events: VecDeque<ServerEvent>,
     next_id: u32,
+
+    /// Idle `'static`-slice buffer kits available to lend to a new TLS
+    /// connection (see [`add_tls_buffer_kit`](Self::add_tls_buffer_kit)). A kit
+    /// is popped on accept and returned on teardown via the reclaim funnel, so
+    /// the same `.bss` region is reused for the connection's lifetime and the
+    /// large TLS/h2 I/O buffers never touch the heap. Empty by default →
+    /// connections fall back to heap-backed buffers (std tests, non-firmware
+    /// users).
+    free_kits: Vec<crate::tcp_tls::TlsBufKit>,
     _marker: core::marker::PhantomData<A>,
 }
 
@@ -253,14 +262,61 @@ where
             quic_conns: Vec::new(),
             events: VecDeque::new(),
             next_id: 0,
+            free_kits: Vec::new(),
             _marker: core::marker::PhantomData,
         }
+    }
+
+    /// Donate a [`TlsBufKit`](crate::tcp_tls::TlsBufKit) of `'static` slices for
+    /// the manager to lend to TLS connections instead of heap-allocating their
+    /// I/O buffers. Each slice must be at least `BUF` bytes. Add as many kits as
+    /// the maximum number of concurrent TLS connections; if none are available
+    /// at accept time the connection falls back to heap-backed buffers.
+    pub fn add_tls_buffer_kit(&mut self, kit: crate::tcp_tls::TlsBufKit) {
+        self.free_kits.push(kit);
+    }
+
+    /// Number of `'static` buffer kits currently idle in the free pool (i.e.
+    /// donated but not lent to a live connection). Useful for diagnostics and
+    /// for verifying the reclaim funnel returns kits on teardown.
+    pub fn free_tls_buffer_kits(&self) -> usize {
+        self.free_kits.len()
+    }
+
+    /// Remove and return one idle buffer kit from the free pool, if any. The
+    /// inverse of [`add_tls_buffer_kit`](Self::add_tls_buffer_kit); the manager
+    /// gives up the `.bss` slices to the caller.
+    pub fn take_tls_buffer_kit(&mut self) -> Option<crate::tcp_tls::TlsBufKit> {
+        self.free_kits.pop()
     }
 
     fn alloc_id(&mut self) -> ConnId {
         let id = ConnId(self.next_id);
         self.next_id += 1;
         id
+    }
+
+    /// Reclaim funnel: take a TCP connection's state to `Closed`, recovering any
+    /// `'static` buffer kit it was lent (from `Handshaking` parts directly, or
+    /// from an `Established` HTTP conn via `reclaim_buffers`) so the `.bss`
+    /// region can be reused by the next connection.
+    ///
+    /// EVERY transition of a connection to `Closed` must go through here, or the
+    /// kit leaks and the manager silently degrades to heap-backed buffers
+    /// (which is exactly the fragmentation this design avoids). Operates on the
+    /// state field alone (a split borrow), so it is callable from sites that
+    /// hold only `&mut conn.state`. The recovered kit is returned for the caller
+    /// to push into `free_kits` (callers inside a `&mut self.tcp_conns` borrow
+    /// can't touch `free_kits` directly).
+    #[must_use = "the reclaimed kit must be returned to free_kits or it leaks"]
+    fn reclaim_and_close(state: &mut TcpState<C, BUF>) -> Option<crate::tcp_tls::TlsBufKit> {
+        let kit = match state {
+            TcpState::Handshaking(parts) => parts.reclaim_buffers(),
+            TcpState::Established(http) => http.reclaim_buffers(),
+            TcpState::Closed => None,
+        };
+        *state = TcpState::Closed;
+        kit
     }
 
     // -----------------------------------------------------------------------
@@ -291,12 +347,24 @@ where
         rng.fill(&mut secret);
         rng.fill(&mut random);
 
-        let parts = TlsParts::new_server(
-            self.provider.clone(),
-            self.tls_config.clone(),
-            secret,
-            random,
-        );
+        // Lend a `'static` buffer kit if one is free, so the large TLS/h2 I/O
+        // buffers live in `.bss` instead of the heap; otherwise fall back to
+        // heap-backed buffers (no kit donated, e.g. std tests).
+        let parts = match self.free_kits.pop() {
+            Some(kit) => TlsParts::new_server_in(
+                self.provider.clone(),
+                self.tls_config.clone(),
+                secret,
+                random,
+                kit,
+            ),
+            None => TlsParts::new_server(
+                self.provider.clone(),
+                self.tls_config.clone(),
+                secret,
+                random,
+            ),
+        };
 
         self.tcp_conns.push(TcpConn {
             id,
@@ -350,7 +418,9 @@ where
             if let TcpState::Handshaking(parts) = &mut conn.state {
                 if let Err(e) = parts.feed_data(data) {
                     let conn_id = conn.id;
-                    conn.state = TcpState::Closed;
+                    if let Some(kit) = Self::reclaim_and_close(&mut conn.state) {
+                        self.free_kits.push(kit);
+                    }
                     self.push_server_event(ServerEvent::Closed(conn_id));
                     return Err(e);
                 }
@@ -368,6 +438,8 @@ where
                 };
 
                 let alpn = parts.alpn();
+                // `parts` is moved into the building arms below. The reject arm
+                // does not consume it, so reclaim its kit there before dropping.
                 let (protocol, http_conn): (ConnProtocol, Box<dyn HttpServerConn>) = match alpn {
                     #[cfg(feature = "h2")]
                     Some(b"h2") => (
@@ -386,8 +458,13 @@ where
                     ),
                     _ => {
                         // Unknown/unsupported ALPN — reject the connection.
+                        // `conn.state` is already `Closed` (replaced above); the
+                        // kit lives in the still-owned `parts` here.
                         let conn_id = conn.id;
-                        conn.state = TcpState::Closed;
+                        let mut parts = parts;
+                        if let Some(kit) = parts.reclaim_buffers() {
+                            self.free_kits.push(kit);
+                        }
                         self.push_server_event(ServerEvent::Closed(conn_id));
                         return Err(Error::InvalidState);
                     }
@@ -396,7 +473,8 @@ where
 
                 // Process any application data that was decrypted alongside the
                 // final handshake message (common with TLS 1.3 piggybacking).
-                // Feeding an empty slice triggers processing of existing app_recv.
+                // Feeding an empty slice triggers processing of the decrypted
+                // plaintext already sitting in net_recv's visible prefix.
                 let _ = http_conn.tcp_feed_data(&[]);
 
                 conn.state = TcpState::Established(http_conn);
@@ -415,6 +493,22 @@ where
                 _ => Err(Error::InvalidState),
             }
         }
+    }
+
+    /// Whether an established connection is applying receive backpressure: it
+    /// is holding undelivered body data behind a full application buffer, so
+    /// the runner should stop reading more TCP for it and instead re-drive
+    /// processing (feed an empty slice) so the consumer can drain. See
+    /// [`HttpServerConn::recv_blocked`].
+    pub fn conn_recv_blocked(&self, id: ConnId) -> bool {
+        self.tcp_conns
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| match &c.state {
+                TcpState::Established(http) => http.recv_blocked(),
+                _ => false,
+            })
+            .unwrap_or(false)
     }
 
     /// Pull outgoing TCP data from a connection.
@@ -558,7 +652,10 @@ where
             return Some(ev);
         }
 
-        // Poll TCP connections
+        // Poll TCP connections. A connection that has closed itself is taken to
+        // `Closed` via the reclaim funnel; the recovered kit is stashed and
+        // pushed to free_kits after the `tcp_conns` borrow ends.
+        let mut reclaimed: Option<(ConnId, Option<crate::tcp_tls::TlsBufKit>)> = None;
         for conn in &mut self.tcp_conns {
             if let TcpState::Established(http) = &mut conn.state {
                 if let Some(ev) = http.poll_event(scratch) {
@@ -569,10 +666,17 @@ where
                 }
                 if http.is_closed() {
                     let id = conn.id;
-                    conn.state = TcpState::Closed;
-                    return Some(ServerEvent::Closed(id));
+                    let kit = Self::reclaim_and_close(&mut conn.state);
+                    reclaimed = Some((id, kit));
+                    break;
                 }
             }
+        }
+        if let Some((id, kit)) = reclaimed {
+            if let Some(kit) = kit {
+                self.free_kits.push(kit);
+            }
+            return Some(ServerEvent::Closed(id));
         }
 
         // Poll QUIC connections
@@ -788,8 +892,10 @@ where
     /// Expire TCP TLS handshakes past their deadline and drive HTTP-level
     /// timers on established connections.
     fn handle_tcp_timeouts(&mut self, now: u64) {
-        // Collect timed-out IDs first (can't push events while iterating).
+        // Collect timed-out IDs + reclaimed kits first (can't push events or
+        // touch free_kits while iterating tcp_conns).
         let mut timed_out = Vec::new();
+        let mut reclaimed_kits = Vec::new();
         for conn in &mut self.tcp_conns {
             match &mut conn.state {
                 TcpState::Handshaking(_) => {
@@ -798,8 +904,11 @@ where
                             .accepted_at
                             .saturating_add(self.config.handshake_timeout_us)
                     {
-                        conn.state = TcpState::Closed;
-                        timed_out.push(conn.id);
+                        let id = conn.id;
+                        if let Some(kit) = Self::reclaim_and_close(&mut conn.state) {
+                            reclaimed_kits.push(kit);
+                        }
+                        timed_out.push(id);
                     }
                 }
                 TcpState::Established(http) => {
@@ -808,6 +917,7 @@ where
                 TcpState::Closed => {}
             }
         }
+        self.free_kits.append(&mut reclaimed_kits);
         for id in timed_out {
             self.push_server_event(ServerEvent::Closed(id));
         }
@@ -821,6 +931,7 @@ where
         // Drain queued HTTP events before closing, collected into a temp vec
         // to avoid borrow conflict with push_server_event.
         let mut drained = Vec::new();
+        let reclaimed_kit;
         if let Some(tcp) = self.tcp_conns.iter_mut().find(|c| c.id == id) {
             if matches!(tcp.state, TcpState::Closed) {
                 return;
@@ -834,9 +945,12 @@ where
                     });
                 }
             }
-            tcp.state = TcpState::Closed;
+            reclaimed_kit = Self::reclaim_and_close(&mut tcp.state);
         } else {
             return;
+        }
+        if let Some(kit) = reclaimed_kit {
+            self.free_kits.push(kit);
         }
         for ev in drained {
             self.push_server_event(ev);
@@ -846,11 +960,16 @@ where
 
     /// Close a specific connection.
     pub fn close(&mut self, id: ConnId) -> Result<(), Error> {
+        let reclaimed_kit;
         if let Some(tcp) = self.tcp_conns.iter_mut().find(|c| c.id == id) {
-            if !matches!(tcp.state, TcpState::Closed) {
-                tcp.state = TcpState::Closed;
-                self.push_server_event(ServerEvent::Closed(id));
+            if matches!(tcp.state, TcpState::Closed) {
+                return Ok(());
             }
+            reclaimed_kit = Self::reclaim_and_close(&mut tcp.state);
+            if let Some(kit) = reclaimed_kit {
+                self.free_kits.push(kit);
+            }
+            self.push_server_event(ServerEvent::Closed(id));
             return Ok(());
         }
         #[cfg(feature = "h3")]

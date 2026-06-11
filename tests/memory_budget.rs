@@ -88,7 +88,7 @@ fn https1_estimate(
 
     // Post-handshake: TlsEngine bufs shrunk to 0
     let http1_heap = http1_hdr_buf + http1_data_buf;
-    let tls_io_heap = 4 * tls_io_buf; // recv, send, app_recv, app_send
+    let tls_io_heap = 3 * tls_io_buf; // net_recv (in-place decrypt), net_send, app_send
     (struc, http1_heap + tls_io_heap)
 }
 
@@ -105,8 +105,8 @@ fn h2_tls_estimate(
     let streams_heap = active_streams * (48 + hdrbuf + databuf);
     // H2 events: VecDeque<H2Event>, typically small
     let events_heap = 8 * size_of::<H2Event>();
-    // 4 shared TLS/H2 buffers (net_recv, net_send, app_recv, app_send)
-    let tls_io_heap = 4 * tls_buf_size;
+    // 3 shared TLS/H2 buffers (net_recv with in-place decrypt, net_send, app_send)
+    let tls_io_heap = 3 * tls_buf_size;
     (h2_tls_struct, streams_heap + events_heap + tls_io_heap)
 }
 
@@ -206,14 +206,17 @@ fn print_memory_budget() {
     );
     // Note: With alloc, Buf<N> is Vec<u8> (24 bytes struct).
     // The BUF param is a capacity cap, not upfront allocation.
-    // Peak heap per TlsParts = 4 * BUF (when all 4 bufs are at capacity).
+    // Peak heap per TlsParts = 3 * BUF (when all 3 bufs are at capacity):
+    // net_recv (TLS records decrypted in place), net_send, app_send. There is
+    // no separate app_recv buffer — decrypt-in-place leaves plaintext in
+    // net_recv's visible prefix.
     println!(
-        "  -> Peak heap per TlsParts<4096>: {} bytes (4 x 4096)",
-        4 * 4096
+        "  -> Peak heap per TlsParts<4096>: {} bytes (3 x 4096)",
+        3 * 4096
     );
     println!(
-        "  -> Peak heap per TlsParts<2048>: {} bytes (4 x 2048)",
-        4 * 2048
+        "  -> Peak heap per TlsParts<2048>: {} bytes (3 x 2048)",
+        3 * 2048
     );
     println!();
 
@@ -249,7 +252,7 @@ fn print_memory_budget() {
     );
 
     // TCP handshake in progress: TlsParts<C, 4096> peak heap
-    let tcp_hs_compact = 4 * 4096; // 4 bufs at capacity during handshake
+    let tcp_hs_compact = 3 * 4096; // 3 bufs at capacity during handshake
     println!(
         "  TCP handshake (TlsParts):    {:>6} bytes  (peak heap for 4096B bufs)",
         tcp_hs_compact
@@ -305,7 +308,7 @@ fn print_memory_budget() {
         https1_tight, h1s_t, h1h_t
     );
 
-    let tcp_hs_tight = 4 * 2048;
+    let tcp_hs_tight = 3 * 2048;
     println!(
         "  TCP handshake (TlsParts):    {:>6} bytes  (peak heap for 2048B bufs)",
         tcp_hs_tight
