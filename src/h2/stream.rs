@@ -37,6 +37,12 @@ pub struct H2Stream<const HDRBUF: usize = 2048, const DATABUF: usize = 4096> {
     /// frame is actually queued, so the advertised window never desyncs from
     /// what the peer has been told.
     pub pending_recv_credit: u32,
+    /// RST_STREAM error code queued by `discard_body` but not yet sent
+    /// because the send buffer was full. Retried from `generate_output`
+    /// (same deferral pattern as `pending_recv_credit`); the stream slot is
+    /// retained until the frame actually goes out, so a cancel is never
+    /// silently lost to a full buffer.
+    pub pending_rst: Option<u32>,
 }
 
 impl<const HDRBUF: usize, const DATABUF: usize> H2Stream<HDRBUF, DATABUF> {
@@ -53,6 +59,7 @@ impl<const HDRBUF: usize, const DATABUF: usize> H2Stream<HDRBUF, DATABUF> {
             fin_received: false,
             fin_sent: false,
             pending_recv_credit: 0,
+            pending_rst: None,
         }
     }
 

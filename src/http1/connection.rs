@@ -367,7 +367,11 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
         data: &[u8],
         now: u64,
     ) -> Result<(), Error> {
-        self.last_activity = now;
+        // Only non-empty feeds count as activity (matches H2Connection):
+        // empty re-drive feeds must not refresh the idle clock.
+        if !data.is_empty() {
+            self.last_activity = now;
+        }
         self.feed_data(io, data)
     }
 
@@ -1803,7 +1807,12 @@ mod tests {
         while conn.poll_event().is_some() {}
         conn.recv_headers(1, |_, _| {}).unwrap();
 
-        conn.feed_data_timed(&mut io.as_io(), b"", 200_000).unwrap();
+        // First bytes of the next request arrive at t=200ms — this is what
+        // triggers the keep-alive transition and anchors the next header
+        // deadline. (Empty feeds deliberately do not count as activity, so
+        // they can no longer stand in for the clock here.)
+        conn.feed_data_timed(&mut io.as_io(), b"GET /b HT", 200_000)
+            .unwrap();
 
         conn.handle_timeout(600_000);
         assert!(!conn.is_closed());

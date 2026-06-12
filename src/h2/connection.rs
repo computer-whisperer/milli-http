@@ -572,6 +572,76 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         Ok((copy_len, fin))
     }
 
+    /// Stop receiving a stream's request body: the application will not (or
+    /// no longer) read it. Use when responding without consuming the body
+    /// (e.g. rejecting an upload with 413) — otherwise the unread body fills
+    /// `data_buf`, the pump stalls, and the connection wedges behind the
+    /// runner's receive backpressure with nothing left to unwedge it.
+    ///
+    /// Effects:
+    /// - An in-flight DATA frame on this stream switches the pump to discard
+    ///   mode: the remaining payload is drained off `recv_buf` and the
+    ///   connection window credited, so frames behind it become parseable
+    ///   again and `recv_blocked` clears.
+    /// - Buffered-but-unread body bytes are dropped and credited back to the
+    ///   connection window (RFC 9113 §6.9.1).
+    /// - Unless the peer already finished the stream (END_STREAM received —
+    ///   nothing more is coming), RST_STREAM with `error_code` is sent so the
+    ///   peer stops transmitting. Use `0` (NO_ERROR) when rejecting after a
+    ///   complete response (RFC 9113 §8.1), `0x8` (CANCEL) otherwise. A full
+    ///   send buffer defers the frame (`H2Stream::pending_rst`), retried from
+    ///   `generate_output` — never silently dropped.
+    ///
+    /// The stream transitions to Closed; its slot is reaped once any pending
+    /// RST has gone out. Returns `InvalidState` if the stream doesn't exist.
+    pub fn discard_body<const BUF: usize>(
+        &mut self,
+        io: &mut H2Io<'_, BUF>,
+        stream_id: u64,
+        error_code: u32,
+    ) -> Result<(), Error> {
+        if !self.streams.iter().any(|s| s.id == stream_id) {
+            return Err(Error::InvalidState);
+        }
+
+        // Abandon any in-flight DATA frame: the pump drains the remaining
+        // payload off recv_buf (crediting the connection window) instead of
+        // waiting forever for data_buf space that will never come.
+        if let Some(pd) = self.partial_data.as_mut() {
+            if pd.stream_id == stream_id {
+                pd.deliver = false;
+            }
+        }
+
+        let (buffered, send_rst) = {
+            let stream = self
+                .streams
+                .iter_mut()
+                .find(|s| s.id == stream_id)
+                .expect("checked above");
+            let buffered = stream.data_buf.len() as u32;
+            stream.data_buf.clear();
+            stream.data_available = false;
+            // No RST needed if the peer already half-closed: nothing more is
+            // coming, the discard is purely local.
+            let send_rst = !stream.fin_received;
+            if send_rst {
+                stream.pending_rst = Some(error_code);
+            }
+            stream.reset();
+            (buffered, send_rst)
+        };
+        if buffered > 0 {
+            self.send_window_update(io, 0, buffered);
+        }
+        if send_rst {
+            // Try to get the RST out now; a full send buffer leaves it
+            // pending for generate_output to retry.
+            self.flush_window_updates(io);
+        }
+        Ok(())
+    }
+
     /// Send a GOAWAY frame.
     pub fn send_goaway<const BUF: usize>(
         &mut self,
@@ -678,11 +748,15 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         self.flush_window_updates(io);
     }
 
-    /// Emit any deferred WINDOW_UPDATE credit (connection + per-stream) that
-    /// fits in the send buffer, applying the credit to the advertised window
-    /// only on a successful queue. Pending credit coalesces, so a backlog
-    /// drains as one larger increment once buffer space frees. Called from
-    /// `generate_output`, so it retries on every `poll_output` cycle.
+    /// Emit any deferred per-stream control frames — WINDOW_UPDATE credit
+    /// (connection + per-stream) and RST_STREAM queued by [`discard_body`]
+    /// — that fit in the send buffer, applying the effect (window advance,
+    /// pending-RST clear) only on a successful queue. Pending credit
+    /// coalesces, so a backlog drains as one larger increment once buffer
+    /// space frees. Called from `generate_output`, so it retries on every
+    /// `poll_output` cycle.
+    ///
+    /// [`discard_body`]: Self::discard_body
     fn flush_window_updates<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>) {
         let mut buf = [0u8; 16];
         if self.pending_conn_credit > 0 {
@@ -699,20 +773,30 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
             }
         }
         for stream in self.streams.iter_mut() {
-            if stream.pending_recv_credit == 0 {
-                continue;
+            if stream.pending_recv_credit > 0 {
+                let inc = stream.pending_recv_credit;
+                let frame = H2Frame::WindowUpdate {
+                    stream_id: stream.id,
+                    increment: inc,
+                };
+                if let Ok(n) = frame::encode_frame(&frame, &mut buf)
+                    && io.queue_send(&buf[..n]).is_ok()
+                {
+                    let new_window = stream.recv_window as i64 + inc as i64;
+                    stream.recv_window = new_window.min(0x7fff_ffff) as i32;
+                    stream.pending_recv_credit = 0;
+                }
             }
-            let inc = stream.pending_recv_credit;
-            let frame = H2Frame::WindowUpdate {
-                stream_id: stream.id,
-                increment: inc,
-            };
-            if let Ok(n) = frame::encode_frame(&frame, &mut buf)
-                && io.queue_send(&buf[..n]).is_ok()
-            {
-                let new_window = stream.recv_window as i64 + inc as i64;
-                stream.recv_window = new_window.min(0x7fff_ffff) as i32;
-                stream.pending_recv_credit = 0;
+            if let Some(error_code) = stream.pending_rst {
+                let frame = H2Frame::RstStream {
+                    stream_id: stream.id,
+                    error_code,
+                };
+                if let Ok(n) = frame::encode_frame(&frame, &mut buf)
+                    && io.queue_send(&buf[..n]).is_ok()
+                {
+                    stream.pending_rst = None;
+                }
             }
         }
     }
@@ -1199,8 +1283,12 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
             io.drain_recv(total);
         }
 
-        self.streams
-            .retain(|s| s.state != H2StreamState::Closed || s.data_available);
+        self.streams.retain(|s| {
+            // Keep Closed streams that still have undelivered body data,
+            // or a deferred RST_STREAM (discard_body under a full send
+            // buffer) that must go out before the slot can be reused.
+            s.state != H2StreamState::Closed || s.data_available || s.pending_rst.is_some()
+        });
 
         Ok(())
     }
@@ -1323,14 +1411,23 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         }
     }
 
-    /// Feed data with timestamp tracking. Updates `last_activity` then calls `feed_data`.
+    /// Feed data with timestamp tracking. Updates `last_activity` then calls
+    /// `feed_data`.
+    ///
+    /// Only non-empty feeds count as activity: the runner re-drives a
+    /// backpressured connection with empty feeds every poll cycle, and a
+    /// wedged connection (body never drained) must not refresh its own idle
+    /// clock through those — the idle timeout is exactly the backstop that
+    /// reaps it.
     pub fn feed_data_timed<const BUF: usize>(
         &mut self,
         io: &mut H2Io<'_, BUF>,
         data: &[u8],
         now: u64,
     ) -> Result<(), Error> {
-        self.last_activity = now;
+        if !data.is_empty() {
+            self.last_activity = now;
+        }
         self.feed_data(io, data)
     }
 
@@ -1669,9 +1766,11 @@ mod tests {
         server.set_timeouts(config, 0);
         run_handshake(&mut client, &mut cio, &mut server, &mut sio);
 
-        // Activity at t=800ms
+        // Activity at t=800ms. Must be real bytes: empty feeds (the runner's
+        // backpressure re-drives) deliberately do not count as activity.
+        let ping = [0u8, 0, 8, 0x6, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
         server
-            .feed_data_timed(&mut sio.as_io(), b"", 800_000)
+            .feed_data_timed(&mut sio.as_io(), &ping, 800_000)
             .unwrap();
 
         // Check at t=1.5s — should NOT timeout
@@ -2316,6 +2415,281 @@ mod tests {
             server.streams.is_empty(),
             "drained Closed stream must be reaped, not leak its slot"
         );
+    }
+
+    // ====== discard_body ======
+
+    /// Parse a raw h2 byte stream into (frame_type, stream_id, payload) tuples.
+    fn parse_frames(raw: &[u8]) -> alloc::vec::Vec<(u8, u32, alloc::vec::Vec<u8>)> {
+        let mut frames = alloc::vec::Vec::new();
+        let mut off = 0;
+        while off + 9 <= raw.len() {
+            let len = ((raw[off] as usize) << 16)
+                | ((raw[off + 1] as usize) << 8)
+                | raw[off + 2] as usize;
+            let ty = raw[off + 3];
+            let sid = u32::from_be_bytes([raw[off + 5], raw[off + 6], raw[off + 7], raw[off + 8]])
+                & 0x7fff_ffff;
+            let ps = off + 9;
+            frames.push((ty, sid, raw[ps..ps + len].to_vec()));
+            off = ps + len;
+        }
+        assert_eq!(off, raw.len(), "trailing partial frame in stream");
+        frames
+    }
+
+    #[test]
+    fn discard_body_unwedges_stalled_pump_and_sends_rst() {
+        // A stalled pump (data_buf full, app refuses to drain) wedges the
+        // connection: frames behind the parked payload are unreachable and
+        // the runner's backpressure gating stops socket reads. discard_body
+        // is the escape hatch: the pump flips to discard mode, the remaining
+        // payload drains off recv_buf (crediting the connection window), and
+        // RST_STREAM tells the peer to stop sending.
+        const DATABUF: usize = 4096;
+        let mut client = H2Connection::<16, 2048, DATABUF>::new_client();
+        let mut cio = H2IoBufs::<40960>::new();
+        let mut server = H2Connection::<16, 2048, DATABUF>::new_server();
+        let mut sio = H2IoBufs::<40960>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+
+        let sid = client
+            .open_stream(
+                &mut cio.as_io(),
+                &[
+                    (b":method", b"POST"),
+                    (b":path", b"/system/update"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"x"),
+                ],
+                false,
+            )
+            .unwrap();
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
+        while server.poll_event().is_some() {}
+
+        // Pre-SETTINGS-ack burst: a full 16384-byte DATA frame (legal under
+        // the RFC-default window, RFC 9113 \u{a7}6.9.2).
+        server.settings_ack_received = false;
+        const PAYLOAD: usize = 16384;
+        let mut frame: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(9 + PAYLOAD);
+        frame.push((PAYLOAD >> 16) as u8);
+        frame.push((PAYLOAD >> 8) as u8);
+        frame.push(PAYLOAD as u8);
+        frame.push(0); // DATA
+        frame.push(0); // flags
+        frame.extend_from_slice(&(sid as u32).to_be_bytes());
+        frame.extend_from_slice(&[0x5Au8; PAYLOAD]);
+        server.feed_data(&mut sio.as_io(), &frame).unwrap();
+
+        // The pump is stalled: data_buf holds DATABUF bytes, the rest is
+        // parked in recv_buf. The app never drains.
+        assert!(server.has_partial_data(), "pump should be stalled");
+
+        // App decides not to read the body.
+        server.discard_body(&mut sio.as_io(), sid, 0x8).unwrap();
+
+        // Runner-style empty re-drive: the discard pump must consume the
+        // entire remaining payload without needing data_buf space.
+        server.feed_data(&mut sio.as_io(), &[]).unwrap();
+        assert!(!server.has_partial_data(), "discard pump must finish");
+        assert!(
+            server.streams.is_empty(),
+            "discarded stream slot must be reaped"
+        );
+
+        // Wire contract: RST_STREAM(CANCEL) went out, and the connection
+        // window was fully re-credited (16384 across WINDOW_UPDATEs on
+        // stream 0) so the next request's body has room.
+        let mut out = alloc::vec::Vec::new();
+        let mut buf = [0u8; 8192];
+        while let Some(d) = server.poll_output(&mut sio.as_io(), &mut buf) {
+            out.extend_from_slice(d);
+        }
+        let frames = parse_frames(&out);
+        let rst: alloc::vec::Vec<_> = frames
+            .iter()
+            .filter(|(ty, _, _)| *ty == FRAME_RST_STREAM)
+            .collect();
+        assert_eq!(rst.len(), 1, "exactly one RST_STREAM");
+        assert_eq!(rst[0].1 as u64, sid, "RST on the discarded stream");
+        assert_eq!(
+            u32::from_be_bytes([rst[0].2[0], rst[0].2[1], rst[0].2[2], rst[0].2[3]]),
+            0x8,
+            "CANCEL error code"
+        );
+        let conn_credit: usize = frames
+            .iter()
+            .filter(|(ty, sid, _)| *ty == FRAME_WINDOW_UPDATE && *sid == 0)
+            .map(|(_, _, p)| u32::from_be_bytes([p[0], p[1], p[2], p[3]]) as usize)
+            .sum();
+        assert_eq!(
+            conn_credit, PAYLOAD,
+            "entire discarded payload re-credited to the connection window"
+        );
+    }
+
+    #[test]
+    fn discard_body_rst_deferred_when_send_buffer_full() {
+        // discard_body with a full send buffer must defer the RST_STREAM
+        // (H2Stream::pending_rst) and keep the stream slot alive until the
+        // frame actually goes out via generate_output — a silently dropped
+        // RST would leave the peer uploading into a dead stream forever.
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<16384>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<16384>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+
+        let sid = client
+            .open_stream(
+                &mut cio.as_io(),
+                &[
+                    (b":method", b"POST"),
+                    (b":path", b"/upload"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"x"),
+                ],
+                false,
+            )
+            .unwrap();
+        client
+            .send_data(&mut cio.as_io(), sid, &[0xAB; 100], false)
+            .unwrap();
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
+        while server.poll_event().is_some() {}
+
+        // Fill the server's send buffer so nothing can be queued.
+        let used = sio.send_buf.len();
+        let filler = alloc::vec![0u8; 16384 - used];
+        sio.send_buf.extend_from_slice(&filler).unwrap();
+
+        server.discard_body(&mut sio.as_io(), sid, 0x8).unwrap();
+        let stream = server.streams.iter().find(|s| s.id == sid).unwrap();
+        assert_eq!(stream.pending_rst, Some(0x8), "RST deferred, not dropped");
+
+        // Retain must keep the slot while the RST is pending.
+        server.feed_data(&mut sio.as_io(), &[]).unwrap();
+        assert!(
+            server.streams.iter().any(|s| s.id == sid),
+            "slot retained until the deferred RST is sent"
+        );
+
+        // Drain the buffer; generate_output flushes the RST; slot reaped.
+        sio.send_buf.clear();
+        server.generate_output(&mut sio.as_io());
+        let out: alloc::vec::Vec<u8> = sio.send_buf.as_slice().to_vec();
+        let frames = parse_frames(&out);
+        assert!(
+            frames
+                .iter()
+                .any(|(ty, fsid, _)| *ty == FRAME_RST_STREAM && *fsid as u64 == sid),
+            "deferred RST_STREAM emitted after buffer drained"
+        );
+        server.feed_data(&mut sio.as_io(), &[]).unwrap();
+        assert!(server.streams.is_empty(), "slot reaped after RST sent");
+    }
+
+    #[test]
+    fn discard_body_after_fin_sends_no_rst() {
+        // If the peer already half-closed (END_STREAM received), nothing more
+        // is coming: discard is purely local bookkeeping and an RST_STREAM
+        // would be noise. The slot must still be reaped.
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<16384>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<16384>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+
+        let sid = client
+            .open_stream(
+                &mut cio.as_io(),
+                &[
+                    (b":method", b"POST"),
+                    (b":path", b"/upload"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"x"),
+                ],
+                false,
+            )
+            .unwrap();
+        client
+            .send_data(&mut cio.as_io(), sid, b"unread body", true)
+            .unwrap();
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
+        while server.poll_event().is_some() {}
+
+        server.discard_body(&mut sio.as_io(), sid, 0x8).unwrap();
+        server.feed_data(&mut sio.as_io(), &[]).unwrap();
+        assert!(server.streams.is_empty(), "slot reaped");
+
+        let mut out = alloc::vec::Vec::new();
+        let mut buf = [0u8; 8192];
+        while let Some(d) = server.poll_output(&mut sio.as_io(), &mut buf) {
+            out.extend_from_slice(d);
+        }
+        assert!(
+            !parse_frames(&out)
+                .iter()
+                .any(|(ty, _, _)| *ty == FRAME_RST_STREAM),
+            "no RST after the peer already finished the stream"
+        );
+    }
+
+    #[test]
+    fn empty_feed_does_not_refresh_idle_clock() {
+        // The runner re-drives backpressured connections with empty feeds
+        // every poll cycle. Those must not count as activity, or a wedged
+        // connection refreshes its own idle clock forever and the timeout
+        // backstop never fires.
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<16384>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<16384>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+        while server.poll_event().is_some() {}
+
+        let config = crate::http::TimeoutConfig {
+            idle_timeout_us: Some(1_000_000),
+            header_timeout_us: None,
+        };
+        server.set_timeouts(config, 0);
+
+        // Empty re-drives right up to the deadline must not push it out.
+        for now in [400_000u64, 800_000, 999_000] {
+            server.feed_data_timed(&mut sio.as_io(), &[], now).unwrap();
+        }
+        server.handle_timeout(&mut sio.as_io(), 1_000_000);
+        let mut timed_out = false;
+        while let Some(ev) = server.poll_event() {
+            if ev == H2Event::Timeout {
+                timed_out = true;
+            }
+        }
+        assert!(timed_out, "idle timeout fires despite empty re-drives");
+
+        // Control: a non-empty feed (a PING) does refresh the clock.
+        let mut server2 = H2Connection::<16>::new_server();
+        let mut sio2 = H2IoBufs::<16384>::new();
+        let mut client2 = H2Connection::<16>::new_client();
+        let mut cio2 = H2IoBufs::<16384>::new();
+        run_handshake(&mut client2, &mut cio2, &mut server2, &mut sio2);
+        while server2.poll_event().is_some() {}
+        server2.set_timeouts(config, 0);
+
+        // PING frame: len 8, type 0x6, flags 0, sid 0, 8 opaque bytes.
+        let ping = [0u8, 0, 8, 0x6, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+        server2
+            .feed_data_timed(&mut sio2.as_io(), &ping, 900_000)
+            .unwrap();
+        server2.handle_timeout(&mut sio2.as_io(), 1_000_000);
+        let mut timed_out2 = false;
+        while let Some(ev) = server2.poll_event() {
+            if ev == H2Event::Timeout {
+                timed_out2 = true;
+            }
+        }
+        assert!(!timed_out2, "real data refreshes the idle clock");
     }
 
     // ====== Item 3: RST_STREAM Reception ======
