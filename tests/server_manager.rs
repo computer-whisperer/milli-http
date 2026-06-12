@@ -1888,3 +1888,241 @@ fn new_connection_reaps_expired_predecessor_inline() {
             .expect("udp_feed must reap the expired conn and accept the new one");
     }
 }
+
+// ===== HTTP-level timeouts + discard_body (h2) =====
+
+/// Drive the manager's timeout machinery; signature differs with/without h3.
+fn drive_timeouts(manager: &mut ServerManager<Aes128GcmProvider, (), 32768>, now: u64) {
+    #[cfg(not(feature = "h3"))]
+    manager.handle_timeouts(now);
+    #[cfg(feature = "h3")]
+    {
+        let mut pool: HandshakePool<Aes128GcmProvider, 4096> = HandshakePool::new();
+        manager.handle_timeouts::<4096>(now, &mut pool);
+    }
+}
+
+/// TLS + h2 handshake between a fresh client and an accepted manager conn.
+fn h2_connect(
+    manager: &mut ServerManager<Aes128GcmProvider, (), 32768>,
+    conn_id: milli_http::server::ConnId,
+    now: u64,
+) -> milli_http::h2_tls::H2TlsClient<Aes128GcmProvider, 32768> {
+    let client_config = TlsConfig {
+        server_name: heapless::String::try_from("test.local").unwrap(),
+        alpn_protocols: &[b"h2"],
+        transport_params: TransportParams::default_params(),
+        pinned_certs: &[],
+    };
+    let mut client = milli_http::h2_tls::H2TlsClient::<Aes128GcmProvider, 32768>::new(
+        Aes128GcmProvider,
+        client_config,
+        [0xCC; 32],
+        [0xDD; 32],
+    );
+    for _ in 0..20 {
+        let mut buf = [0u8; 32768];
+        let mut progress = false;
+        while let Some(data) = client.poll_output(&mut buf) {
+            let copy = data.to_vec();
+            manager.tcp_feed(conn_id, &copy, now).unwrap();
+            progress = true;
+        }
+        let mut buf2 = [0u8; 32768];
+        while let Some(data) = manager.tcp_poll_output(conn_id, &mut buf2) {
+            let copy = data.to_vec();
+            client.feed_data(&copy).unwrap();
+            progress = true;
+        }
+        if !progress {
+            break;
+        }
+    }
+    assert!(client.is_established());
+    client
+}
+
+/// Pump all pending manager output into the client.
+fn pump_to_client(
+    manager: &mut ServerManager<Aes128GcmProvider, (), 32768>,
+    conn_id: milli_http::server::ConnId,
+    client: &mut milli_http::h2_tls::H2TlsClient<Aes128GcmProvider, 32768>,
+) {
+    let mut buf = [0u8; 32768];
+    while let Some(data) = manager.tcp_poll_output(conn_id, &mut buf) {
+        let copy = data.to_vec();
+        client.feed_data(&copy).unwrap();
+    }
+}
+
+#[test]
+fn h2_discard_body_rejects_upload_and_connection_survives() {
+    // An application that responds without reading the request body must be
+    // able to discard it: the body buffer is dropped, flow-control credit
+    // restored, the client told to stop (RST_STREAM NO_ERROR per RFC 9113
+    // §8.1), and — critically — the connection stays usable for the next
+    // request instead of wedging behind receive backpressure.
+    let cert: &'static [u8] = test_cert_der().leak();
+    let server_config = make_server_config(cert);
+    let mut manager: ServerManager<Aes128GcmProvider, (), 32768> =
+        ServerManager::new(Aes128GcmProvider, server_config, ServerConfig::default());
+    let mut rng = TestRng(0x77);
+    let now = 1_000_000;
+
+    let conn_id = manager.accept_tcp(&mut rng, now).unwrap();
+    let mut client = h2_connect(&mut manager, conn_id, now);
+    let mut scratch = [0u8; 2048];
+    while manager.poll_event(&mut scratch).is_some() {}
+    while client.poll_event().is_some() {}
+
+    // Upload: fill the server's entire stream window (DATABUF = 4096).
+    let stream_id = client
+        .send_request("POST", "/upload", "test.local", &[], false)
+        .unwrap();
+    let body = vec![0xABu8; 8192];
+    let sent = client.send_body(stream_id, &body, false).unwrap();
+    assert_eq!(sent, 4096, "client paced to the server's stream window");
+    let mut buf = [0u8; 32768];
+    while let Some(data) = client.poll_output(&mut buf) {
+        let copy = data.to_vec();
+        manager.tcp_feed(conn_id, &copy, now).unwrap();
+    }
+    let mut header_stream = None;
+    while let Some(ev) = manager.poll_event(&mut scratch) {
+        if let ServerEvent::Http {
+            event: HttpEvent::Headers(sid),
+            ..
+        } = ev
+        {
+            header_stream = Some(sid);
+        }
+    }
+    let sid = header_stream.expect("request headers");
+
+    // App rejects WITHOUT reading the body: complete response, then discard.
+    manager.send_response(conn_id, sid, 413, &[], true).unwrap();
+    manager.discard_body(conn_id, sid, 0).unwrap();
+
+    // Client sees the 413 and the RST_STREAM(NO_ERROR).
+    pump_to_client(&mut manager, conn_id, &mut client);
+    let mut got_reset = false;
+    while let Some(ev) = client.poll_event() {
+        if let milli_http::h2::connection::H2Event::StreamReset(rsid, code) = ev {
+            assert_eq!(rsid, stream_id);
+            assert_eq!(code, 0, "NO_ERROR after a complete response");
+            got_reset = true;
+        }
+    }
+    let mut status = Vec::new();
+    client
+        .recv_headers(stream_id, |name, value| {
+            if name == b":status" {
+                status.extend_from_slice(value);
+            }
+        })
+        .unwrap();
+    assert_eq!(status, b"413");
+    assert!(got_reset, "client must be told to stop uploading");
+
+    // The connection survives: a second request completes normally.
+    let stream2 = client
+        .send_request("GET", "/", "test.local", &[], true)
+        .unwrap();
+    while let Some(data) = client.poll_output(&mut buf) {
+        let copy = data.to_vec();
+        manager.tcp_feed(conn_id, &copy, now).unwrap();
+    }
+    let mut sid2 = None;
+    while let Some(ev) = manager.poll_event(&mut scratch) {
+        match ev {
+            ServerEvent::Http {
+                event: HttpEvent::Headers(s),
+                ..
+            } => sid2 = Some(s),
+            ServerEvent::Closed(_) => panic!("connection must survive the discard"),
+            _ => {}
+        }
+    }
+    let sid2 = sid2.expect("second request headers");
+    manager
+        .send_response(conn_id, sid2, 200, &[], true)
+        .unwrap();
+    pump_to_client(&mut manager, conn_id, &mut client);
+    while client.poll_event().is_some() {}
+    let mut status2 = Vec::new();
+    client
+        .recv_headers(stream2, |name, value| {
+            if name == b":status" {
+                status2.extend_from_slice(value);
+            }
+        })
+        .unwrap();
+    assert_eq!(status2, b"200", "connection fully usable after discard");
+}
+
+#[test]
+fn wedged_h2_connection_reaped_by_idle_timeout() {
+    // The backstop for an application that neither drains nor discards a
+    // request body: with default ServerConfig the idle timeout (60 s) fires
+    // — the connection emits Timeout, transitions to Closed, and the manager
+    // reaps it, freeing the slot. Without this the connection (and the
+    // runner polling it) wedged forever.
+    let cert: &'static [u8] = test_cert_der().leak();
+    let server_config = make_server_config(cert);
+    let mut manager: ServerManager<Aes128GcmProvider, (), 32768> =
+        ServerManager::new(Aes128GcmProvider, server_config, ServerConfig::default());
+    let mut rng = TestRng(0x78);
+    let now = 1_000_000;
+
+    let conn_id = manager.accept_tcp(&mut rng, now).unwrap();
+    let mut client = h2_connect(&mut manager, conn_id, now);
+    let mut scratch = [0u8; 2048];
+    while manager.poll_event(&mut scratch).is_some() {}
+    while client.poll_event().is_some() {}
+
+    // Upload arrives; the app never reads it and never discards.
+    let stream_id = client
+        .send_request("POST", "/upload", "test.local", &[], false)
+        .unwrap();
+    let body = vec![0xCDu8; 8192];
+    client.send_body(stream_id, &body, false).unwrap();
+    let mut buf = [0u8; 32768];
+    while let Some(data) = client.poll_output(&mut buf) {
+        let copy = data.to_vec();
+        manager.tcp_feed(conn_id, &copy, now).unwrap();
+    }
+    while manager.poll_event(&mut scratch).is_some() {}
+
+    // Just under the 60 s idle default: still alive.
+    drive_timeouts(&mut manager, now + 59_000_000);
+    assert!(
+        manager.poll_event(&mut scratch).is_none(),
+        "no timeout before the idle deadline"
+    );
+
+    // Past the deadline: Timeout + Closed, and the conn is gone.
+    drive_timeouts(&mut manager, now + 60_000_001);
+    let mut got_timeout = false;
+    let mut got_closed = false;
+    while let Some(ev) = manager.poll_event(&mut scratch) {
+        match ev {
+            ServerEvent::Http {
+                event: HttpEvent::Timeout,
+                ..
+            } => got_timeout = true,
+            ServerEvent::Closed(id) => {
+                assert_eq!(id, conn_id);
+                got_closed = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(got_timeout, "HTTP Timeout event surfaces");
+    assert!(got_closed, "manager reaps the wedged connection");
+    assert!(
+        manager
+            .tcp_feed(conn_id, &[0u8; 1], now + 60_000_002)
+            .is_err(),
+        "closed connection rejects further data"
+    );
+}

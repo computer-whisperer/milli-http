@@ -607,10 +607,10 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         // Abandon any in-flight DATA frame: the pump drains the remaining
         // payload off recv_buf (crediting the connection window) instead of
         // waiting forever for data_buf space that will never come.
-        if let Some(pd) = self.partial_data.as_mut() {
-            if pd.stream_id == stream_id {
-                pd.deliver = false;
-            }
+        if let Some(pd) = self.partial_data.as_mut()
+            && pd.stream_id == stream_id
+        {
+            pd.deliver = false;
         }
 
         let (buffered, send_rst) = {
@@ -1284,10 +1284,17 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         }
 
         self.streams.retain(|s| {
-            // Keep Closed streams that still have undelivered body data,
-            // or a deferred RST_STREAM (discard_body under a full send
-            // buffer) that must go out before the slot can be reused.
-            s.state != H2StreamState::Closed || s.data_available || s.pending_rst.is_some()
+            // Keep Closed streams that still have something for the
+            // application: undelivered body data, unread headers (a complete
+            // response followed by RST_STREAM NO_ERROR — RFC 9113 §8.1's
+            // reject-without-reading pattern — closes the stream in the same
+            // feed that delivered the headers; the response must survive
+            // until read), or a deferred RST_STREAM (discard_body under a
+            // full send buffer) that must go out before the slot is reused.
+            s.state != H2StreamState::Closed
+                || s.data_available
+                || s.headers_received
+                || s.pending_rst.is_some()
         });
 
         Ok(())
@@ -2383,6 +2390,9 @@ mod tests {
             .unwrap();
         exchange(&mut client, &mut cio, &mut server, &mut sio);
         while server.poll_event().is_some() {}
+        // Consume the request headers (any real app does) so the
+        // Closed-stream retain can reap the slot afterwards.
+        server.recv_headers(stream_id, |_, _| {}).unwrap();
         let mut buf = [0u8; 64];
         loop {
             match server.recv_body(&mut sio.as_io(), stream_id, &mut buf) {
@@ -2467,6 +2477,9 @@ mod tests {
             .unwrap();
         exchange(&mut client, &mut cio, &mut server, &mut sio);
         while server.poll_event().is_some() {}
+        // Consume the request headers (any real app does) so the
+        // Closed-stream retain can reap the slot afterwards.
+        server.recv_headers(sid, |_, _| {}).unwrap();
 
         // Pre-SETTINGS-ack burst: a full 16384-byte DATA frame (legal under
         // the RFC-default window, RFC 9113 \u{a7}6.9.2).
@@ -2558,6 +2571,9 @@ mod tests {
             .unwrap();
         exchange(&mut client, &mut cio, &mut server, &mut sio);
         while server.poll_event().is_some() {}
+        // Consume the request headers (any real app does) so the
+        // Closed-stream retain can reap the slot afterwards.
+        server.recv_headers(sid, |_, _| {}).unwrap();
 
         // Fill the server's send buffer so nothing can be queued.
         let used = sio.send_buf.len();
@@ -2618,6 +2634,9 @@ mod tests {
             .unwrap();
         exchange(&mut client, &mut cio, &mut server, &mut sio);
         while server.poll_event().is_some() {}
+        // Consume the request headers (any real app does) so the
+        // Closed-stream retain can reap the slot afterwards.
+        server.recv_headers(sid, |_, _| {}).unwrap();
 
         server.discard_body(&mut sio.as_io(), sid, 0x8).unwrap();
         server.feed_data(&mut sio.as_io(), &[]).unwrap();

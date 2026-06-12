@@ -144,6 +144,15 @@ pub struct ServerConfig {
     pub max_events: usize,
     /// TLS handshake timeout in microseconds.
     pub handshake_timeout_us: u64,
+    /// HTTP-level timeouts (idle / first-headers) applied to every TCP
+    /// connection when it becomes established. Defaults ON (idle 60 s,
+    /// header 10 s): a connection wedged behind receive backpressure (body
+    /// never drained, see [`HttpServerConn::discard_body`]) is reaped by the
+    /// idle timeout as the backstop. Note "activity" counts only received
+    /// bytes — a handler that goes silent longer than the idle timeout while
+    /// processing (peer quietly waiting for the response) will be reaped, so
+    /// size the idle timeout above worst-case handler processing time.
+    pub http_timeouts: crate::http::TimeoutConfig,
 }
 
 impl Default for ServerConfig {
@@ -154,6 +163,10 @@ impl Default for ServerConfig {
             max_quic_conns: 8,
             max_events: 32,
             handshake_timeout_us: 10_000_000,
+            http_timeouts: crate::http::TimeoutConfig {
+                idle_timeout_us: Some(60_000_000),
+                header_timeout_us: Some(10_000_000),
+            },
         }
     }
 }
@@ -471,11 +484,15 @@ where
                 };
                 let mut http_conn = http_conn;
 
+                // Arm the HTTP-level timeouts (idle / first-headers) from the
+                // moment the connection is established.
+                http_conn.set_timeouts(self.config.http_timeouts, now);
+
                 // Process any application data that was decrypted alongside the
                 // final handshake message (common with TLS 1.3 piggybacking).
                 // Feeding an empty slice triggers processing of the decrypted
                 // plaintext already sitting in net_recv's visible prefix.
-                let _ = http_conn.tcp_feed_data(&[]);
+                let _ = http_conn.tcp_feed_data(&[], now);
 
                 conn.state = TcpState::Established(http_conn);
                 conn.protocol = protocol;
@@ -486,10 +503,7 @@ where
             Ok(())
         } else {
             match &mut conn.state {
-                TcpState::Established(http) => {
-                    let _ = now;
-                    http.tcp_feed_data(data)
-                }
+                TcpState::Established(http) => http.tcp_feed_data(data, now),
                 _ => Err(Error::InvalidState),
             }
         }
@@ -742,6 +756,32 @@ where
         #[cfg(feature = "h3")]
         if let Some(qconn) = self.quic_conns.iter_mut().find(|c| c.id == conn) {
             return qconn.server.recv_body(stream_id, buf);
+        }
+        Err(Error::InvalidState)
+    }
+
+    /// Stop receiving a stream's request body: the application will not (or
+    /// no longer) read it. Call this when responding without consuming the
+    /// body (e.g. rejecting an upload with 413) — an unread body otherwise
+    /// stalls the connection behind receive backpressure until the idle
+    /// timeout reaps it.
+    ///
+    /// For HTTP/2 this discards buffered/in-flight body data, restores
+    /// flow-control credit, and sends RST_STREAM with `error_code` (`0` =
+    /// NO_ERROR when rejecting after a complete response per RFC 9113 §8.1,
+    /// `0x8` = CANCEL otherwise). Returns `InvalidState` for protocols
+    /// without per-stream cancellation (HTTP/1.1) — close the connection
+    /// instead.
+    pub fn discard_body(
+        &mut self,
+        conn: ConnId,
+        stream_id: u64,
+        error_code: u32,
+    ) -> Result<(), Error> {
+        if let Some(tcp) = self.tcp_conns.iter_mut().find(|c| c.id == conn)
+            && let TcpState::Established(http) = &mut tcp.state
+        {
+            return http.discard_body(stream_id, error_code);
         }
         Err(Error::InvalidState)
     }

@@ -66,6 +66,30 @@ pub trait HttpServerConn {
     /// Whether the connection is closed.
     fn is_closed(&self) -> bool;
 
+    /// Stop receiving a stream's request body: the application will not (or
+    /// no longer) read it. For HTTP/2 this discards buffered/in-flight body
+    /// data, restores flow-control credit, and tells the peer to stop
+    /// sending (RST_STREAM with `error_code`: `0` = NO_ERROR when rejecting
+    /// after a complete response per RFC 9113 §8.1, `0x8` = CANCEL
+    /// otherwise). Required when responding without consuming the body —
+    /// otherwise the unread body stalls the connection behind receive
+    /// backpressure (see [`recv_blocked`](Self::recv_blocked)) until the
+    /// idle timeout reaps it.
+    ///
+    /// Default `Err(InvalidState)`: protocols without per-stream
+    /// cancellation (HTTP/1.1) don't support it — close the connection
+    /// instead.
+    fn discard_body(&mut self, _stream_id: u64, _error_code: u32) -> Result<(), Error> {
+        Err(Error::InvalidState)
+    }
+
+    /// Configure HTTP-level timeouts (idle / header). `now` is the current
+    /// timestamp in microseconds. Called by the connection manager when the
+    /// connection becomes established.
+    ///
+    /// Default no-op: H3 connections handle timeouts at the QUIC layer.
+    fn set_timeouts(&mut self, _config: crate::http::TimeoutConfig, _now: u64) {}
+
     /// Return the earliest timeout deadline, or `None`.
     fn next_timeout(&self) -> Option<u64>;
 
@@ -73,10 +97,12 @@ pub trait HttpServerConn {
     fn handle_timeout(&mut self, now: u64);
 
     /// Feed encrypted TCP data into the connection (TLS + HTTP processing).
+    /// `now` (microseconds) tracks receive activity for the idle timeout;
+    /// only non-empty feeds count as activity.
     ///
     /// Only meaningful for TCP-based connections (Https1, H2Tls).
     /// H3 connections should return `Ok(())` (they use UDP via the manager).
-    fn tcp_feed_data(&mut self, data: &[u8]) -> Result<(), Error>;
+    fn tcp_feed_data(&mut self, data: &[u8], now: u64) -> Result<(), Error>;
 
     /// Pull outgoing encrypted TCP data.
     ///

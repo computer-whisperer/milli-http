@@ -93,6 +93,7 @@ fn main() {
         max_events: 8,
         handshake_timeout_us: 10_000_000,
         max_quic_conns: 1,
+        ..ServerConfig::default()
     };
     let mut manager: ServerManager<Aes128GcmProvider, SocketAddr, BUF> =
         ServerManager::new(Aes128GcmProvider, tls_config, server_config);

@@ -498,8 +498,12 @@ where
         Https1Server::handle_timeout(self, now);
     }
 
-    fn tcp_feed_data(&mut self, data: &[u8]) -> Result<(), Error> {
-        Https1Server::feed_data(self, data)
+    fn set_timeouts(&mut self, config: crate::http::TimeoutConfig, now: u64) {
+        Https1Server::set_timeouts(self, config, now);
+    }
+
+    fn tcp_feed_data(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
+        Https1Server::feed_data_timed(self, data, now)
     }
 
     fn tcp_poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
@@ -574,8 +578,12 @@ where
         Https1Client::handle_timeout(self, now);
     }
 
-    fn tcp_feed_data(&mut self, data: &[u8]) -> Result<(), Error> {
-        Https1Client::feed_data(self, data)
+    fn set_timeouts(&mut self, config: crate::http::TimeoutConfig, now: u64) {
+        Https1Client::set_timeouts(self, config, now);
+    }
+
+    fn tcp_feed_data(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
+        Https1Client::feed_data_timed(self, data, now)
     }
 
     fn tcp_poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {

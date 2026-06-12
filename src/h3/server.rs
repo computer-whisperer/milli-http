@@ -297,7 +297,7 @@ where
         H3Server::handle_timeout(self, now);
     }
 
-    fn tcp_feed_data(&mut self, _data: &[u8]) -> Result<(), Error> {
+    fn tcp_feed_data(&mut self, _data: &[u8], _now: u64) -> Result<(), Error> {
         Ok(()) // H3 uses UDP, not TCP
     }
 

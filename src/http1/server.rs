@@ -192,8 +192,12 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
         Http1Server::handle_timeout(self, now);
     }
 
-    fn tcp_feed_data(&mut self, data: &[u8]) -> Result<(), Error> {
-        Http1Server::feed_data(self, data)
+    fn set_timeouts(&mut self, config: crate::http::TimeoutConfig, now: u64) {
+        Http1Server::set_timeouts(self, config, now);
+    }
+
+    fn tcp_feed_data(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
+        Http1Server::feed_data_timed(self, data, now)
     }
 
     fn tcp_poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {

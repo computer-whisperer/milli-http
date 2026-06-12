@@ -364,6 +364,21 @@ where
         self.h2.recv_body(&mut h2_io, stream_id, buf)
     }
 
+    /// Stop receiving a stream's request body (see
+    /// [`H2Connection::discard_body`]): discards buffered/in-flight body
+    /// data, restores flow-control credit, and sends RST_STREAM with
+    /// `error_code` unless the peer already finished the stream. Use when
+    /// responding without consuming the body.
+    ///
+    /// [`H2Connection::discard_body`]: crate::h2::connection::H2Connection::discard_body
+    pub fn discard_body(&mut self, stream_id: u64, error_code: u32) -> Result<(), Error> {
+        let mut h2_io: H2Io<'_, BUF> = H2Io {
+            recv_buf: &mut self.net_recv,
+            send_buf: &mut self.app_send,
+        };
+        self.h2.discard_body(&mut h2_io, stream_id, error_code)
+    }
+
     /// Send response headers.
     pub fn send_response(
         &mut self,
@@ -544,8 +559,16 @@ where
         H2TlsServer::handle_timeout(self, now);
     }
 
-    fn tcp_feed_data(&mut self, data: &[u8]) -> Result<(), Error> {
-        H2TlsServer::feed_data(self, data)
+    fn discard_body(&mut self, stream_id: u64, error_code: u32) -> Result<(), Error> {
+        H2TlsServer::discard_body(self, stream_id, error_code)
+    }
+
+    fn set_timeouts(&mut self, config: crate::http::TimeoutConfig, now: u64) {
+        H2TlsServer::set_timeouts(self, config, now);
+    }
+
+    fn tcp_feed_data(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
+        H2TlsServer::feed_data_timed(self, data, now)
     }
 
     fn tcp_poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
@@ -635,8 +658,12 @@ where
         H2TlsClient::handle_timeout(self, now);
     }
 
-    fn tcp_feed_data(&mut self, data: &[u8]) -> Result<(), Error> {
-        H2TlsClient::feed_data(self, data)
+    fn set_timeouts(&mut self, config: crate::http::TimeoutConfig, now: u64) {
+        H2TlsClient::set_timeouts(self, config, now);
+    }
+
+    fn tcp_feed_data(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
+        H2TlsClient::feed_data_timed(self, data, now)
     }
 
     fn tcp_poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
