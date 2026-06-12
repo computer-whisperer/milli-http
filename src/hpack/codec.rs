@@ -241,12 +241,14 @@ impl HpackDecoder {
                 // §6.2.2 Literal without Indexing: 0000xxxx
                 let (name_index, consumed) = integer::decode_integer(&src[pos..], 4)?;
                 pos += consumed;
-                pos += self.decode_literal_field(src, pos, name_index as usize, false, &mut emit)?;
+                pos +=
+                    self.decode_literal_field(src, pos, name_index as usize, false, &mut emit)?;
             } else if first & 0b1111_0000 == 0b0001_0000 {
                 // §6.2.3 Literal Never Indexed: 0001xxxx
                 let (name_index, consumed) = integer::decode_integer(&src[pos..], 4)?;
                 pos += consumed;
-                pos += self.decode_literal_field(src, pos, name_index as usize, false, &mut emit)?;
+                pos +=
+                    self.decode_literal_field(src, pos, name_index as usize, false, &mut emit)?;
             } else if first & 0b1110_0000 == 0b0010_0000 {
                 // §6.3 Dynamic Table Size Update: 001xxxxx
                 let (new_size, consumed) = integer::decode_integer(&src[pos..], 5)?;
