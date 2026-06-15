@@ -44,6 +44,21 @@ hmac = { version = "0.12", default-features = false, optional = true }
 [dev-dependencies]
 hex-literal = "0.4"
 rand = "0.9"
+# hyper/rustls interop bench (tests/hyper_interop.rs): a mainstream h2 client
+# against ServerRunner over real TCP. Dev-only; the library itself stays
+# no_std.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util"] }
+hyper = { version = "1", features = ["client", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+futures = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+
+[[test]]
+name = "hyper_interop"
+required-features = ["server", "h2", "tcp-tls", "http1", "rustcrypto-aes", "std", "alloc"]
 
 [[example]]
 name = "h3_server"

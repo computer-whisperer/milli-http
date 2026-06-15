@@ -24,7 +24,6 @@ use crate::tls::handshake::ServerTlsConfig;
 use crate::tls::transport_params::TransportParams;
 use crate::transport::{Address, Rng};
 
-#[cfg(feature = "h3")]
 pub mod runner;
 
 // ---------------------------------------------------------------------------

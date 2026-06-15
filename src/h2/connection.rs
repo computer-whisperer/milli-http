@@ -252,8 +252,18 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         // window at the buffer size means a peer can never have more DATA in
         // flight than `data_buf` can hold — the overflow path below would
         // otherwise silently drop body bytes and corrupt large request bodies.
+        //
+        // Likewise advertise the *real* stream capacity (RFC 9113 §6.5.2).
+        // The default of 128 promised concurrency the `MAX_STREAMS`-bounded
+        // stream table cannot deliver: a compliant client (e.g. hyper
+        // multiplexing a request batch) legitimately opened a 9th stream,
+        // `ensure_stream` silently refused it, and the Headers event for the
+        // never-created stream made the server route a request with no
+        // readable headers. Advertising the true limit makes the peer queue
+        // excess streams client-side instead.
         let local_settings = H2Settings {
             initial_window_size: DATABUF as u32,
+            max_concurrent_streams: MAX_STREAMS as u32,
             ..H2Settings::default()
         };
         Self {
@@ -370,6 +380,13 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         headers: &[(&[u8], &[u8])],
         end_stream: bool,
     ) -> Result<(), Error> {
+        // Track the stream before encoding anything: silently emitting
+        // HEADERS for a stream the table cannot hold would desync stream
+        // state from the wire (and, server-side, resurrect IDs the peer has
+        // already finished with).
+        if !self.ensure_stream(stream_id) {
+            return Err(Error::InvalidState);
+        }
         let hdr_start = io.send_buf.len();
         if hdr_start + 9 > BUF {
             return Err(Error::BufferTooSmall {
@@ -404,7 +421,6 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         };
         frame::encode_frame_header(&hdr, &mut io.send_buf[hdr_start..hdr_start + 9])?;
 
-        self.ensure_stream(stream_id);
         if let Some(stream) = self.get_stream_mut(stream_id) {
             if stream.state == H2StreamState::Idle {
                 stream.open();
@@ -509,7 +525,13 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         stream_id: u64,
         emit: F,
     ) -> Result<(), Error> {
-        let stream = self.get_stream(stream_id).ok_or(Error::InvalidState)?;
+        // Field-level borrows: the decoder (mutable — dynamic table inserts)
+        // and the stream's header block (immutable) are disjoint.
+        let stream = self
+            .streams
+            .iter()
+            .find(|s| s.id == stream_id)
+            .ok_or(Error::InvalidState)?;
         if !stream.headers_received {
             return Err(Error::WouldBlock);
         }
@@ -1067,7 +1089,16 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                     }
 
                     self.last_peer_stream_id = self.last_peer_stream_id.max(stream_id);
-                    self.ensure_stream(stream_id);
+                    // RFC 9113 §5.1.2: a peer opening more streams than our
+                    // advertised SETTINGS_MAX_CONCURRENT_STREAMS is a
+                    // protocol violation; treat it as a connection error.
+                    // Never fall through with the stream missing — pushing
+                    // Headers/Finished events for a stream that was never
+                    // created hands the application a request whose headers
+                    // cannot be read (this produced bogus 405s).
+                    if !self.ensure_stream(stream_id) {
+                        return Err(Error::Http2(crate::error::H2Error::ProtocolError));
+                    }
                     if let Some(stream) = self.streams.iter_mut().find(|s| s.id == stream_id) {
                         if stream.state == H2StreamState::Idle {
                             stream.open();
@@ -1329,18 +1360,38 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
     // Stream management
     // ------------------------------------------------------------------
 
-    fn ensure_stream(&mut self, stream_id: u64) {
-        if !self.streams.iter().any(|s| s.id == stream_id) {
-            #[cfg(feature = "alloc")]
-            if self.streams.len() >= MAX_STREAMS {
-                return; // At capacity
-            }
-            let initial_send = self.peer_settings.initial_window_size as i32;
-            let initial_recv = self.local_settings.initial_window_size as i32;
-            let _ = self
-                .streams
-                .push(H2Stream::new(stream_id, initial_send, initial_recv));
+    /// Ensure a stream exists, creating it if there is capacity. Returns
+    /// `false` if the stream does not exist and cannot be created
+    /// (`MAX_STREAMS` live streams even after reclaiming closed ones).
+    fn ensure_stream(&mut self, stream_id: u64) -> bool {
+        if self.streams.iter().any(|s| s.id == stream_id) {
+            return true;
         }
+        if self.streams.len() >= MAX_STREAMS {
+            // `process_recv` only sweeps closed streams after the whole
+            // batch, so a burst that opens, completes, and is followed by
+            // more HEADERS still holds slots here. Closed streams do not
+            // count toward the peer's advertised concurrency (RFC 9113
+            // §5.1.2) and must not hold capacity against new ones — reclaim
+            // them before refusing. Same predicate as the post-batch sweep:
+            // closed streams still carrying something for the application
+            // (undelivered body, unread headers, a deferred RST) survive.
+            self.streams.retain(|s| {
+                s.state != H2StreamState::Closed
+                    || s.data_available
+                    || s.headers_received
+                    || s.pending_rst.is_some()
+            });
+        }
+        if self.streams.len() >= MAX_STREAMS {
+            return false;
+        }
+        let initial_send = self.peer_settings.initial_window_size as i32;
+        let initial_recv = self.local_settings.initial_window_size as i32;
+        let _ = self
+            .streams
+            .push(H2Stream::new(stream_id, initial_send, initial_recv));
+        true
     }
 
     fn get_stream(&self, stream_id: u64) -> Option<&H2Stream<HDRBUF, DATABUF>> {
@@ -1706,6 +1757,163 @@ mod tests {
             };
             let _ = receiver.feed_data(&mut receiver_io.as_io(), &copy);
         }
+    }
+
+    // ====== Stream-capacity tests ======
+
+    /// The server's initial SETTINGS must advertise the real `MAX_STREAMS`
+    /// (RFC 9113 §6.5.2). Advertising the old default of 128 over a smaller
+    /// stream table let compliant clients open streams the table refused.
+    #[test]
+    fn server_advertises_true_stream_capacity() {
+        let mut server = H2Connection::<4>::new_server();
+        let mut io = H2IoBufs::<4096>::new();
+        let mut buf = [0u8; 4096];
+        let data = server.poll_output(&mut io.as_io(), &mut buf).unwrap();
+        // First frame is SETTINGS; walk its parameters.
+        assert_eq!(data[3], FRAME_SETTINGS);
+        let len = u32::from_be_bytes([0, data[0], data[1], data[2]]) as usize;
+        let mut advertised = None;
+        frame::decode_settings_params(&data[9..9 + len], |id, value| {
+            if id == SETTINGS_MAX_CONCURRENT_STREAMS {
+                advertised = Some(value);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(advertised, Some(4));
+    }
+
+    /// Regression for the field 405s: a burst of requests that open, complete,
+    /// and close — with no further inbound data to trigger the post-batch
+    /// sweep — must not hold stream-table capacity against the next request.
+    /// Before the fix, the (MAX_STREAMS+1)-th stream was silently refused but
+    /// its Headers event still fired, so the application routed a request
+    /// whose headers were unreadable.
+    #[test]
+    fn closed_streams_are_reclaimed_for_new_ones_within_capacity() {
+        let mut client = H2Connection::<4>::new_client();
+        let mut cio = H2IoBufs::<16384>::new();
+        let mut server = H2Connection::<4>::new_server();
+        let mut sio = H2IoBufs::<16384>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+        while client.poll_event().is_some() {}
+        while server.poll_event().is_some() {}
+
+        let req: &[(&[u8], &[u8])] = &[
+            (b":method", b"GET"),
+            (b":path", b"/"),
+            (b":scheme", b"https"),
+            (b":authority", b"example.com"),
+        ];
+
+        // Burst 1: fill the stream table, respond to everything (streams
+        // close server-side, but nothing arrives afterwards to sweep them).
+        let mut burst = heapless::Vec::<u64, 4>::new();
+        for _ in 0..4 {
+            burst
+                .push(client.open_stream(&mut cio.as_io(), req, true).unwrap())
+                .unwrap();
+        }
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
+        while let Some(ev) = server.poll_event() {
+            if let H2Event::Headers(sid) = ev {
+                server.recv_headers(sid, |_, _| {}).unwrap();
+                server
+                    .send_headers(&mut sio.as_io(), sid, &[(b":status", b"200")], true)
+                    .unwrap();
+            }
+        }
+        exchange(&mut server, &mut sio, &mut client, &mut cio);
+        // Consume the responses client-side: a closed stream with unread
+        // headers is deliberately NOT reclaimable (the application hasn't
+        // seen its response yet), so the client must read them for its own
+        // slots to free.
+        while let Some(ev) = client.poll_event() {
+            if let H2Event::Headers(sid) = ev {
+                client.recv_headers(sid, |_, _| {}).unwrap();
+            }
+        }
+
+        // Burst 2: one more request. All four table slots hold closed
+        // streams; the new one must displace them, and its headers must be
+        // readable when the Headers event is consumed.
+        let sid = client.open_stream(&mut cio.as_io(), req, true).unwrap();
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
+        let mut got = false;
+        while let Some(ev) = server.poll_event() {
+            if let H2Event::Headers(s) = ev {
+                assert_eq!(s, sid);
+                let mut method = heapless::Vec::<u8, 16>::new();
+                server
+                    .recv_headers(s, |name, value| {
+                        if name == b":method" {
+                            let _ = method.extend_from_slice(value);
+                        }
+                    })
+                    .expect("headers must be readable for an accepted stream");
+                assert_eq!(method.as_slice(), b"GET");
+                got = true;
+            }
+        }
+        assert!(got, "server never saw the post-burst request");
+    }
+
+    /// A peer that exceeds the advertised SETTINGS_MAX_CONCURRENT_STREAMS with
+    /// genuinely live (unanswered) streams is a protocol violation — the
+    /// connection errors instead of emitting events for a stream that was
+    /// never created (RFC 9113 §5.1.2).
+    #[test]
+    fn exceeding_advertised_stream_limit_is_a_connection_error() {
+        // Client table is larger than the server's so the client *can*
+        // violate the server's limit; the generic-bound helpers require equal
+        // shapes, so the exchange is hand-rolled.
+        let mut client = H2Connection::<8>::new_client();
+        let mut cio = H2IoBufs::<16384>::new();
+        let mut server = H2Connection::<2>::new_server();
+        let mut sio = H2IoBufs::<16384>::new();
+
+        let mut buf = [0u8; 8192];
+        for _ in 0..5 {
+            while let Some(data) = client.poll_output(&mut cio.as_io(), &mut buf) {
+                let mut v = heapless::Vec::<u8, 8192>::new();
+                v.extend_from_slice(data).unwrap();
+                server.feed_data(&mut sio.as_io(), &v).unwrap();
+            }
+            while let Some(data) = server.poll_output(&mut sio.as_io(), &mut buf) {
+                let mut v = heapless::Vec::<u8, 8192>::new();
+                v.extend_from_slice(data).unwrap();
+                client.feed_data(&mut cio.as_io(), &v).unwrap();
+            }
+        }
+
+        let req: &[(&[u8], &[u8])] = &[
+            (b":method", b"GET"),
+            (b":path", b"/"),
+            (b":scheme", b"https"),
+            (b":authority", b"example.com"),
+        ];
+        // Three concurrent (unanswered) requests against an advertised limit
+        // of two.
+        for _ in 0..3 {
+            client.open_stream(&mut cio.as_io(), req, true).unwrap();
+        }
+        let mut result = Ok(());
+        while let Some(data) = client.poll_output(&mut cio.as_io(), &mut buf) {
+            let mut v = heapless::Vec::<u8, 8192>::new();
+            v.extend_from_slice(data).unwrap();
+            result = server.feed_data(&mut sio.as_io(), &v);
+            if result.is_err() {
+                break;
+            }
+        }
+        assert!(
+            matches!(
+                result,
+                Err(Error::Http2(crate::error::H2Error::ProtocolError))
+            ),
+            "expected connection-level protocol error, got {result:?}"
+        );
     }
 
     // ====== Timeout + Connection State Tests ======
