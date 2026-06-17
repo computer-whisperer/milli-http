@@ -159,10 +159,68 @@ pub fn build_p256_cert_der(public_key: &[u8], out: &mut [u8]) -> Result<usize, E
 }
 
 /// Build a minimal self-signed ECDSA P-256 X.509 certificate (CN=milli-quic)
-/// with an optional `subjectAltName` extension. `dns_names` and `ip_addrs`
-/// populate the SAN so TLS clients can validate the hostname/IP they connected
-/// to; both are optional (pass empty slices to omit the extension).
+/// with an optional `subjectAltName` extension, using a **placeholder**
+/// signature. `dns_names` and `ip_addrs` populate the SAN so TLS clients can
+/// validate the hostname/IP they connected to; both are optional (pass empty
+/// slices to omit the extension).
+///
+/// The signature is fake — fine for `curl --cacert`, which pins the leaf as a
+/// trust anchor and never verifies its self-signature. Browsers DO verify it, so
+/// for a browser-facing leaf use [`build_p256_self_signed_cert_der_with_san`],
+/// which signs for real.
 pub fn build_p256_cert_der_with_san(
+    public_key: &[u8],
+    dns_names: &[&str],
+    ip_addrs: &[core::net::IpAddr],
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    let mut content = [0u8; 512];
+    let content_len = build_p256_tbs_content(public_key, dns_names, ip_addrs, &mut content)?;
+    let mut tbs_seq = [0u8; 600];
+    let tbs_seq_len = wrap_tbs_seq(&content[..content_len], &mut tbs_seq)?;
+    // 8-byte placeholder — see the doc comment.
+    const PLACEHOLDER_SIG: [u8; 8] = [0xAA; 8];
+    assemble_p256_cert(&tbs_seq[..tbs_seq_len], &PLACEHOLDER_SIG, out)
+}
+
+/// Build a **properly self-signed** ECDSA P-256 X.509 leaf: same structure as
+/// [`build_p256_cert_der_with_san`], but with a real ECDSA-SHA256 signature over
+/// the TBSCertificate, computed from the 32-byte private `scalar`.
+///
+/// Because the self-signature actually verifies, a browser treats this as a
+/// normal untrusted-issuer cert (`ERR_CERT_AUTHORITY_INVALID`) — a one-click
+/// "proceed" — rather than a hard malformed-cert reject, and h2 still negotiates.
+/// This is the path a browser-facing server (e.g. the main module's web UI) uses.
+pub fn build_p256_self_signed_cert_der_with_san(
+    scalar: &[u8; 32],
+    dns_names: &[&str],
+    ip_addrs: &[core::net::IpAddr],
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    use p256::ecdsa::{SigningKey, signature::Signer};
+
+    let public_key = p256_public_key_from_scalar(scalar)?;
+    let mut content = [0u8; 512];
+    let content_len =
+        build_p256_tbs_content(public_key.as_slice(), dns_names, ip_addrs, &mut content)?;
+    let mut tbs_seq = [0u8; 600];
+    let tbs_seq_len = wrap_tbs_seq(&content[..content_len], &mut tbs_seq)?;
+
+    // ECDSA-SHA256 over the DER TBSCertificate. The p256 `Signer` impl hashes the
+    // input with SHA-256 and emits a DER-encoded (r,s) signature (deterministic,
+    // RFC 6979 — no RNG needed).
+    let signing_key = SigningKey::from_bytes(scalar.into()).map_err(|_| Error::Tls)?;
+    let signature: p256::ecdsa::DerSignature = signing_key.sign(&tbs_seq[..tbs_seq_len]);
+
+    assemble_p256_cert(&tbs_seq[..tbs_seq_len], signature.as_bytes(), out)
+}
+
+/// Write the TBSCertificate *content* (everything inside the TBS `SEQUENCE`:
+/// version, serial, inner sigAlg, issuer, validity, subject, SPKI, and the
+/// optional SAN extension) for a self-signed P-256 leaf. Returns the content
+/// length. Shared by the placeholder- and real-signature cert builders so the
+/// two produce byte-identical certificate bodies.
+fn build_p256_tbs_content(
     public_key: &[u8],
     dns_names: &[&str],
     ip_addrs: &[core::net::IpAddr],
@@ -173,183 +231,130 @@ pub fn build_p256_cert_der_with_san(
         return Err(Error::Tls);
     }
 
-    // Build a minimal X.509 Certificate structure.
-    // We construct this manually, piece by piece.
-    //
-    // SubjectPublicKeyInfo for ECDSA P-256:
-    //   SEQUENCE {
-    //     SEQUENCE {
-    //       OID 1.2.840.10045.2.1 (ecPublicKey)
-    //       OID 1.2.840.10045.3.1.7 (secp256r1)
-    //     }
-    //     BIT STRING (0x00 + 65-byte uncompressed point)
-    //   }
-
-    // ecPublicKey OID: 06 07 2a 86 48 ce 3d 02 01
-    // secp256r1 OID:   06 08 2a 86 48 ce 3d 03 01 07
-
-    // Build the SPKI
+    // SubjectPublicKeyInfo OIDs: ecPublicKey (1.2.840.10045.2.1) + secp256r1
+    // (1.2.840.10045.3.1.7).
     let algo_seq_inner: &[u8] = &[
         0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, // ecPublicKey OID
         0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, // secp256r1 OID
     ];
-    // algo SEQUENCE: 30 + len + inner
     let algo_seq_len = algo_seq_inner.len(); // 19
-
-    // BIT STRING: 03 + len(66) + 0x00 + pubkey(65)
-    let bit_string_len = 1 + 65; // 66
-
-    // SPKI SEQUENCE length: (1 + 1 + algo_seq_len) + (1 + 1 + bit_string_len)
+    let bit_string_len = 1 + 65; // 0x00 unused-bits + uncompressed point
     let spki_inner_len = (2 + algo_seq_len) + (2 + bit_string_len);
 
-    // CN = "milli-quic" in RDN format:
-    // SET { SEQUENCE { OID 2.5.4.3, UTF8String "milli-quic" } }
+    // CN = "milli-quic": SET { SEQUENCE { OID 2.5.4.3, UTF8String "milli-quic" } }
     let cn_rdn: &[u8] = &[
         0x31, 0x13, 0x30, 0x11, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x0a, b'm', b'i', b'l', b'l',
         b'i', b'-', b'q', b'u', b'i', b'c',
     ];
-
     // Validity: UTCTime "250101000000Z" to "350101000000Z"
     let validity: &[u8] = &[
         0x30, 0x1e, 0x17, 0x0d, b'2', b'5', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0',
         b'0', b'Z', 0x17, 0x0d, b'3', b'5', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0',
         b'0', b'Z',
     ];
-
-    // Signature algorithm for the outer cert: ecdsaWithSHA256
-    // OID 1.2.840.10045.4.3.2
+    // Inner signature AlgorithmIdentifier: ecdsaWithSHA256 (1.2.840.10045.4.3.2).
     let ecdsa_sha256_algo: &[u8] = &[
         0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02,
     ];
-
-    // TBSCertificate contents:
-    //   [0] EXPLICIT INTEGER v3 (2)       = a0 03 02 01 02  (5 bytes)
-    //   INTEGER serialNumber = 1          = 02 01 01        (3 bytes)
-    //   SEQUENCE sigAlgo (ecdsa-sha256)   = ecdsa_sha256_algo  (12 bytes)
-    //   SEQUENCE issuer (CN=milli-quic)   = 30 15 + cn_rdn  (23 bytes total)
-    //   SEQUENCE validity                 = validity         (32 bytes)
-    //   SEQUENCE subject (CN=milli-quic)  = 30 15 + cn_rdn  (23 bytes total)
-    //   SEQUENCE SPKI                     = computed
-
     let version_bytes: &[u8] = &[0xa0, 0x03, 0x02, 0x01, 0x02];
     let serial_bytes: &[u8] = &[0x02, 0x01, 0x01];
     let issuer_header: &[u8] = &[0x30, 0x15];
     let subject_header: &[u8] = &[0x30, 0x15];
 
-    // Placeholder signature: 8 bytes of zeros (minimal valid-looking DER sig)
-    // Actually let's use a fake 64-byte-ish signature to look realistic.
-    // BIT STRING: 03 + len + 0x00 + signature_bytes
-    let fake_sig_len = 8;
-    let fake_sig_bitstring_len = 1 + fake_sig_len; // 9
-
-    // Build the entire certificate
-    let mut buf_off = 0;
-
-    // Helper closure is not ergonomic in no_std, so we'll build manually.
-
-    // ---- TBSCertificate ----
-    let mut tbs = [0u8; 512];
-    let mut tbs_off = 0;
-
-    // Copy version, serial
-    tbs[tbs_off..tbs_off + version_bytes.len()].copy_from_slice(version_bytes);
-    tbs_off += version_bytes.len();
-    tbs[tbs_off..tbs_off + serial_bytes.len()].copy_from_slice(serial_bytes);
-    tbs_off += serial_bytes.len();
-
-    // sigAlgo
-    tbs[tbs_off..tbs_off + ecdsa_sha256_algo.len()].copy_from_slice(ecdsa_sha256_algo);
-    tbs_off += ecdsa_sha256_algo.len();
-
-    // issuer
-    tbs[tbs_off..tbs_off + issuer_header.len()].copy_from_slice(issuer_header);
-    tbs_off += issuer_header.len();
-    tbs[tbs_off..tbs_off + cn_rdn.len()].copy_from_slice(cn_rdn);
-    tbs_off += cn_rdn.len();
-
-    // validity
-    tbs[tbs_off..tbs_off + validity.len()].copy_from_slice(validity);
-    tbs_off += validity.len();
-
-    // subject
-    tbs[tbs_off..tbs_off + subject_header.len()].copy_from_slice(subject_header);
-    tbs_off += subject_header.len();
-    tbs[tbs_off..tbs_off + cn_rdn.len()].copy_from_slice(cn_rdn);
-    tbs_off += cn_rdn.len();
+    let mut off = 0;
+    out[off..off + version_bytes.len()].copy_from_slice(version_bytes);
+    off += version_bytes.len();
+    out[off..off + serial_bytes.len()].copy_from_slice(serial_bytes);
+    off += serial_bytes.len();
+    out[off..off + ecdsa_sha256_algo.len()].copy_from_slice(ecdsa_sha256_algo);
+    off += ecdsa_sha256_algo.len();
+    out[off..off + issuer_header.len()].copy_from_slice(issuer_header);
+    off += issuer_header.len();
+    out[off..off + cn_rdn.len()].copy_from_slice(cn_rdn);
+    off += cn_rdn.len();
+    out[off..off + validity.len()].copy_from_slice(validity);
+    off += validity.len();
+    out[off..off + subject_header.len()].copy_from_slice(subject_header);
+    off += subject_header.len();
+    out[off..off + cn_rdn.len()].copy_from_slice(cn_rdn);
+    off += cn_rdn.len();
 
     // SPKI SEQUENCE
-    tbs[tbs_off] = 0x30;
-    tbs_off += 1;
-    tbs_off += write_asn1_length(spki_inner_len, &mut tbs[tbs_off..])?;
-
+    out[off] = 0x30;
+    off += 1;
+    off += write_asn1_length(spki_inner_len, &mut out[off..])?;
     // Algorithm SEQUENCE
-    tbs[tbs_off] = 0x30;
-    tbs_off += 1;
-    tbs[tbs_off] = algo_seq_len as u8;
-    tbs_off += 1;
-    tbs[tbs_off..tbs_off + algo_seq_inner.len()].copy_from_slice(algo_seq_inner);
-    tbs_off += algo_seq_inner.len();
-
+    out[off] = 0x30;
+    off += 1;
+    out[off] = algo_seq_len as u8;
+    off += 1;
+    out[off..off + algo_seq_inner.len()].copy_from_slice(algo_seq_inner);
+    off += algo_seq_inner.len();
     // BIT STRING (public key)
-    tbs[tbs_off] = 0x03;
-    tbs_off += 1;
-    tbs[tbs_off] = bit_string_len as u8;
-    tbs_off += 1;
-    tbs[tbs_off] = 0x00; // unused bits
-    tbs_off += 1;
-    tbs[tbs_off..tbs_off + 65].copy_from_slice(public_key);
-    tbs_off += 65;
+    out[off] = 0x03;
+    off += 1;
+    out[off] = bit_string_len as u8;
+    off += 1;
+    out[off] = 0x00; // unused bits
+    off += 1;
+    out[off..off + 65].copy_from_slice(public_key);
+    off += 65;
 
     // Extensions: [3] EXPLICIT subjectAltName (nothing written if both empty).
-    tbs_off +=
-        crate::crypto::x509::encode_san_extensions(dns_names, ip_addrs, &mut tbs[tbs_off..])?;
+    off += crate::crypto::x509::encode_san_extensions(dns_names, ip_addrs, &mut out[off..])?;
 
-    let tbs_len = tbs_off;
+    Ok(off)
+}
 
-    // ---- Outer Certificate SEQUENCE ----
-    // Content: TBS-SEQUENCE + sigAlgo-SEQUENCE + sig-BIT-STRING
-    let tbs_seq_encoded_len = 1 + asn1_length_size(tbs_len) + tbs_len;
-    let outer_content_len = tbs_seq_encoded_len
-        + ecdsa_sha256_algo.len()
+/// Wrap TBS content as the TBSCertificate `SEQUENCE` element (`30 len content`) —
+/// the exact byte range an X.509 signature is computed over.
+fn wrap_tbs_seq(content: &[u8], out: &mut [u8]) -> Result<usize, Error> {
+    let total = 1 + asn1_length_size(content.len()) + content.len();
+    if out.len() < total {
+        return Err(Error::BufferTooSmall { needed: total });
+    }
+    let mut off = 0;
+    out[off] = 0x30;
+    off += 1;
+    off += write_asn1_length(content.len(), &mut out[off..])?;
+    out[off..off + content.len()].copy_from_slice(content);
+    off += content.len();
+    Ok(off)
+}
+
+/// Assemble the outer Certificate `SEQUENCE` from the TBSCertificate element and
+/// a signature value: `30 len { tbs_seq, ecdsaWithSHA256 algId, BIT STRING sig }`.
+fn assemble_p256_cert(tbs_seq: &[u8], sig: &[u8], out: &mut [u8]) -> Result<usize, Error> {
+    const ECDSA_SHA256_ALGO: &[u8] = &[
+        0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02,
+    ];
+    let sig_bitstring_len = 1 + sig.len(); // 0x00 unused-bits prefix + sig
+    let outer_content_len = tbs_seq.len()
+        + ECDSA_SHA256_ALGO.len()
         + 1
-        + asn1_length_size(fake_sig_bitstring_len)
-        + fake_sig_bitstring_len;
-
-    if out.len() < 1 + asn1_length_size(outer_content_len) + outer_content_len {
-        return Err(Error::BufferTooSmall {
-            needed: 1 + asn1_length_size(outer_content_len) + outer_content_len,
-        });
+        + asn1_length_size(sig_bitstring_len)
+        + sig_bitstring_len;
+    let total = 1 + asn1_length_size(outer_content_len) + outer_content_len;
+    if out.len() < total {
+        return Err(Error::BufferTooSmall { needed: total });
     }
 
-    // Outer SEQUENCE tag + length
-    out[buf_off] = 0x30;
-    buf_off += 1;
-    buf_off += write_asn1_length(outer_content_len, &mut out[buf_off..])?;
-
-    // TBSCertificate SEQUENCE
-    out[buf_off] = 0x30;
-    buf_off += 1;
-    buf_off += write_asn1_length(tbs_len, &mut out[buf_off..])?;
-    out[buf_off..buf_off + tbs_len].copy_from_slice(&tbs[..tbs_len]);
-    buf_off += tbs_len;
-
-    // signatureAlgorithm
-    out[buf_off..buf_off + ecdsa_sha256_algo.len()].copy_from_slice(ecdsa_sha256_algo);
-    buf_off += ecdsa_sha256_algo.len();
-
-    // signature BIT STRING (placeholder)
-    out[buf_off] = 0x03;
-    buf_off += 1;
-    buf_off += write_asn1_length(fake_sig_bitstring_len, &mut out[buf_off..])?;
-    out[buf_off] = 0x00; // unused bits
-    buf_off += 1;
-    // fake_sig_len bytes of zeros (already zero from caller or we set them)
-    for b in out[buf_off..buf_off + fake_sig_len].iter_mut() {
-        *b = 0xAA; // placeholder signature
-    }
-    buf_off += fake_sig_len;
-
-    Ok(buf_off)
+    let mut off = 0;
+    out[off] = 0x30;
+    off += 1;
+    off += write_asn1_length(outer_content_len, &mut out[off..])?;
+    out[off..off + tbs_seq.len()].copy_from_slice(tbs_seq);
+    off += tbs_seq.len();
+    out[off..off + ECDSA_SHA256_ALGO.len()].copy_from_slice(ECDSA_SHA256_ALGO);
+    off += ECDSA_SHA256_ALGO.len();
+    out[off] = 0x03;
+    off += 1;
+    off += write_asn1_length(sig_bitstring_len, &mut out[off..])?;
+    out[off] = 0x00; // unused bits
+    off += 1;
+    out[off..off + sig.len()].copy_from_slice(sig);
+    off += sig.len();
+    Ok(off)
 }
 
 /// Find the first occurrence of `needle` in `haystack`.
@@ -515,6 +520,45 @@ mod tests {
         let mut plain = [0u8; 512];
         let plain_len = build_p256_cert_der(&pubkey, &mut plain).unwrap();
         assert!(cert_len > plain_len);
+    }
+
+    #[test]
+    fn self_signed_cert_signature_verifies() {
+        use p256::ecdsa::{DerSignature, VerifyingKey, signature::Verifier};
+
+        let scalar = [0x42u8; 32];
+        let dns = ["raven.local"];
+
+        let mut cert = [0u8; 700];
+        let n = build_p256_self_signed_cert_der_with_san(&scalar, &dns, &[], &mut cert).unwrap();
+        let cert = &cert[..n];
+
+        // The embedded SAN + pubkey are still present and parseable.
+        assert!(find_subsequence(cert, b"raven.local").is_some());
+        let pubkey = extract_p256_pubkey_from_cert(cert).unwrap();
+
+        // Reconstruct the exact TBSCertificate element that was signed, then pull
+        // the signature BIT STRING from the tail (TBS-SEQ, then the 12-byte
+        // ecdsaWithSHA256 algId, then `03 <len> 00 <der-sig>`).
+        let mut content = [0u8; 512];
+        let cl = build_p256_tbs_content(pubkey.as_slice(), &dns, &[], &mut content).unwrap();
+        let mut tbs_seq = [0u8; 600];
+        let tl = wrap_tbs_seq(&content[..cl], &mut tbs_seq).unwrap();
+        let tbs_seq = &tbs_seq[..tl];
+
+        let pos = find_subsequence(cert, tbs_seq).unwrap();
+        let after = pos + tbs_seq.len() + 12;
+        assert_eq!(cert[after], 0x03, "expected signature BIT STRING");
+        let (bitlen, lensz) = parse_asn1_length(&cert[after + 1..]).unwrap();
+        let sig_start = after + 1 + lensz + 1; // tag, length, 0x00 unused-bits
+        let sig = &cert[sig_start..sig_start + (bitlen - 1)];
+
+        // The real self-signature must verify (ECDSA-SHA256 over the TBS) — this
+        // is what makes a browser treat it as untrusted-but-valid (click-through)
+        // rather than a hard malformed-cert reject.
+        let vk = VerifyingKey::from_sec1_bytes(pubkey.as_slice()).unwrap();
+        let der = DerSignature::try_from(sig).unwrap();
+        vk.verify(tbs_seq, &der).unwrap();
     }
 
     #[test]
