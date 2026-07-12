@@ -155,6 +155,11 @@ pub enum Error {
     Tls,
     /// Caller-provided buffer too small.
     BufferTooSmall { needed: usize },
+    /// The allocator could not satisfy a buffer growth request. Unlike
+    /// `BufferTooSmall` (a per-connection bound that clears as the peer
+    /// drains), this signals global memory pressure — shedding the
+    /// connection/subscriber is a reasonable response.
+    OutOfMemory,
     /// No more stream slots available.
     StreamLimitExhausted,
     /// Connection is closed.
@@ -200,6 +205,7 @@ impl core::fmt::Display for Error {
             Error::BufferTooSmall { needed } => {
                 write!(f, "buffer too small, need {needed} bytes")
             }
+            Error::OutOfMemory => write!(f, "allocator exhausted"),
             Error::StreamLimitExhausted => write!(f, "stream limit exhausted"),
             Error::Closed => write!(f, "connection closed"),
             Error::WouldBlock => write!(f, "would block"),

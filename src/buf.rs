@@ -193,6 +193,32 @@ impl<const N: usize> Buf<N> {
         }
     }
 
+    /// Fallible [`reserve_clamped`](Self::reserve_clamped): grow the backing
+    /// allocation to fit `additional` more bytes, or report allocator
+    /// exhaustion instead of aborting. `Ok(())` guarantees a subsequent append
+    /// of `additional` bytes will not touch the allocator, so callers can
+    /// reserve up-front fallibly and then write infallibly.
+    ///
+    /// If the amortized (doubled) reservation cannot be satisfied, falls back
+    /// to the exact requirement before giving up — under memory pressure a
+    /// tight fit beats a failure. Does NOT check the `N` capacity bound (the
+    /// append does); the `Static` variant always succeeds.
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), ()> {
+        if let Storage::Heap(v) = &mut self.storage {
+            let needed = v.len() + additional;
+            if needed <= v.capacity() {
+                return Ok(());
+            }
+            let target = v.capacity().saturating_mul(2).max(needed).min(N);
+            if v.try_reserve_exact(target - v.len()).is_ok() {
+                return Ok(());
+            }
+            v.try_reserve_exact(needed - v.len()).map_err(|_| ())
+        } else {
+            Ok(())
+        }
+    }
+
     /// Append bytes to the visible contents, respecting the `N` capacity bound
     /// (which includes any hidden tail). A hidden tail stays at the end: new
     /// bytes are inserted before it.
@@ -251,6 +277,38 @@ impl<const N: usize> Buf<N> {
     pub fn shrink_to_fit(&mut self) {
         if let Storage::Heap(v) = &mut self.storage {
             v.shrink_to_fit();
+        }
+    }
+
+    /// Release heap capacity when it exceeds `min_capacity`. The threshold
+    /// gives shrink hysteresis: buffers that only ever see small payloads are
+    /// never touched, so the steady state does no allocator work; only a
+    /// buffer grown by an occasional large payload is trimmed back.
+    ///
+    /// Never panics on allocator exhaustion (unlike `Vec::shrink_to`, whose
+    /// realloc aborts on failure — unacceptable in the low-memory situations
+    /// shrinking exists to relieve): an empty buffer is released outright
+    /// (pure dealloc), a non-empty one is copied to a right-sized block only
+    /// if that block can be allocated, and kept as-is otherwise. No-op for
+    /// the `Static` variant.
+    pub fn shrink_to(&mut self, min_capacity: usize) {
+        if let Storage::Heap(v) = &mut self.storage {
+            if v.capacity() <= min_capacity {
+                return;
+            }
+            if v.is_empty() {
+                *v = alloc::vec::Vec::new();
+                return;
+            }
+            let mut smaller = alloc::vec::Vec::new();
+            if smaller
+                .try_reserve_exact(v.len().max(min_capacity))
+                .is_err()
+            {
+                return; // keep the oversized block rather than risk a panic
+            }
+            smaller.extend_from_slice(v);
+            *v = smaller;
         }
     }
 
@@ -336,6 +394,15 @@ pub trait BufExt {
     fn buf_as_mut_slice(&mut self) -> &mut [u8];
     /// Drain `n` bytes from the front by shifting remaining data forward.
     fn buf_drain_front(&mut self, n: usize);
+    /// Fallibly pre-grow to fit `additional` more bytes, so a subsequent
+    /// append cannot hit the allocator. Fixed-capacity backends always
+    /// succeed — their bound is enforced by the append itself. Returns
+    /// [`Error::OutOfMemory`](crate::error::Error::OutOfMemory) if the
+    /// allocator cannot satisfy the request.
+    fn buf_try_reserve(&mut self, additional: usize) -> Result<(), crate::error::Error>;
+    /// Release heap capacity above `min_capacity` (see [`Buf::shrink_to`]).
+    /// No-op for fixed-capacity backends.
+    fn buf_shrink_to(&mut self, min_capacity: usize);
 }
 
 impl<const N: usize> BufExt for heapless::Vec<u8, N> {
@@ -370,6 +437,10 @@ impl<const N: usize> BufExt for heapless::Vec<u8, N> {
         self.copy_within(n.., 0);
         self.truncate(self.len() - n);
     }
+    fn buf_try_reserve(&mut self, _additional: usize) -> Result<(), crate::error::Error> {
+        Ok(())
+    }
+    fn buf_shrink_to(&mut self, _min_capacity: usize) {}
 }
 
 #[cfg(feature = "alloc")]
@@ -403,6 +474,13 @@ impl<const N: usize> BufExt for Buf<N> {
         let len = self.len();
         self.as_mut_slice().copy_within(n.., 0);
         self.truncate(len - n);
+    }
+    fn buf_try_reserve(&mut self, additional: usize) -> Result<(), crate::error::Error> {
+        self.try_reserve(additional)
+            .map_err(|_| crate::error::Error::OutOfMemory)
+    }
+    fn buf_shrink_to(&mut self, min_capacity: usize) {
+        self.shrink_to(min_capacity);
     }
 }
 
@@ -451,6 +529,56 @@ mod tests {
         // Space freed — can add more
         assert!(buf.extend_from_slice(&[6, 7, 8, 9, 10]).is_ok());
         assert_eq!(buf.len(), 8);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn buf_try_reserve_within_bound() {
+        let mut buf: Buf<8> = Buf::new();
+        assert!(buf.try_reserve(4).is_ok());
+        assert!(buf.extend_from_slice(&[1, 2, 3, 4]).is_ok());
+        // try_reserve doesn't enforce the N bound — the append does.
+        assert!(buf.try_reserve(64).is_ok());
+        assert!(buf.extend_from_slice(&[0; 5]).is_err());
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn buf_shrink_to_keeps_floor_and_contents() {
+        let mut buf: Buf<16384> = Buf::new();
+        let big = std::vec![0xAAu8; 9000];
+        assert!(buf.extend_from_slice(&big).is_ok());
+        buf.buf_drain_front(9000 - 5);
+        buf.shrink_to(2048);
+        assert_eq!(buf.len(), 5);
+        assert_eq!(&buf[..], &[0xAA; 5]);
+        // Refilling below the floor must still work.
+        assert!(buf.extend_from_slice(&[1, 2, 3]).is_ok());
+        assert_eq!(buf.len(), 8);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn buf_shrink_to_releases_empty_buffer() {
+        let mut buf: Buf<16384> = Buf::new();
+        assert!(buf.extend_from_slice(&[0xBB; 9000]).is_ok());
+        buf.clear();
+        buf.shrink_to(2048);
+        assert_eq!(buf.len(), 0);
+        // Still usable after the release.
+        assert!(buf.extend_from_slice(&[1, 2, 3]).is_ok());
+        assert_eq!(&buf[..], &[1, 2, 3]);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn buf_shrink_to_noop_for_static() {
+        let mem: &'static mut [u8] = std::vec::Vec::leak(std::vec![0u8; 16]);
+        let mut buf: Buf<16> = Buf::from_static(mem);
+        assert!(buf.extend_from_slice(&[1, 2, 3]).is_ok());
+        buf.shrink_to(0);
+        assert!(buf.try_reserve(8).is_ok());
+        assert_eq!(&buf[..], &[1, 2, 3]);
     }
 
     #[cfg(feature = "alloc")]

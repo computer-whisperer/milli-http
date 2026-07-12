@@ -8,7 +8,7 @@
 //! for the application as its visible prefix and any not-yet-decrypted
 //! ciphertext as a hidden tail (see [`crate::buf::Buf::hide_tail`]).
 
-use crate::buf::Buf;
+use crate::buf::{Buf, BufExt};
 use crate::error::Error;
 
 /// Borrowed I/O buffers for a TLS connection.
@@ -38,6 +38,7 @@ impl<'a, const BUF: usize> TlsIo<'a, BUF> {
                 needed: self.send_buf.len() + data.len(),
             });
         }
+        self.send_buf.buf_try_reserve(data.len())?;
         let _ = self.send_buf.extend_from_slice(data);
         Ok(())
     }

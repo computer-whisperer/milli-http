@@ -118,23 +118,26 @@ const CLIENT_BUF: usize = BUF;
 // drains as it encrypts, the receiver compacts in place — so the real peak is
 // well below the naive 6 x 18432 sum.
 //
-// Empirically the measured peak is ~116 KB (printed by the test). The budget is
-// chosen against the actual measurement, not the upper-bound estimate:
+// Empirically the measured peak is ~102 KB (printed by the test; it dropped
+// from ~116 KB when the h2 HEADERS HPACK scratch went from push-driven
+// Vec-doubling growth to a single up-front `try_reserve`, eliminating the
+// doubling ladder's realloc transients). The budget is chosen against the
+// actual measurement, not the upper-bound estimate:
 //
-//   measured peak (P)            ~ 116 KB
+//   measured peak (P)            ~ 102 KB
 //   one TLS Buf<BUF>             =  18 KB
-//   P + BUF                      ~ 134 KB
+//   P + BUF                      ~ 120 KB
 //
-// We set the budget at 126 KB — about 10 KB above the measured peak (slack for
+// We set the budget at 112 KB — about 10 KB above the measured peak (slack for
 // Vec-doubling jitter so the test is not flaky) and a clear ~8 KB BELOW P + BUF.
 // A regression reintroducing a fourth per-connection `Buf<BUF>` adds ~18 KB,
-// pushing the peak to ~134 KB > 126 KB and tripping the upper-bound assert.
+// pushing the peak to ~120 KB > 112 KB and tripping the upper-bound assert.
 //
 // The test also asserts the LOWER bound `peak + BUF > budget`: if the real peak
 // ever drifts so far under budget that one extra buffer would NOT breach it,
 // that assert fires telling you to retighten this constant — so the guard can
 // never silently go toothless.
-const SERVER_PEAK_BUDGET: usize = 126 * 1024;
+const SERVER_PEAK_BUDGET: usize = 112 * 1024;
 
 // ===========================================================================
 // Fixtures

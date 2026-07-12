@@ -1,6 +1,6 @@
 //! I/O buffers for HTTP/2 connections.
 
-use crate::buf::Buf;
+use crate::buf::{Buf, BufExt};
 use crate::error::Error;
 
 /// Borrowed I/O buffers for an HTTP/2 connection.
@@ -21,6 +21,7 @@ impl<'a, const BUF: usize> H2Io<'a, BUF> {
                 needed: self.send_buf.len() + data.len(),
             });
         }
+        self.send_buf.buf_try_reserve(data.len())?;
         let _ = self.send_buf.extend_from_slice(data);
         Ok(())
     }

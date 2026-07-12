@@ -9,6 +9,7 @@ use super::flow_control::{
 use super::frame::{self, *};
 use super::io::H2Io;
 use super::stream::{H2Stream, H2StreamState};
+use crate::buf::BufExt;
 use crate::error::Error;
 use crate::hpack::codec::{HpackDecoder, HpackEncoder};
 
@@ -316,6 +317,7 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                 needed: io.recv_buf.len() + data.len(),
             });
         }
+        io.recv_buf.buf_try_reserve(data.len())?;
         let _ = io.recv_buf.extend_from_slice(data);
 
         self.process_recv(io)
@@ -393,6 +395,9 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                 needed: hdr_start + 9,
             });
         }
+        // The zero-fill below grows send_buf to its full BUF bound for the
+        // HPACK scratch region, so reserve the whole remainder fallibly.
+        io.send_buf.buf_try_reserve(BUF - hdr_start)?;
         for _ in 0..9 {
             let _ = io.send_buf.push(0);
         }
@@ -491,6 +496,7 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                 needed: io.send_buf.len() + total_needed,
             });
         }
+        io.send_buf.buf_try_reserve(total_needed)?;
         let flags = if actual_end { FLAG_END_STREAM } else { 0 };
         let hdr = frame::H2FrameHeader {
             length: to_send.len() as u32,
@@ -860,6 +866,9 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                         break; // data_buf full → backpressure until recv_body drains
                     }
                     let n = pd.data_remaining.min(avail).min(free);
+                    if stream.data_buf.buf_try_reserve(n).is_err() {
+                        break; // allocator pressure → backpressure, as for full
+                    }
                     // n <= free, so this never overflows the buffer.
                     let _ = stream.data_buf.extend_from_slice(&io.recv_buf[..n]);
                     stream.data_available = true;
@@ -1109,11 +1118,16 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                         // section we will accept; if it overflows, reject the whole
                         // connection rather than silently truncating an
                         // attacker-controlled header set or accepting an unbounded
-                        // CONTINUATION flood.
+                        // CONTINUATION flood. Allocator exhaustion gets the same
+                        // treatment — reject the connection, don't panic or truncate.
                         if stream
                             .headers_data
-                            .extend_from_slice(&io.recv_buf[frag_start..data_end])
+                            .buf_try_reserve(data_end - frag_start)
                             .is_err()
+                            || stream
+                                .headers_data
+                                .extend_from_slice(&io.recv_buf[frag_start..data_end])
+                                .is_err()
                         {
                             return Err(Error::Http2(crate::error::H2Error::EnhanceYourCalm));
                         }
@@ -1292,11 +1306,13 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                     if let Some(stream) = self.streams.iter_mut().find(|s| s.id == stream_id) {
                         // Bound the accumulated header block (see FRAME_HEADERS): an
                         // overflow here means a CONTINUATION flood or oversized field
-                        // section — terminate rather than silently truncate.
-                        if stream
-                            .headers_data
-                            .extend_from_slice(&io.recv_buf[ps..pe])
-                            .is_err()
+                        // section — terminate rather than silently truncate. Allocator
+                        // exhaustion terminates the same way.
+                        if stream.headers_data.buf_try_reserve(pe - ps).is_err()
+                            || stream
+                                .headers_data
+                                .extend_from_slice(&io.recv_buf[ps..pe])
+                                .is_err()
                         {
                             return Err(Error::Http2(crate::error::H2Error::EnhanceYourCalm));
                         }

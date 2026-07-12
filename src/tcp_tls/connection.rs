@@ -2,7 +2,7 @@
 //!
 //! Follows the milli-http `feed_data()` → `poll_output()` → `poll_event()` pattern.
 
-use crate::buf::Buf;
+use crate::buf::{Buf, BufExt};
 use crate::crypto::key_schedule::derive_tls_record_keys;
 use crate::crypto::{Aead, CryptoProvider, Level};
 use crate::error::Error;
@@ -167,6 +167,7 @@ where
                 needed: io.recv_buf.len() + data.len(),
             });
         }
+        io.recv_buf.buf_try_reserve(data.len())?;
         let _ = io.recv_buf.extend_from_slice(data);
         self.process_recv(io, plain)
     }
@@ -234,6 +235,7 @@ where
                 needed: io.app_send_buf.len() + data.len(),
             });
         }
+        io.app_send_buf.buf_try_reserve(data.len())?;
         let _ = io.app_send_buf.extend_from_slice(data);
         Ok(data.len())
     }
@@ -807,6 +809,7 @@ fn encrypt_into<A: crate::crypto::Aead, const BUF: usize>(
             needed: send_buf.len() + total_needed,
         });
     }
+    send_buf.buf_try_reserve(total_needed)?;
 
     // Build and write record header (also used as AAD)
     let mut header = [0u8; 5];

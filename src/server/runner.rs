@@ -335,8 +335,17 @@ where
                 }
             }
             if conn.write_offset >= conn.pending_write.len() {
-                conn.pending_write.clear();
                 conn.write_offset = 0;
+                // Congestion is transient: once fully flushed, release the
+                // stash's allocation instead of pinning up to
+                // MAX_PENDING_WRITE for the connection's lifetime. Swap in a
+                // fresh Vec (pure dealloc) rather than `shrink_to`, whose
+                // realloc can abort on allocator exhaustion.
+                if conn.pending_write.capacity() > 2048 {
+                    conn.pending_write = Vec::new();
+                } else {
+                    conn.pending_write.clear();
+                }
             } else {
                 has_pending_output = true;
                 continue;
@@ -367,7 +376,21 @@ where
                         }
                     }
                     if written < data_len {
-                        conn.pending_write.extend_from_slice(&data[written..]);
+                        let rest = &data[written..];
+                        // `try_reserve_exact`: std's amortized growth would
+                        // transiently overshoot MAX_PENDING_WRITE on a
+                        // memory-tight target; congestion appends are ~MTU
+                        // sized and bounded by the cap, so exact fits are
+                        // cheap.
+                        if conn.pending_write.try_reserve_exact(rest.len()).is_err() {
+                            // The bytes already left the manager's send buffer;
+                            // dropping them would corrupt the stream. Treat
+                            // allocator exhaustion like a fatal write error.
+                            conn.eof = true;
+                            self.manager.tcp_eof(conn.id);
+                            break;
+                        }
+                        conn.pending_write.extend_from_slice(rest);
                         conn.write_offset = 0;
                         has_pending_output = true;
                         break;

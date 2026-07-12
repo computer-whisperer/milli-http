@@ -17,8 +17,15 @@
 
 use super::io::Http1Io;
 use super::parse;
-use crate::buf::Buf;
+use crate::buf::{Buf, BufExt};
 use crate::error::Error;
+
+/// Capacity floor (bytes) retained when releasing a buffer's excess heap at a
+/// request/drain boundary. Small payloads (SSE frames, JSON API responses)
+/// stay under this and never cause allocator traffic; only a buffer grown by
+/// an occasional large payload (e.g. a full page asset) is trimmed, once, when
+/// it empties. Heap-backed buffers only — `Static`/heapless are untouched.
+const SHRINK_RETAIN: usize = 2048;
 
 /// Events produced by the HTTP/1.1 connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +159,7 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
                 needed: io.recv_buf.len() + data.len(),
             });
         }
+        io.recv_buf.buf_try_reserve(data.len())?;
         let _ = io.recv_buf.extend_from_slice(data);
         self.process_recv(io)
     }
@@ -172,6 +180,7 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
         if self.send_offset >= io.send_buf.len() {
             io.send_buf.clear();
             self.send_offset = 0;
+            io.send_buf.buf_shrink_to(SHRINK_RETAIN);
         }
         Some(&buf[..n])
     }
@@ -530,6 +539,13 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
                     self.headers_phase_complete = false;
                     self.connection_start = self.last_activity;
                     self.state = ParseState::Idle;
+                    // Request boundary: release excess capacity a large
+                    // request left behind, so a parked keep-alive connection
+                    // (e.g. an idle SSE stream) doesn't pin its high-water
+                    // mark for its whole lifetime.
+                    self.header_buf.buf_shrink_to(SHRINK_RETAIN);
+                    self.data_buf.buf_shrink_to(SHRINK_RETAIN);
+                    io.recv_buf.buf_shrink_to(SHRINK_RETAIN);
                 }
             }
         }
@@ -663,6 +679,11 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
         let can_store = (DATABUF - self.data_buf.len()).min(to_consume);
 
         if can_store > 0 {
+            if self.data_buf.buf_try_reserve(can_store).is_err() {
+                // Allocator pressure: leave the bytes in recv_buf; progress
+                // resumes on the next feed (same as a full data_buf).
+                return Ok(false);
+            }
             let _ = self.data_buf.extend_from_slice(&io.recv_buf[..can_store]);
             io.drain_recv(can_store);
             let new_remaining = remaining - can_store;
@@ -714,6 +735,12 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
                 let can_store = (DATABUF - self.data_buf.len()).min(to_consume);
 
                 if can_store > 0 {
+                    if self.data_buf.buf_try_reserve(can_store).is_err() {
+                        // Allocator pressure: leave the bytes in recv_buf;
+                        // progress resumes on the next feed (same as a full
+                        // data_buf).
+                        return Ok(false);
+                    }
                     let _ = self.data_buf.extend_from_slice(&io.recv_buf[..can_store]);
                     io.drain_recv(can_store);
                     let new_remaining = remaining - can_store;
@@ -772,6 +799,11 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
         if !io.recv_buf.is_empty() {
             let n = io.recv_buf.len().min(DATABUF - self.data_buf.len());
             if n > 0 {
+                if self.data_buf.buf_try_reserve(n).is_err() {
+                    // Allocator pressure: leave the bytes in recv_buf, as for
+                    // a full data_buf.
+                    return;
+                }
                 let _ = self.data_buf.extend_from_slice(&io.recv_buf[..n]);
                 io.drain_recv(n);
                 let sid = self.current_stream_id;
@@ -796,6 +828,7 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
         if self.header_buf.len() + needed > HDRBUF {
             return Err(Error::BufferTooSmall { needed });
         }
+        self.header_buf.buf_try_reserve(needed)?;
         let _ = self.header_buf.extend_from_slice(name);
         let _ = self.header_buf.push(0);
         let _ = self.header_buf.extend_from_slice(value);
