@@ -176,6 +176,24 @@ where
         self.h2.recv_body(&mut h2_io, stream_id, buf)
     }
 
+    /// Cancel a stream: stop receiving its response body (see
+    /// [`H2Connection::discard_body`]). Discards buffered/in-flight body
+    /// data, restores flow-control credit, and sends RST_STREAM with
+    /// `error_code` unless the peer already finished the stream. Use to
+    /// abandon a long-lived response stream (e.g. a telemetry subscription)
+    /// without tearing down the shared connection — other streams are
+    /// unaffected, and late frames the peer already had in flight are
+    /// ignored.
+    ///
+    /// [`H2Connection::discard_body`]: crate::h2::connection::H2Connection::discard_body
+    pub fn discard_body(&mut self, stream_id: u64, error_code: u32) -> Result<(), Error> {
+        let mut h2_io: H2Io<'_, BUF> = H2Io {
+            recv_buf: &mut self.net_recv,
+            send_buf: &mut self.app_send,
+        };
+        self.h2.discard_body(&mut h2_io, stream_id, error_code)
+    }
+
     /// Configure timeouts.
     pub fn set_timeouts(&mut self, config: crate::http::TimeoutConfig, now: u64) {
         self.h2.set_timeouts(config, now);

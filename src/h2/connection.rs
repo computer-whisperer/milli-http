@@ -600,11 +600,20 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         Ok((copy_len, fin))
     }
 
-    /// Stop receiving a stream's request body: the application will not (or
-    /// no longer) read it. Use when responding without consuming the body
-    /// (e.g. rejecting an upload with 413) — otherwise the unread body fills
-    /// `data_buf`, the pump stalls, and the connection wedges behind the
-    /// runner's receive backpressure with nothing left to unwedge it.
+    /// Stop receiving a stream's body: the application will not (or no
+    /// longer) read it. Role-symmetric — it discards inbound data and queues
+    /// RST_STREAM regardless of which side opened the stream:
+    ///
+    /// - **Server**: reject a request without consuming its body (e.g. a 413
+    ///   on an upload) — otherwise the unread body fills `data_buf`, the pump
+    ///   stalls, and the connection wedges behind the runner's receive
+    ///   backpressure with nothing left to unwedge it.
+    /// - **Client**: cancel a response stream (e.g. abandon a long-lived
+    ///   subscription) without tearing down the shared connection; other
+    ///   streams are unaffected. A late response, trailers, or in-flight DATA
+    ///   arriving behind our RST_STREAM are ignored per RFC 9113 §5.1 (see
+    ///   the closed-stream leniency in `process_recv`), with DATA bytes still
+    ///   credited back to the connection window.
     ///
     /// Effects:
     /// - An in-flight DATA frame on this stream switches the pump to discard
@@ -650,6 +659,15 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
             let buffered = stream.data_buf.len() as u32;
             stream.data_buf.clear();
             stream.data_available = false;
+            // Drop unread headers too: the application has abandoned the
+            // whole stream, and the Closed-stream retain deliberately keeps
+            // slots with unread headers alive (a normally-completed response
+            // must survive until read). Without this, a client canceling
+            // before reading the response headers leaked the slot forever —
+            // MAX_STREAMS cancels wedged the connection with InvalidState on
+            // every subsequent open_stream.
+            stream.headers_data.clear();
+            stream.headers_received = false;
             // No RST needed if the peer already half-closed: nothing more is
             // coming, the discard is purely local.
             let send_rst = !stream.fin_received;
@@ -1088,6 +1106,34 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                     let is_new = !self.streams.iter().any(|s| s.id == stream_id);
                     if is_new {
                         let odd = stream_id % 2 == 1;
+                        // RFC 9113 §5.1: frames on a stream WE opened and have
+                        // since closed (a discard_body cancel, a completed
+                        // exchange) must be ignored — a late response or
+                        // trailers can legitimately be in flight behind our
+                        // RST_STREAM, and treating them as the peer opening a
+                        // new stream (below) tears down the whole connection.
+                        // Our IDs are allocated monotonically, so "in our ID
+                        // space and below next_stream_id, with no live slot"
+                        // identifies exactly the streams we once opened. The
+                        // dropped block still passes through the HPACK decoder
+                        // (output discarded): skipping it would desync a
+                        // dynamic-table-inserting peer's table for every
+                        // subsequent header block. A !END_HEADERS block here
+                        // leaves its CONTINUATIONs to that arm's existing
+                        // unknown-stream leniency (HPACK sync is best-effort
+                        // there, as it already is for unknown streams).
+                        let ours = match self.role {
+                            Role::Client => odd,
+                            Role::Server => !odd,
+                        };
+                        if ours && stream_id < self.next_stream_id {
+                            if end_headers {
+                                self.decoder
+                                    .decode(&io.recv_buf[frag_start..data_end], |_, _| {})?;
+                            }
+                            io.drain_recv(total);
+                            continue;
+                        }
                         let ok = match self.role {
                             Role::Server => odd,
                             Role::Client => false,
@@ -2876,6 +2922,219 @@ mod tests {
                 .iter()
                 .any(|(ty, _, _)| *ty == FRAME_RST_STREAM),
             "no RST after the peer already finished the stream"
+        );
+    }
+
+    /// Open a client request and deliver a server response HEADERS
+    /// (`:status: 200`, end_stream=false) for it, leaving the stream open
+    /// for body DATA. Returns the stream id.
+    fn open_streaming_response<const M: usize, const BUF: usize>(
+        client: &mut H2Connection<M>,
+        cio: &mut H2IoBufs<BUF>,
+        server: &mut H2Connection<M>,
+        sio: &mut H2IoBufs<BUF>,
+    ) -> u64 {
+        let sid = client
+            .open_stream(
+                &mut cio.as_io(),
+                &[
+                    (b":method", b"POST"),
+                    (b":path", b"/telemetry/live"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"x"),
+                ],
+                true,
+            )
+            .unwrap();
+        exchange(client, cio, server, sio);
+        while server.poll_event().is_some() {}
+        server.recv_headers(sid, |_, _| {}).unwrap();
+        server
+            .send_headers(&mut sio.as_io(), sid, &[(b":status", b"200")], false)
+            .unwrap();
+        exchange(server, sio, client, cio);
+        while client.poll_event().is_some() {}
+        sid
+    }
+
+    #[test]
+    fn client_discard_body_cancels_response_stream() {
+        // The client-side use: abandon a long-lived response stream (e.g. a
+        // telemetry subscription) without tearing down the shared
+        // connection. RST_STREAM(CANCEL) goes out, buffered + late-arriving
+        // body bytes are credited back to the connection window, the slot is
+        // reaped, and a subsequent request on the same connection works.
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<16384>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<16384>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+        let sid = open_streaming_response(&mut client, &mut cio, &mut server, &mut sio);
+
+        // Some body arrives and sits unread client-side.
+        server
+            .send_data(&mut sio.as_io(), sid, &[0x11; 300], false)
+            .unwrap();
+        exchange(&mut server, &mut sio, &mut client, &mut cio);
+        while client.poll_event().is_some() {}
+        client.recv_headers(sid, |_, _| {}).unwrap();
+
+        // Cancel. The RST is queued client-side but NOT yet delivered — the
+        // server keeps streaming into the closing window.
+        client.discard_body(&mut cio.as_io(), sid, 0x8).unwrap();
+        client.feed_data(&mut cio.as_io(), &[]).unwrap();
+        assert!(client.streams.is_empty(), "canceled slot reaped");
+        server
+            .send_data(&mut sio.as_io(), sid, &[0x22; 200], false)
+            .unwrap();
+        exchange(&mut server, &mut sio, &mut client, &mut cio);
+        assert!(
+            client.poll_event().is_none(),
+            "in-flight DATA behind the cancel must be silent"
+        );
+        assert!(client.is_active(), "connection survives the late DATA");
+
+        // Wire contract: one RST_STREAM(CANCEL) on the canceled stream, and
+        // every body byte (300 buffered at cancel + 200 in flight behind it)
+        // credited back to the connection window.
+        let mut out = alloc::vec::Vec::new();
+        let mut buf = [0u8; 8192];
+        while let Some(d) = client.poll_output(&mut cio.as_io(), &mut buf) {
+            out.extend_from_slice(d);
+        }
+        let frames = parse_frames(&out);
+        let rst: alloc::vec::Vec<_> = frames
+            .iter()
+            .filter(|(ty, _, _)| *ty == FRAME_RST_STREAM)
+            .collect();
+        assert_eq!(rst.len(), 1, "exactly one RST_STREAM");
+        assert_eq!(rst[0].1 as u64, sid);
+        assert_eq!(
+            u32::from_be_bytes([rst[0].2[0], rst[0].2[1], rst[0].2[2], rst[0].2[3]]),
+            0x8,
+            "CANCEL error code"
+        );
+        let conn_credit: usize = frames
+            .iter()
+            .filter(|(ty, fsid, _)| *ty == FRAME_WINDOW_UPDATE && *fsid == 0)
+            .map(|(_, _, p)| u32::from_be_bytes([p[0], p[1], p[2], p[3]]) as usize)
+            .sum();
+        assert_eq!(conn_credit, 500, "all discarded body bytes re-credited");
+
+        // The server processes the RST and the connection keeps working: a
+        // fresh request round-trips.
+        server.feed_data(&mut sio.as_io(), &out).unwrap();
+        while server.poll_event().is_some() {}
+        let sid2 = open_streaming_response(&mut client, &mut cio, &mut server, &mut sio);
+        assert_ne!(sid, sid2);
+        client.recv_headers(sid2, |_, _| {}).unwrap();
+    }
+
+    #[test]
+    fn client_cancel_before_reading_headers_does_not_leak_slots() {
+        // Canceling a stream whose response headers were never read must
+        // still free the slot: the Closed-stream retain deliberately keeps
+        // unread-headers slots alive (a completed response must survive
+        // until read), but discard_body is an explicit declaration of
+        // disinterest. Before the headers-clear in discard_body, MAX_STREAMS
+        // cancels wedged the client with InvalidState on every open_stream.
+        let mut client = H2Connection::<2>::new_client();
+        let mut cio = H2IoBufs::<16384>::new();
+        let mut server = H2Connection::<2>::new_server();
+        let mut sio = H2IoBufs::<16384>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+
+        for _ in 0..4 {
+            let sid = open_streaming_response(&mut client, &mut cio, &mut server, &mut sio);
+            // Cancel WITHOUT reading the response headers.
+            client.discard_body(&mut cio.as_io(), sid, 0x8).unwrap();
+            client.feed_data(&mut cio.as_io(), &[]).unwrap();
+            assert!(client.streams.is_empty(), "canceled slot reaped");
+            // Deliver the RST so the server-side slot closes too.
+            exchange(&mut client, &mut cio, &mut server, &mut sio);
+            while server.poll_event().is_some() {}
+        }
+    }
+
+    #[test]
+    fn late_headers_on_canceled_stream_ignored_and_hpack_stays_synced() {
+        // Trailers (or a late response) already in flight when the client's
+        // RST_STREAM lands must be ignored (RFC 9113 §5.1) — before the
+        // closed-stream leniency, HEADERS on the reaped stream id was
+        // treated as the peer opening a new stream: a connection-fatal
+        // ProtocolError that defeated the whole point of per-stream cancel.
+        // The dropped block must still pass through the HPACK decoder: this
+        // one inserts a dynamic-table entry that a later response references
+        // by index.
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<16384>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<16384>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+        let sid = open_streaming_response(&mut client, &mut cio, &mut server, &mut sio);
+        client.recv_headers(sid, |_, _| {}).unwrap();
+
+        client.discard_body(&mut cio.as_io(), sid, 0x8).unwrap();
+        client.feed_data(&mut cio.as_io(), &[]).unwrap();
+        assert!(client.streams.is_empty(), "canceled slot reaped");
+
+        // Late trailers on the canceled stream, hand-crafted because our own
+        // encoder is static-only: a Literal with Incremental Indexing
+        // (RFC 7541 §6.2.1) inserting x-token: hello at dynamic index 62.
+        let mut block: alloc::vec::Vec<u8> = alloc::vec![0x40];
+        block.push(7);
+        block.extend_from_slice(b"x-token");
+        block.push(5);
+        block.extend_from_slice(b"hello");
+        let mut frame: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        frame.extend_from_slice(&[0, 0, block.len() as u8]);
+        frame.push(FRAME_HEADERS);
+        frame.push(FLAG_END_HEADERS | FLAG_END_STREAM);
+        frame.extend_from_slice(&(sid as u32).to_be_bytes());
+        frame.extend_from_slice(&block);
+        client
+            .feed_data(&mut cio.as_io(), &frame)
+            .expect("late HEADERS on a canceled stream must not error");
+        assert!(
+            client.poll_event().is_none(),
+            "ignored block must emit no events"
+        );
+        assert!(client.is_active());
+
+        // A new request whose response references the inserted entry by
+        // index (0xBE = dynamic 62) proves the dropped block was decoded
+        // into the table, not skipped.
+        let sid2 = client
+            .open_stream(
+                &mut cio.as_io(),
+                &[
+                    (b":method", b"GET"),
+                    (b":path", b"/"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"x"),
+                ],
+                true,
+            )
+            .unwrap();
+        let block2: &[u8] = &[0x88, 0xBE]; // :status: 200 (static 8), dynamic 62
+        let mut frame2: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        frame2.extend_from_slice(&[0, 0, block2.len() as u8]);
+        frame2.push(FRAME_HEADERS);
+        frame2.push(FLAG_END_HEADERS | FLAG_END_STREAM);
+        frame2.extend_from_slice(&(sid2 as u32).to_be_bytes());
+        frame2.extend_from_slice(block2);
+        client.feed_data(&mut cio.as_io(), &frame2).unwrap();
+        let mut token = alloc::vec::Vec::new();
+        client
+            .recv_headers(sid2, |name, value| {
+                if name == b"x-token" {
+                    token.extend_from_slice(value);
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            token, b"hello",
+            "dynamic entry from the dropped block must resolve"
         );
     }
 
