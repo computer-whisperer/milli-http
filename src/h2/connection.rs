@@ -1026,14 +1026,29 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                     (payload_len, 0)
                 };
 
+                // A Closed slot no longer receives — its frames are handled
+                // like unknown-stream frames (drained + connection window
+                // credited) per RFC 9113 §5.1. The slot lingers between a
+                // local reset (`discard_body`) and the end-of-batch reap;
+                // without this gate, DATA landing in that window was
+                // delivered into the canceled stream's `data_buf` with no
+                // credit returned, and `data_available` kept the slot alive
+                // forever — a slot + connection-window leak per cancel.
+                let live = self
+                    .streams
+                    .iter()
+                    .find(|s| s.id == stream_id && s.state != H2StreamState::Closed);
+
                 // RFC 9113 §6.9.1: once the peer has acknowledged our SETTINGS
                 // it must honor the receive window we advertised; exceeding it
                 // is a FLOW_CONTROL_ERROR. Before the ack the peer is entitled to
                 // the RFC-default window (§6.9.2) and may legally send more than
                 // we advertised — that burst is absorbed by data_buf
-                // backpressure (see pump_partial_data), not rejected.
+                // backpressure (see pump_partial_data), not rejected. Frames on
+                // a closed stream are exempt (§5.1 — sent before our RST
+                // arrived, against a window we no longer track).
                 if self.settings_ack_received
-                    && let Some(stream) = self.streams.iter().find(|s| s.id == stream_id)
+                    && let Some(stream) = live
                     && (data_total as i32) > stream.recv_window
                 {
                     return Err(Error::Http2(crate::error::H2Error::FlowControlError));
@@ -1042,7 +1057,7 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                 // Commit the frame's data length against the connection-level
                 // receive window up front; recv_body replenishes it on drain.
                 self.conn_recv_fc.consume(data_total as u32)?;
-                let deliver = self.streams.iter().any(|s| s.id == stream_id);
+                let deliver = live.is_some();
 
                 io.drain_recv(header_len);
                 self.partial_data = Some(PartialData {
@@ -1103,39 +1118,52 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                     // a new stream via HEADERS (server push uses PUSH_PROMISE and
                     // is disabled). Existing streams (e.g. a response on a stream
                     // we opened) are unaffected.
+                    // RFC 9113 §5.1: frames on a closed stream must be
+                    // ignored — a late response or trailers can legitimately
+                    // be in flight behind our RST_STREAM, and treating them
+                    // as the peer opening a new stream (below) tears down
+                    // the whole connection. Two shapes of "closed":
+                    // - a still-present slot in Closed state (a local
+                    //   `discard_body` whose reap hasn't run yet, or a
+                    //   completed exchange retained for the application) —
+                    //   delivering here would clobber retained response
+                    //   headers and re-pin the slot;
+                    // - no slot at all, but the ID is in our own monotonic
+                    //   ID space below `next_stream_id` — a stream we opened
+                    //   that has been reaped.
+                    // The dropped block still passes through the HPACK
+                    // decoder (output discarded): skipping it would desync a
+                    // dynamic-table-inserting peer's table for every
+                    // subsequent header block on the connection. A
+                    // !END_HEADERS block cannot be decoded fragment-wise, so
+                    // it is a connection error (COMPRESSION_ERROR, §4.3): we
+                    // can no longer maintain HPACK state, and a clean
+                    // teardown beats silently wrong header values on other
+                    // streams. (In practice multi-frame trailers on a
+                    // canceled stream do not occur with in-tree peers.)
                     let is_new = !self.streams.iter().any(|s| s.id == stream_id);
-                    if is_new {
-                        let odd = stream_id % 2 == 1;
-                        // RFC 9113 §5.1: frames on a stream WE opened and have
-                        // since closed (a discard_body cancel, a completed
-                        // exchange) must be ignored — a late response or
-                        // trailers can legitimately be in flight behind our
-                        // RST_STREAM, and treating them as the peer opening a
-                        // new stream (below) tears down the whole connection.
-                        // Our IDs are allocated monotonically, so "in our ID
-                        // space and below next_stream_id, with no live slot"
-                        // identifies exactly the streams we once opened. The
-                        // dropped block still passes through the HPACK decoder
-                        // (output discarded): skipping it would desync a
-                        // dynamic-table-inserting peer's table for every
-                        // subsequent header block. A !END_HEADERS block here
-                        // leaves its CONTINUATIONs to that arm's existing
-                        // unknown-stream leniency (HPACK sync is best-effort
-                        // there, as it already is for unknown streams).
-                        let ours = match self.role {
-                            Role::Client => odd,
-                            Role::Server => !odd,
-                        };
-                        if ours && stream_id < self.next_stream_id {
-                            if end_headers {
-                                self.decoder
-                                    .decode(&io.recv_buf[frag_start..data_end], |_, _| {})?;
-                            }
-                            io.drain_recv(total);
-                            continue;
+                    let closed = self
+                        .streams
+                        .iter()
+                        .any(|s| s.id == stream_id && s.state == H2StreamState::Closed)
+                        || (is_new
+                            && stream_id < self.next_stream_id
+                            && match self.role {
+                                Role::Client => stream_id % 2 == 1,
+                                Role::Server => stream_id.is_multiple_of(2),
+                            });
+                    if closed {
+                        if !end_headers {
+                            return Err(Error::Http2(crate::error::H2Error::CompressionError));
                         }
+                        self.decoder
+                            .decode(&io.recv_buf[frag_start..data_end], |_, _| {})?;
+                        io.drain_recv(total);
+                        continue;
+                    }
+                    if is_new {
                         let ok = match self.role {
-                            Role::Server => odd,
+                            Role::Server => stream_id % 2 == 1,
                             Role::Client => false,
                         };
                         if !ok {
@@ -1349,6 +1377,14 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                         return Err(Error::Http2(crate::error::H2Error::ProtocolError));
                     }
                     let end_headers = flags & FLAG_END_HEADERS != 0;
+                    if end_headers {
+                        // Clear the contiguity latch even when the slot is
+                        // gone (a stream reaped between its HEADERS and this
+                        // CONTINUATION): leaving it set turns the next
+                        // unrelated frame into a guaranteed ProtocolError
+                        // connection kill.
+                        self.continuation_stream_id = None;
+                    }
                     if let Some(stream) = self.streams.iter_mut().find(|s| s.id == stream_id) {
                         // Bound the accumulated header block (see FRAME_HEADERS): an
                         // overflow here means a CONTINUATION flood or oversized field
@@ -1364,7 +1400,6 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                         }
                         if end_headers {
                             stream.headers_received = true;
-                            self.continuation_stream_id = None;
                             self.push_event(H2Event::Headers(stream_id));
                         }
                     }
@@ -3136,6 +3171,172 @@ mod tests {
             token, b"hello",
             "dynamic entry from the dropped block must resolve"
         );
+    }
+
+    #[test]
+    fn frames_in_the_cancel_to_reap_window_are_ignored() {
+        // The reap runs at the END of a process_recv batch, so a canceled
+        // slot is still present when the next feed's frames parse. Frames in
+        // that window must get closed-stream treatment (RFC 9113 §5.1):
+        // before the state gate on `deliver`, late DATA was delivered into
+        // the canceled stream's data_buf with no window credit returned and
+        // `data_available` re-pinned the slot — a slot + connection-window
+        // leak per cancel, with no empty re-drive to save it.
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<16384>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<16384>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+        let sid = open_streaming_response(&mut client, &mut cio, &mut server, &mut sio);
+        client.recv_headers(sid, |_, _| {}).unwrap();
+
+        client.discard_body(&mut cio.as_io(), sid, 0x8).unwrap();
+        // NO empty re-drive: the very next feed carries late DATA while the
+        // Closed slot is still present.
+        server
+            .send_data(&mut sio.as_io(), sid, &[0x33; 256], false)
+            .unwrap();
+        exchange(&mut server, &mut sio, &mut client, &mut cio);
+        assert!(
+            client.poll_event().is_none(),
+            "no events for the canceled stream"
+        );
+        assert!(
+            client.streams.is_empty(),
+            "slot reaped by the same feed's sweep"
+        );
+
+        // Every discarded byte came back as connection credit.
+        let mut out = alloc::vec::Vec::new();
+        let mut buf = [0u8; 8192];
+        while let Some(d) = client.poll_output(&mut cio.as_io(), &mut buf) {
+            out.extend_from_slice(d);
+        }
+        let conn_credit: usize = parse_frames(&out)
+            .iter()
+            .filter(|(ty, fsid, _)| *ty == FRAME_WINDOW_UPDATE && *fsid == 0)
+            .map(|(_, _, p)| u32::from_be_bytes([p[0], p[1], p[2], p[3]]) as usize)
+            .sum();
+        assert_eq!(
+            conn_credit, 256,
+            "in-window DATA credited to the connection"
+        );
+    }
+
+    #[test]
+    fn trailers_in_the_cancel_to_reap_window_are_ignored() {
+        // Same window as above, HEADERS shape: trailers landing on the
+        // still-present Closed slot must not fire events, clobber retained
+        // state, or re-pin the slot via headers_received.
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<16384>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<16384>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+        let sid = open_streaming_response(&mut client, &mut cio, &mut server, &mut sio);
+        client.recv_headers(sid, |_, _| {}).unwrap();
+
+        client.discard_body(&mut cio.as_io(), sid, 0x8).unwrap();
+        let block: &[u8] = &[0x88]; // :status: 200 (static)
+        let mut frame: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        frame.extend_from_slice(&[0, 0, block.len() as u8]);
+        frame.push(FRAME_HEADERS);
+        frame.push(FLAG_END_HEADERS | FLAG_END_STREAM);
+        frame.extend_from_slice(&(sid as u32).to_be_bytes());
+        frame.extend_from_slice(block);
+        client
+            .feed_data(&mut cio.as_io(), &frame)
+            .expect("trailers on a canceled slot must not error");
+        assert!(client.poll_event().is_none(), "ignored block, no events");
+        assert!(client.streams.is_empty(), "slot reaped, not re-pinned");
+
+        // The connection keeps working end to end.
+        let sid2 = open_streaming_response(&mut client, &mut cio, &mut server, &mut sio);
+        client.recv_headers(sid2, |_, _| {}).unwrap();
+    }
+
+    #[test]
+    fn multiframe_trailers_on_canceled_stream_are_a_connection_error() {
+        // A !END_HEADERS block on a closed stream cannot be decoded
+        // fragment-wise, so ignoring it would silently desync the HPACK
+        // dynamic table for every other stream — the honest outcome is a
+        // COMPRESSION_ERROR connection teardown.
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<16384>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<16384>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+        let sid = open_streaming_response(&mut client, &mut cio, &mut server, &mut sio);
+        client.recv_headers(sid, |_, _| {}).unwrap();
+        client.discard_body(&mut cio.as_io(), sid, 0x8).unwrap();
+        client.feed_data(&mut cio.as_io(), &[]).unwrap();
+        assert!(client.streams.is_empty());
+
+        let block: &[u8] = &[0x88];
+        let mut frame: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        frame.extend_from_slice(&[0, 0, block.len() as u8]);
+        frame.push(FRAME_HEADERS);
+        frame.push(FLAG_END_STREAM); // no END_HEADERS
+        frame.extend_from_slice(&(sid as u32).to_be_bytes());
+        frame.extend_from_slice(block);
+        assert!(matches!(
+            client.feed_data(&mut cio.as_io(), &frame),
+            Err(Error::Http2(crate::error::H2Error::CompressionError))
+        ));
+    }
+
+    #[test]
+    fn continuation_for_reaped_stream_clears_the_latch() {
+        // Pre-existing wedge: HEADERS(!END_HEADERS + END_STREAM) closes the
+        // stream, the end-of-feed sweep reaps the slot, and the CONTINUATION
+        // arriving in the next feed used to leave `continuation_stream_id`
+        // latched (the clear lived inside the slot lookup) — turning the
+        // next unrelated frame into a guaranteed ProtocolError.
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<16384>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<16384>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+        let sid = client
+            .open_stream(
+                &mut cio.as_io(),
+                &[
+                    (b":method", b"GET"),
+                    (b":path", b"/"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"x"),
+                ],
+                true,
+            )
+            .unwrap();
+
+        // Feed 1: HEADERS fragment, END_STREAM but not END_HEADERS — the
+        // stream goes Closed (fin both ways) and the sweep reaps it.
+        let frag: &[u8] = &[0x88];
+        let mut h: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        h.extend_from_slice(&[0, 0, frag.len() as u8]);
+        h.push(FRAME_HEADERS);
+        h.push(FLAG_END_STREAM);
+        h.extend_from_slice(&(sid as u32).to_be_bytes());
+        h.extend_from_slice(frag);
+        client.feed_data(&mut cio.as_io(), &h).unwrap();
+        assert!(client.streams.is_empty(), "slot reaped with block open");
+
+        // Feed 2: the CONTINUATION completing the block — slot gone, but the
+        // latch must clear.
+        let mut c: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        c.extend_from_slice(&[0, 0, frag.len() as u8]);
+        c.push(FRAME_CONTINUATION);
+        c.push(FLAG_END_HEADERS);
+        c.extend_from_slice(&(sid as u32).to_be_bytes());
+        c.extend_from_slice(frag);
+        client.feed_data(&mut cio.as_io(), &c).unwrap();
+
+        // Feed 3: an unrelated frame must not hit a stale latch.
+        let ping: &[u8] = &[0, 0, 8, FRAME_PING, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+        client
+            .feed_data(&mut cio.as_io(), ping)
+            .expect("stale continuation latch must not kill the connection");
     }
 
     #[test]
