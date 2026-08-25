@@ -828,6 +828,24 @@ where
         Err(Error::InvalidState)
     }
 
+    /// Bytes [`send_body`](Self::send_body) would accept on `stream_id`
+    /// right now without truncating; `None` when the stream (or connection)
+    /// cannot send. See [`HttpServerConn::send_capacity`]. QUIC connections
+    /// report no window limit.
+    pub fn send_capacity(&self, conn: ConnId, stream_id: u64) -> Option<usize> {
+        if let Some(tcp) = self.tcp_conns.iter().find(|c| c.id == conn) {
+            return match &tcp.state {
+                TcpState::Established(http) => http.send_capacity(stream_id),
+                _ => None,
+            };
+        }
+        #[cfg(feature = "h3")]
+        if self.quic_conns.iter().any(|c| c.id == conn) {
+            return Some(usize::MAX);
+        }
+        None
+    }
+
     // -----------------------------------------------------------------------
     // Lifecycle
     // -----------------------------------------------------------------------

@@ -557,6 +557,10 @@ where
         H2TlsServer::send_response(self, stream_id, status, headers, end_stream)
     }
 
+    fn send_capacity(&self, stream_id: u64) -> Option<usize> {
+        self.h2.send_capacity(stream_id)
+    }
+
     fn send_body(&mut self, stream_id: u64, data: &[u8], end_stream: bool) -> Result<usize, Error> {
         H2TlsServer::send_body(self, stream_id, data, end_stream)
     }
@@ -654,6 +658,10 @@ where
         _end_stream: bool,
     ) -> Result<(), Error> {
         Err(Error::InvalidState) // clients don't send responses
+    }
+
+    fn send_capacity(&self, stream_id: u64) -> Option<usize> {
+        self.h2.send_capacity(stream_id)
     }
 
     fn send_body(&mut self, stream_id: u64, data: &[u8], end_stream: bool) -> Result<usize, Error> {

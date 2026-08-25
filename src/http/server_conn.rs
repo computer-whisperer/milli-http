@@ -60,6 +60,15 @@ pub trait HttpServerConn {
     /// Send body data on a stream. Returns bytes written.
     fn send_body(&mut self, stream_id: u64, data: &[u8], end_stream: bool) -> Result<usize, Error>;
 
+    /// Bytes [`send_body`](Self::send_body) would accept on `stream_id`
+    /// right now without truncating (flow-control windows, frame size);
+    /// `None` when the stream cannot send at all. Protocols without a send
+    /// window report `Some(usize::MAX)`; a full send buffer is still
+    /// reported by `send_body` as `BufferTooSmall`.
+    fn send_capacity(&self, _stream_id: u64) -> Option<usize> {
+        Some(usize::MAX)
+    }
+
     /// Whether the connection is established (handshake/settings complete).
     fn is_established(&self) -> bool;
 

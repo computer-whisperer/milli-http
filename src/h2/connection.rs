@@ -454,6 +454,29 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         Ok(stream_id)
     }
 
+    /// Bytes [`send_data`](Self::send_data) would accept on `stream_id`
+    /// right now without truncating — the smaller of the connection window,
+    /// the stream window, and the peer's max frame size. `None` when the
+    /// stream is unknown or not in a sendable state (`send_data` would
+    /// answer `InvalidState`/`WouldBlock` forever); `Some(0)` is a closed
+    /// window, i.e. backpressure. Send-buffer space is not counted:
+    /// `send_data` reports that as `BufferTooSmall` without writing
+    /// anything. Lets a sender of self-delimiting records refuse a partial
+    /// write instead of tearing a record the receiver cannot resync on.
+    pub fn send_capacity(&self, stream_id: u64) -> Option<usize> {
+        let stream = self.get_stream(stream_id)?;
+        if !stream.can_send() {
+            return None;
+        }
+        let by_conn = self.conn_send_fc.window().max(0) as usize;
+        let by_stream = stream.send_window.max(0) as usize;
+        Some(
+            by_conn
+                .min(by_stream)
+                .min(self.peer_settings.max_frame_size as usize),
+        )
+    }
+
     /// Send data on a stream.
     pub fn send_data<const BUF: usize>(
         &mut self,
@@ -2248,6 +2271,65 @@ mod tests {
 
         let result = client.send_data(&mut cio.as_io(), stream_id, &[0u8; 1], false);
         assert_eq!(result, Err(Error::WouldBlock));
+    }
+
+    #[test]
+    fn send_capacity_tracks_windows_and_stream_state() {
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<32768>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<32768>::new();
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+
+        let stream_id = client
+            .open_stream(
+                &mut cio.as_io(),
+                &[
+                    (b":method", b"POST"),
+                    (b":path", b"/"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"example.com"),
+                ],
+                false,
+            )
+            .unwrap();
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
+        while let Some(_) = server.poll_event() {}
+
+        // Fresh stream: bounded by the server's advertised stream window
+        // (DATABUF = 4096), below the connection window and max frame size.
+        assert_eq!(client.send_capacity(stream_id), Some(4096));
+        // A stream that was never opened cannot send at all.
+        assert_eq!(client.send_capacity(stream_id + 2), None);
+
+        let chunk = [0u8; 4096];
+        assert_eq!(
+            client
+                .send_data(&mut cio.as_io(), stream_id, &chunk[..4000], false)
+                .unwrap(),
+            4000
+        );
+        assert_eq!(client.send_capacity(stream_id), Some(96));
+
+        // Exhausted window: capacity is a closed window (Some(0)), which is
+        // exactly what send_data would refuse with WouldBlock.
+        assert_eq!(
+            client
+                .send_data(&mut cio.as_io(), stream_id, &chunk[..96], false)
+                .unwrap(),
+            96
+        );
+        assert_eq!(client.send_capacity(stream_id), Some(0));
+        assert_eq!(
+            client.send_data(&mut cio.as_io(), stream_id, &[0u8; 1], false),
+            Err(Error::WouldBlock)
+        );
+
+        // Ending our side leaves the stream unsendable: None, not Some(0).
+        client
+            .send_data(&mut cio.as_io(), stream_id, &[], true)
+            .unwrap();
+        assert_eq!(client.send_capacity(stream_id), None);
     }
 
     #[test]
