@@ -206,6 +206,17 @@ where
             self.tls.feed_data(&mut tls_io, data)?;
         }
 
+        // Non-empty ciphertext the TLS layer accepted = peer receive activity
+        // (RFC 9000 §10.1 receive rule). The plaintext reaches the HTTP layer
+        // via `net_recv`, so the `feed_data_timed(&[], ..)` below can never
+        // refresh the idle clock itself — without this, `last_activity` froze
+        // at accept and the idle timeout became an absolute connection
+        // lifetime (KalogonTech/Raven-Firmware#80). Empty re-drive feeds
+        // still don't refresh, preserving the wedged-connection reap.
+        if !data.is_empty() {
+            self.http.note_recv_activity(now);
+        }
+
         if !self.net_recv.is_empty() {
             let mut http_io: Http1Io<'_, BUF> = Http1Io {
                 recv_buf: &mut self.net_recv,
@@ -407,6 +418,17 @@ where
                 app_send_buf: &mut self.app_send,
             };
             self.tls.feed_data(&mut tls_io, data)?;
+        }
+
+        // Non-empty ciphertext the TLS layer accepted = peer receive activity
+        // (RFC 9000 §10.1 receive rule). The plaintext reaches the HTTP layer
+        // via `net_recv`, so the `feed_data_timed(&[], ..)` below can never
+        // refresh the idle clock itself — without this, `last_activity` froze
+        // at accept and the idle timeout became an absolute connection
+        // lifetime (KalogonTech/Raven-Firmware#80). Empty re-drive feeds
+        // still don't refresh, preserving the wedged-connection reap.
+        if !data.is_empty() {
+            self.http.note_recv_activity(now);
         }
 
         if !self.net_recv.is_empty() {

@@ -224,6 +224,17 @@ where
             self.tls.feed_data(&mut tls_io, data)?;
         }
 
+        // Non-empty ciphertext the TLS layer accepted = peer receive activity
+        // (RFC 9000 §10.1 receive rule). The plaintext reaches the HTTP layer
+        // via `net_recv`, so the `feed_data_timed(&[], ..)` below can never
+        // refresh the idle clock itself — without this, `last_activity` froze
+        // at accept and the idle timeout became an absolute connection
+        // lifetime (KalogonTech/Raven-Firmware#80). Empty re-drive feeds
+        // still don't refresh, preserving the wedged-connection reap.
+        if !data.is_empty() {
+            self.h2.note_recv_activity(now);
+        }
+
         if !self.net_recv.is_empty() {
             let mut h2_io: H2Io<'_, BUF> = H2Io {
                 recv_buf: &mut self.net_recv,
@@ -465,6 +476,17 @@ where
                 app_send_buf: &mut self.app_send,
             };
             self.tls.feed_data(&mut tls_io, data)?;
+        }
+
+        // Non-empty ciphertext the TLS layer accepted = peer receive activity
+        // (RFC 9000 §10.1 receive rule). The plaintext reaches the HTTP layer
+        // via `net_recv`, so the `feed_data_timed(&[], ..)` below can never
+        // refresh the idle clock itself — without this, `last_activity` froze
+        // at accept and the idle timeout became an absolute connection
+        // lifetime (KalogonTech/Raven-Firmware#80). Empty re-drive feeds
+        // still don't refresh, preserving the wedged-connection reap.
+        if !data.is_empty() {
+            self.h2.note_recv_activity(now);
         }
 
         if !self.net_recv.is_empty() {
@@ -994,5 +1016,65 @@ mod tests {
         let mut body = [0u8; 256];
         let (n, _fin) = client.recv_body(stream_id, &mut body).unwrap();
         assert_eq!(&body[..n], b"Hello from H2-TLS!");
+    }
+
+    /// Regression (KalogonTech/Raven-Firmware#80): a connection that keeps
+    /// RECEIVING traffic must never be reaped by the idle timeout. The TLS
+    /// composition hands the h2 layer empty `data` slices (plaintext arrives
+    /// through the shared `net_recv` buffer), so before the fix
+    /// `last_activity` froze at accept and the "idle" timeout acted as an
+    /// absolute connection lifetime — every h2-over-TLS transfer longer than
+    /// the timeout (e.g. a 95 s firmware upload against the 60 s default)
+    /// was GOAWAY'd mid-flight at exactly `accept + idle`.
+    #[test]
+    fn h2_tls_idle_timeout_refreshed_by_inbound_traffic() {
+        let cert: &'static [u8] = test_cert_der().leak();
+        let mut client = make_client();
+        let mut server = make_server(cert);
+        exchange(&mut client, &mut server);
+        assert!(server.tls.is_active(), "handshake failed");
+
+        // Virtual clock, 1 s idle timeout armed at t=0.
+        let idle = crate::http::TimeoutConfig {
+            idle_timeout_us: Some(1_000_000),
+            header_timeout_us: None,
+        };
+        server.set_timeouts(idle, 0);
+
+        let stream_id = client
+            .send_request("POST", "/upload", "test.local", &[], false)
+            .unwrap();
+
+        // Trickle body for 4.5 virtual seconds — 4.5x the idle timeout —
+        // pumping each chunk through the timed feed path. The connection
+        // must stay open the whole time.
+        let mut now = 0u64;
+        let mut wire = [0u8; 32768];
+        for _ in 0..15 {
+            now += 300_000;
+            let _ = client.send_body(stream_id, &[0xAB; 64], false).unwrap();
+            while let Some(data) = client.poll_output(&mut wire) {
+                let copy = data.to_vec();
+                server.feed_data_timed(&copy, now).unwrap();
+            }
+            // Drain server->client (SETTINGS acks, WINDOW_UPDATEs).
+            let mut back = [0u8; 32768];
+            while let Some(data) = server.poll_output(&mut back) {
+                let copy = data.to_vec();
+                client.feed_data(&copy).unwrap();
+            }
+            server.handle_timeout(now);
+            assert!(
+                !server.is_closed(),
+                "active connection reaped as idle at t={now}us"
+            );
+        }
+
+        // Now actually go quiet: one idle period with no inbound bytes
+        // (empty re-drives don't count) must still reap the connection.
+        server.feed_data_timed(&[], now + 500_000).unwrap();
+        now += 1_100_000;
+        server.handle_timeout(now);
+        assert!(server.is_closed(), "silent connection not reaped");
     }
 }
