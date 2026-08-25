@@ -384,6 +384,16 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
         self.feed_data(io, data)
     }
 
+    /// Record peer receive activity at `now` (µs), refreshing the idle clock.
+    ///
+    /// Called by the TLS composition (`https1`), whose `feed_data_timed`
+    /// always passes an empty `data` slice (plaintext arrives via the shared
+    /// `recv_buf`) — see `H2Connection::note_recv_activity` for the full
+    /// rationale and the failure this fixes.
+    pub fn note_recv_activity(&mut self, now: u64) {
+        self.last_activity = now;
+    }
+
     /// Whether the connection has been closed (by timeout or other means).
     pub fn is_closed(&self) -> bool {
         self.closed

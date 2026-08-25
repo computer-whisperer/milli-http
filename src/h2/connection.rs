@@ -1609,6 +1609,26 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         self.feed_data(io, data)
     }
 
+    /// Record peer receive activity at `now` (µs), refreshing the idle clock.
+    ///
+    /// For the TLS compositions (`h2_tls`, `https1`): decrypted plaintext
+    /// reaches this layer through the shared `recv_buf`, so their
+    /// `feed_data_timed` calls always pass an empty `data` slice and the
+    /// non-empty guard in [`Self::feed_data_timed`] never fires. The wrapper
+    /// calls this instead whenever it fed non-empty ciphertext that the TLS
+    /// layer accepted — the RFC 9000 §10.1 receive rule (restart the idle
+    /// timer on a packet received and processed successfully). Empty runner
+    /// re-drives still don't refresh, so a wedged connection (body never
+    /// drained → reads backpressured) is still reaped by the idle timeout.
+    ///
+    /// Without this, `last_activity` froze at accept and the idle timeout
+    /// acted as an absolute connection lifetime: every h2-over-TLS transfer
+    /// longer than the timeout died mid-flight at exactly `accept + idle`
+    /// (KalogonTech/Raven-Firmware#80 — 95 s OTA uploads GOAWAY'd at 60 s).
+    pub fn note_recv_activity(&mut self, now: u64) {
+        self.last_activity = now;
+    }
+
     /// Whether the connection has been closed (GOAWAY sent/received, or timeout).
     pub fn is_closed(&self) -> bool {
         matches!(self.state, H2ConnState::Closed | H2ConnState::Closing)

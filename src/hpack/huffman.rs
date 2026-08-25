@@ -1075,7 +1075,10 @@ pub fn encoded_len(src: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
+    use std::vec;
+    use std::vec::Vec;
 
     /// Guard: the canonical decode tables assume RFC 7541's code is canonical
     /// (consecutive codes per length, standard first-code recurrence). If
