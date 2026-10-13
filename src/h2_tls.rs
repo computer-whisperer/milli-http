@@ -11,6 +11,7 @@ use crate::h2::connection::{H2Connection, H2Event};
 use crate::h2::io::H2Io;
 use crate::tcp_tls::connection::TlsConnection;
 use crate::tcp_tls::io::TlsIo;
+use crate::tls::CipherSuite;
 use crate::tls::handshake::{ServerTlsConfig, TlsConfig};
 
 /// HTTP/2 over TLS client — shared buffer composition.
@@ -47,6 +48,11 @@ where
             net_send: Buf::new(),
             app_send: Buf::new(),
         }
+    }
+
+    /// The negotiated cipher suite, once the ServerHello has fixed it.
+    pub fn cipher_suite(&self) -> Option<CipherSuite> {
+        self.tls.cipher_suite()
     }
 
     /// Feed received TCP data (encrypted).

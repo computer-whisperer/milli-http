@@ -22,6 +22,7 @@ pub use header_protection::HeaderProtection;
 pub use hkdf::Hkdf;
 
 use crate::error::Error;
+use crate::tls::CipherSuite;
 use zeroize::Zeroize;
 
 /// Encryption level — determines which keys to use.
@@ -41,6 +42,22 @@ pub trait CryptoProvider {
     type Aead: Aead;
     type Hkdf: Hkdf;
     type HeaderProtection: HeaderProtection;
+
+    /// The cipher suites this provider can key, in preference order.
+    ///
+    /// A client offers exactly these in its ClientHello and rejects a
+    /// ServerHello that names any other; a server takes the first of these
+    /// the client offered. The default is the single suite whose AEAD key
+    /// length is `Self::Aead::KEY_LEN`. A provider that can key more than
+    /// one suite overrides this and builds the AEAD the key length asks for
+    /// (`AnySuiteProvider` in the `rustcrypto` module).
+    fn cipher_suites() -> &'static [CipherSuite] {
+        match Self::Aead::KEY_LEN {
+            16 => &[CipherSuite::TlsAes128GcmSha256],
+            32 => &[CipherSuite::TlsChacha20Poly1305Sha256],
+            _ => &[],
+        }
+    }
 
     /// Create an AEAD instance from a key.
     fn aead(&self, key: &[u8]) -> Result<Self::Aead, Error>;

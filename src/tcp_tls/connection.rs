@@ -7,7 +7,7 @@ use crate::crypto::key_schedule::derive_tls_record_keys;
 use crate::crypto::{Aead, CryptoProvider, Level};
 use crate::error::Error;
 use crate::tls::handshake::{ServerTlsConfig, TlsConfig, TlsEngine};
-use crate::tls::{DerivedKeys, TlsSession};
+use crate::tls::{CipherSuite, DerivedKeys, TlsSession};
 
 use super::io::TlsIo;
 use super::record::{self, ContentType, RECORD_HEADER_LEN};
@@ -105,6 +105,11 @@ where
     ) -> Self {
         let engine = TlsEngine::<C>::new_tcp_server(config, secret, random);
         Self::new(provider, engine)
+    }
+
+    /// The negotiated cipher suite, once the ServerHello has fixed it.
+    pub fn cipher_suite(&self) -> Option<CipherSuite> {
+        self.engine.cipher_suite()
     }
 
     fn new(provider: C, engine: TlsEngine<C>) -> Self {
@@ -503,7 +508,9 @@ where
 
     fn install_keys(&mut self, keys: DerivedKeys) -> Result<(), Error> {
         let hkdf = C::Hkdf::default();
-        let key_len = C::Aead::KEY_LEN;
+        // The negotiated suite, not the provider's constant, sizes the keys:
+        // an either-suite provider keys whichever length it is handed.
+        let key_len = keys.cipher_suite.key_len();
 
         let send_secret = &keys.send_secret[..keys.secret_len];
         let recv_secret = &keys.recv_secret[..keys.secret_len];
@@ -859,31 +866,49 @@ mod tests {
     }
 
     fn make_client() -> TestConn {
+        make_client_on(Aes128GcmProvider)
+    }
+
+    fn make_client_on<C: CryptoProvider>(provider: C) -> TlsConnection<C>
+    where
+        C::Hkdf: Default,
+    {
         let config = TlsConfig {
             server_name: heapless::String::try_from("test.local").unwrap(),
             alpn_protocols: &[b"h2"],
             transport_params: TransportParams::default_params(),
             pinned_certs: &[],
         };
-        TestConn::new_client(Aes128GcmProvider, config, [0xAA; 32], [0xBB; 32])
+        TlsConnection::new_client(provider, config, [0xAA; 32], [0xBB; 32])
     }
 
     fn make_server(cert: &'static [u8]) -> TestConn {
+        make_server_on(Aes128GcmProvider, cert)
+    }
+
+    fn make_server_on<C: CryptoProvider>(provider: C, cert: &'static [u8]) -> TlsConnection<C>
+    where
+        C::Hkdf: Default,
+    {
         let config = ServerTlsConfig {
             cert_der: cert,
             private_key_der: &TEST_SEED,
             alpn_protocols: &[b"h2"],
             transport_params: TransportParams::default_params(),
         };
-        TestConn::new_server(Aes128GcmProvider, config, [0xCC; 32], [0xDD; 32])
+        TlsConnection::new_server(provider, config, [0xCC; 32], [0xDD; 32])
     }
 
-    fn transfer<const A: usize, const B: usize>(
-        src: &mut TestConn,
+    fn transfer<S: CryptoProvider, D: CryptoProvider, const A: usize, const B: usize>(
+        src: &mut TlsConnection<S>,
         sio: &mut TlsIoBufs<A>,
-        dst: &mut TestConn,
+        dst: &mut TlsConnection<D>,
         dio: &mut TlsIoBufs<B>,
-    ) -> bool {
+    ) -> bool
+    where
+        S::Hkdf: Default,
+        D::Hkdf: Default,
+    {
         let mut any = false;
         let mut buf = [0u8; 32768];
         while let Some(data) = src.poll_output(&mut sio.as_io(), &mut buf) {
@@ -894,12 +919,15 @@ mod tests {
         any
     }
 
-    fn handshake<const A: usize, const B: usize>(
-        client: &mut TestConn,
+    fn handshake<CC: CryptoProvider, SC: CryptoProvider, const A: usize, const B: usize>(
+        client: &mut TlsConnection<CC>,
         cio: &mut TlsIoBufs<A>,
-        server: &mut TestConn,
+        server: &mut TlsConnection<SC>,
         sio: &mut TlsIoBufs<B>,
-    ) {
+    ) where
+        CC::Hkdf: Default,
+        SC::Hkdf: Default,
+    {
         for _ in 0..20 {
             let a = transfer(client, cio, server, sio);
             let b = transfer(server, sio, client, cio);
@@ -909,7 +937,10 @@ mod tests {
         }
     }
 
-    fn drain_events(c: &mut TestConn) -> Vec<TlsEvent> {
+    fn drain_events<C: CryptoProvider>(c: &mut TlsConnection<C>) -> Vec<TlsEvent>
+    where
+        C::Hkdf: Default,
+    {
         let mut events = Vec::new();
         while let Some(ev) = c.poll_event() {
             events.push(ev);
@@ -1590,5 +1621,62 @@ mod tests {
         let mut rb = [0u8; 64];
         let n = client.recv_app_data(&mut cio.as_io(), &mut rb).unwrap();
         assert_eq!(&rb[..n], b"parting words");
+    }
+
+    /// An either-suite client against a server of provider `S`: both sides
+    /// land on `want`, and application data flows both ways under it — the
+    /// record layer sized its keys from the negotiated suite, not from the
+    /// client provider's constant.
+    #[cfg(feature = "rustcrypto-chacha")]
+    fn exchange_with<S: CryptoProvider>(mut server: TlsConnection<S>, want: CipherSuite)
+    where
+        S::Hkdf: Default,
+    {
+        use crate::crypto::rustcrypto::AnySuiteProvider;
+
+        let mut client = make_client_on(AnySuiteProvider);
+        let mut cio = TestIo::new();
+        let mut sio = TestIo::new();
+
+        handshake(&mut client, &mut cio, &mut server, &mut sio);
+        assert!(drain_events(&mut client).contains(&TlsEvent::HandshakeComplete));
+        assert!(drain_events(&mut server).contains(&TlsEvent::HandshakeComplete));
+        assert_eq!(client.cipher_suite(), Some(want));
+        assert_eq!(server.cipher_suite(), Some(want));
+
+        client.send_app_data(&mut cio.as_io(), b"ping").unwrap();
+        transfer(&mut client, &mut cio, &mut server, &mut sio);
+        assert!(drain_events(&mut server).contains(&TlsEvent::AppData));
+        let mut buf = [0u8; 64];
+        let n = server.recv_app_data(&mut sio.as_io(), &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"ping");
+
+        server.send_app_data(&mut sio.as_io(), b"pong").unwrap();
+        transfer(&mut server, &mut sio, &mut client, &mut cio);
+        assert!(drain_events(&mut client).contains(&TlsEvent::AppData));
+        let n = client.recv_app_data(&mut cio.as_io(), &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"pong");
+    }
+
+    #[cfg(feature = "rustcrypto-chacha")]
+    #[test]
+    fn any_suite_client_exchanges_data_with_a_chacha20_server() {
+        use crate::crypto::rustcrypto::ChaCha20Provider;
+
+        let cert = test_cert_der().leak();
+        exchange_with(
+            make_server_on(ChaCha20Provider, cert),
+            CipherSuite::TlsChacha20Poly1305Sha256,
+        );
+    }
+
+    #[cfg(feature = "rustcrypto-chacha")]
+    #[test]
+    fn any_suite_client_exchanges_data_with_an_aes_server() {
+        let cert = test_cert_der().leak();
+        exchange_with(
+            make_server_on(Aes128GcmProvider, cert),
+            CipherSuite::TlsAes128GcmSha256,
+        );
     }
 }

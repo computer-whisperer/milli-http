@@ -2,6 +2,8 @@
 
 use crate::crypto::{Aead as AeadTrait, CryptoProvider, HeaderProtection, Hkdf as HkdfTrait};
 use crate::error::Error;
+#[cfg(feature = "rustcrypto-chacha")]
+use crate::tls::CipherSuite;
 
 // ---- HKDF-SHA256 ----
 
@@ -295,6 +297,125 @@ impl CryptoProvider for ChaCha20Provider {
     }
 }
 
+// ---- Either-suite provider ----
+
+/// AEAD keyed for whichever suite the handshake negotiated.
+///
+/// The AES variant carries its expanded key schedule and so dwarfs the
+/// ChaCha20 one; a connection holds one of these per direction, which is
+/// no more than it holds on [`Aes128GcmProvider`], so no box.
+#[cfg(feature = "rustcrypto-chacha")]
+#[allow(clippy::large_enum_variant)]
+pub enum AnySuiteAead {
+    Aes128Gcm(Aes128GcmAead),
+    ChaCha20Poly1305(ChaCha20Poly1305Aead),
+}
+
+#[cfg(feature = "rustcrypto-chacha")]
+impl AeadTrait for AnySuiteAead {
+    /// An upper bound only. The record layers size this AEAD's key from the
+    /// negotiated suite (`CipherSuite::key_len`), never from this constant,
+    /// and `AnySuiteProvider::cipher_suites` does not consult it either.
+    const KEY_LEN: usize = 32;
+    const NONCE_LEN: usize = 12;
+    const TAG_LEN: usize = 16;
+
+    fn seal_in_place(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        buf: &mut [u8],
+        payload_len: usize,
+    ) -> Result<usize, Error> {
+        match self {
+            Self::Aes128Gcm(aead) => aead.seal_in_place(nonce, aad, buf, payload_len),
+            Self::ChaCha20Poly1305(aead) => aead.seal_in_place(nonce, aad, buf, payload_len),
+        }
+    }
+
+    fn open_in_place(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        buf: &mut [u8],
+        ciphertext_len: usize,
+    ) -> Result<usize, Error> {
+        match self {
+            Self::Aes128Gcm(aead) => aead.open_in_place(nonce, aad, buf, ciphertext_len),
+            Self::ChaCha20Poly1305(aead) => aead.open_in_place(nonce, aad, buf, ciphertext_len),
+        }
+    }
+}
+
+/// Header protection keyed for whichever suite the handshake negotiated.
+/// (Same size asymmetry as [`AnySuiteAead`], same reasoning.)
+#[cfg(feature = "rustcrypto-chacha")]
+#[allow(clippy::large_enum_variant)]
+pub enum AnySuiteHeaderProtection {
+    Aes(AesHeaderProtection),
+    ChaCha(ChaChaHeaderProtection),
+}
+
+#[cfg(feature = "rustcrypto-chacha")]
+impl HeaderProtection for AnySuiteHeaderProtection {
+    fn mask(&self, sample: &[u8]) -> [u8; 5] {
+        match self {
+            Self::Aes(hp) => hp.mask(sample),
+            Self::ChaCha(hp) => hp.mask(sample),
+        }
+    }
+}
+
+/// A provider that keys either suite — ChaCha20-Poly1305 preferred,
+/// AES-128-GCM accepted — for a host that talks to peers built on
+/// [`ChaCha20Provider`] and on [`Aes128GcmProvider`] alike. It offers both
+/// suites and builds the AEAD the negotiated key length asks for (16 bytes
+/// → AES, 32 → ChaCha20). A single-suite peer stays on the one provider
+/// that matches its hardware.
+#[cfg(feature = "rustcrypto-chacha")]
+#[derive(Clone, Copy, Default)]
+pub struct AnySuiteProvider;
+
+#[cfg(feature = "rustcrypto-chacha")]
+impl CryptoProvider for AnySuiteProvider {
+    type Aead = AnySuiteAead;
+    type Hkdf = HkdfSha256;
+    type HeaderProtection = AnySuiteHeaderProtection;
+
+    fn cipher_suites() -> &'static [CipherSuite] {
+        &[
+            CipherSuite::TlsChacha20Poly1305Sha256,
+            CipherSuite::TlsAes128GcmSha256,
+        ]
+    }
+
+    fn aead(&self, key: &[u8]) -> Result<Self::Aead, Error> {
+        match key.len() {
+            16 => Aes128GcmProvider.aead(key).map(AnySuiteAead::Aes128Gcm),
+            32 => ChaCha20Provider
+                .aead(key)
+                .map(AnySuiteAead::ChaCha20Poly1305),
+            _ => Err(Error::Crypto),
+        }
+    }
+
+    fn hkdf(&self) -> Self::Hkdf {
+        HkdfSha256
+    }
+
+    fn header_protection(&self, key: &[u8]) -> Result<Self::HeaderProtection, Error> {
+        match key.len() {
+            16 => Aes128GcmProvider
+                .header_protection(key)
+                .map(AnySuiteHeaderProtection::Aes),
+            32 => ChaCha20Provider
+                .header_protection(key)
+                .map(AnySuiteHeaderProtection::ChaCha),
+            _ => Err(Error::Crypto),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +560,107 @@ mod tests {
         assert_eq!(ChaCha20Poly1305Aead::KEY_LEN, 32);
         assert_eq!(ChaCha20Poly1305Aead::NONCE_LEN, 12);
         assert_eq!(ChaCha20Poly1305Aead::TAG_LEN, 16);
+    }
+
+    // ---- Either-suite provider ----
+
+    #[cfg(feature = "rustcrypto-chacha")]
+    fn sealed<A: AeadTrait>(aead: &A) -> [u8; 32] {
+        let mut buf = [0u8; 32];
+        buf[..16].copy_from_slice(b"same bytes here!");
+        aead.seal_in_place(&[7u8; 12], b"aad", &mut buf, 16)
+            .unwrap();
+        buf
+    }
+
+    /// The either-suite provider builds the AEAD the key length names, and
+    /// it is byte-for-byte the single-suite provider's AEAD.
+    #[cfg(feature = "rustcrypto-chacha")]
+    #[test]
+    fn any_suite_provider_keys_by_key_length() {
+        let aes_key = [0x42u8; 16];
+        let chacha_key = [0x42u8; 32];
+
+        let any = AnySuiteProvider.aead(&aes_key).unwrap();
+        assert!(matches!(any, AnySuiteAead::Aes128Gcm(_)));
+        assert_eq!(
+            sealed(&any),
+            sealed(&Aes128GcmProvider.aead(&aes_key).unwrap())
+        );
+
+        let any = AnySuiteProvider.aead(&chacha_key).unwrap();
+        assert!(matches!(any, AnySuiteAead::ChaCha20Poly1305(_)));
+        assert_eq!(
+            sealed(&any),
+            sealed(&ChaCha20Provider.aead(&chacha_key).unwrap())
+        );
+
+        assert!(matches!(
+            AnySuiteProvider.aead(&[0u8; 24]),
+            Err(Error::Crypto)
+        ));
+
+        let mut buf = sealed(&AnySuiteProvider.aead(&chacha_key).unwrap());
+        let n = AnySuiteProvider
+            .aead(&chacha_key)
+            .unwrap()
+            .open_in_place(&[7u8; 12], b"aad", &mut buf, 32)
+            .unwrap();
+        assert_eq!(&buf[..n], b"same bytes here!");
+    }
+
+    #[cfg(feature = "rustcrypto-chacha")]
+    #[test]
+    fn any_suite_header_protection_keys_by_key_length() {
+        let sample = [0xaau8; 16];
+        let aes_key = [0x55u8; 16];
+        let chacha_key = [0x55u8; 32];
+
+        assert_eq!(
+            AnySuiteProvider
+                .header_protection(&aes_key)
+                .unwrap()
+                .mask(&sample),
+            Aes128GcmProvider
+                .header_protection(&aes_key)
+                .unwrap()
+                .mask(&sample)
+        );
+        assert_eq!(
+            AnySuiteProvider
+                .header_protection(&chacha_key)
+                .unwrap()
+                .mask(&sample),
+            ChaCha20Provider
+                .header_protection(&chacha_key)
+                .unwrap()
+                .mask(&sample)
+        );
+        assert!(matches!(
+            AnySuiteProvider.header_protection(&[0u8; 24]),
+            Err(Error::Crypto)
+        ));
+    }
+
+    /// Single-suite providers list exactly their suite; the either-suite
+    /// provider lists both, ChaCha20 first.
+    #[cfg(feature = "rustcrypto-chacha")]
+    #[test]
+    fn providers_list_the_suites_they_key() {
+        assert_eq!(
+            Aes128GcmProvider::cipher_suites(),
+            &[CipherSuite::TlsAes128GcmSha256]
+        );
+        assert_eq!(
+            ChaCha20Provider::cipher_suites(),
+            &[CipherSuite::TlsChacha20Poly1305Sha256]
+        );
+        assert_eq!(
+            AnySuiteProvider::cipher_suites(),
+            &[
+                CipherSuite::TlsChacha20Poly1305Sha256,
+                CipherSuite::TlsAes128GcmSha256
+            ]
+        );
     }
 }

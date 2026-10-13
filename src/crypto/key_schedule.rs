@@ -5,6 +5,7 @@
 
 use crate::crypto::{Aead, CryptoProvider, DirectionalKeys, Hkdf};
 use crate::error::Error;
+use crate::tls::CipherSuite;
 use zeroize::Zeroize;
 
 /// QUIC v1 Initial salt (RFC 9001 section 5.2).
@@ -124,18 +125,36 @@ pub fn derive_next_application_secret<H: Hkdf>(
     hkdf_expand_label(hkdf, current_secret, b"quic ku", &[], new_secret)
 }
 
-/// Derive complete `DirectionalKeys` from a traffic secret using a `CryptoProvider`.
+/// Derive complete `DirectionalKeys` from a traffic secret for the provider's
+/// own suite — the one whose AEAD key length is `C::Aead::KEY_LEN`. Keys for
+/// a negotiated suite come from [`derive_directional_keys_for`].
 pub fn derive_directional_keys<C: CryptoProvider>(
     provider: &C,
     hkdf: &C::Hkdf,
     secret: &[u8],
 ) -> Result<DirectionalKeys<C::Aead, C::HeaderProtection>, Error> {
+    let suite = match C::Aead::KEY_LEN {
+        16 => CipherSuite::TlsAes128GcmSha256,
+        32 => CipherSuite::TlsChacha20Poly1305Sha256,
+        _ => return Err(Error::Crypto),
+    };
+    derive_directional_keys_for(provider, hkdf, secret, suite)
+}
+
+/// Derive complete `DirectionalKeys` from a traffic secret for `suite`, which
+/// fixes the AEAD and header-protection key lengths (RFC 9001 §5.1, §5.4).
+pub fn derive_directional_keys_for<C: CryptoProvider>(
+    provider: &C,
+    hkdf: &C::Hkdf,
+    secret: &[u8],
+    suite: CipherSuite,
+) -> Result<DirectionalKeys<C::Aead, C::HeaderProtection>, Error> {
     let mut key_buf = [0u8; 32];
     let mut iv = [0u8; 12];
     let mut hp_buf = [0u8; 32];
 
-    let key_len = C::Aead::KEY_LEN;
-    let hp_key_len = core::cmp::max(key_len, 16); // AES HP is always 16, ChaCha HP is 32
+    let key_len = suite.key_len();
+    let hp_key_len = suite.hp_key_len();
 
     let result = (|| {
         derive_packet_keys(

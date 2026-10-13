@@ -24,10 +24,15 @@ pub use transport_params::TransportParams;
 use crate::crypto::Level;
 use zeroize::Zeroize;
 
-/// Keys derived during the TLS handshake, to be consumed by QUIC.
+/// Keys derived during the TLS handshake, to be consumed by the QUIC packet
+/// layer or the TLS record layer.
 pub struct DerivedKeys {
     /// The encryption level these keys apply to.
     pub level: Level,
+    /// The negotiated cipher suite these secrets key. It fixes the AEAD and
+    /// header-protection key lengths ([`CipherSuite::key_len`],
+    /// [`CipherSuite::hp_key_len`]) the consumer derives from the secrets.
+    pub cipher_suite: CipherSuite,
     /// Send traffic secret — up to 48 bytes (32 for SHA-256, 48 for SHA-384).
     pub send_secret: [u8; 48],
     /// Receive traffic secret — up to 48 bytes (32 for SHA-256, 48 for SHA-384).

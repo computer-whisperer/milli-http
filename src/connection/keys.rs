@@ -106,6 +106,9 @@ pub struct KeyUpdateState<C: CryptoProvider> {
     pub recv_hp_key: [u8; 32],
     /// Length of HP key (16 for AES, 32 for ChaCha20).
     pub hp_key_len: usize,
+    /// AEAD key length of the negotiated suite (16 for AES-128-GCM, 32 for
+    /// ChaCha20-Poly1305); each key-update generation is derived at it.
+    pub key_len: usize,
     /// Previous-generation read AEAD key, for decrypting packets still
     /// encrypted with the old key phase during a transition.
     pub(crate) prev_recv_key: OptKeys<C::Aead, C::HeaderProtection>,
@@ -146,6 +149,7 @@ impl<C: CryptoProvider> KeyUpdateState<C> {
             send_hp_key: [0u8; 32],
             recv_hp_key: [0u8; 32],
             hp_key_len: 0,
+            key_len: 0,
             prev_recv_key: OptKeys::none(),
             update_confirmed: true, // No pending update initially
             packets_encrypted: 0,
@@ -251,15 +255,17 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
     pub fn install_derived(&mut self, provider: &C, derived: &DerivedKeys) -> Result<(), Error> {
         let hkdf = provider.hkdf();
-        let send_keys = crate::crypto::key_schedule::derive_directional_keys(
+        let send_keys = crate::crypto::key_schedule::derive_directional_keys_for(
             provider,
             &hkdf,
             &derived.send_secret[..derived.secret_len],
+            derived.cipher_suite,
         )?;
-        let recv_keys = crate::crypto::key_schedule::derive_directional_keys(
+        let recv_keys = crate::crypto::key_schedule::derive_directional_keys_for(
             provider,
             &hkdf,
             &derived.recv_secret[..derived.secret_len],
+            derived.cipher_suite,
         )?;
 
         match derived.level {
@@ -276,12 +282,13 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
                 self.key_update.recv_secret[..derived.secret_len]
                     .copy_from_slice(&derived.recv_secret[..derived.secret_len]);
                 self.key_update.secret_len = derived.secret_len;
+                self.key_update.key_len = derived.cipher_suite.key_len();
                 self.key_update.key_phase = 0;
                 self.key_update.update_confirmed = true;
 
                 // Save the initial HP key bytes. Per RFC 9001 section 6, header
                 // protection keys do NOT change during key updates.
-                let hp_key_len = core::cmp::max(C::Aead::KEY_LEN, 16);
+                let hp_key_len = derived.cipher_suite.hp_key_len();
                 let mut send_hp = [0u8; 32];
                 let mut recv_hp = [0u8; 32];
                 crate::crypto::key_schedule::hkdf_expand_label(
@@ -437,7 +444,7 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
 
         let mut key_buf = [0u8; 32];
         let mut iv = [0u8; 12];
-        let key_len = C::Aead::KEY_LEN;
+        let key_len = self.key_update.key_len;
 
         crate::crypto::key_schedule::hkdf_expand_label(
             &hkdf,
@@ -646,6 +653,7 @@ impl<C: CryptoProvider> ConnectionKeys<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tls::CipherSuite;
 
     #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
     #[test]
@@ -703,6 +711,7 @@ mod tests {
         recv_secret[..32].copy_from_slice(&[0xBB; 32]);
 
         let derived = DerivedKeys {
+            cipher_suite: CipherSuite::TlsAes128GcmSha256,
             level: Level::Handshake,
             send_secret,
             recv_secret,
@@ -813,6 +822,7 @@ mod tests {
             rs[..32].copy_from_slice(recv_secret);
 
             let derived = DerivedKeys {
+                cipher_suite: CipherSuite::TlsAes128GcmSha256,
                 level: Level::Application,
                 send_secret: ss,
                 recv_secret: rs,

@@ -76,7 +76,10 @@ released after the handshake completes.
 **Pluggable crypto.** AEAD, HKDF, and key exchange are behind a
 `CryptoProvider` trait. Default implementations use RustCrypto
 (`rustcrypto-chacha` enables ChaCha20-Poly1305 + AES-GCM; `rustcrypto-aes` is
-AES-only for smaller flash). Certificates: Ed25519 and ECDSA P-256.
+AES-only for smaller flash). A provider keys one suite (`ChaCha20Provider`,
+`Aes128GcmProvider`) or either (`AnySuiteProvider`, for a host facing peers of
+both kinds); the handshake offers and selects from
+`CryptoProvider::cipher_suites`. Certificates: Ed25519 and ECDSA P-256.
 
 ## Memory footprint
 
@@ -124,7 +127,7 @@ cargo run --example omni_client --features h3,h2,http1,rustcrypto-chacha
 | `h2` | `http` | HTTP/2 + HPACK over TCP |
 | `http1` | `http` | HTTP/1.1 over TCP |
 | `tcp-tls` | `http` | TLS 1.3 record layer for HTTPS/1.1 and H2 |
-| `rustcrypto-chacha` | RustCrypto | ChaCha20-Poly1305 + AES-GCM providers (default) |
+| `rustcrypto-chacha` | RustCrypto | ChaCha20-Poly1305 + AES-GCM providers, and the either-suite `AnySuiteProvider` (default) |
 | `rustcrypto-aes` | RustCrypto | AES-GCM only (smaller flash) |
 | `alloc` | — | Heap-backed internal buffers (lower idle RAM) |
 | `std` | — | `std` integration for tests and examples |

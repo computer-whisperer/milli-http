@@ -55,6 +55,24 @@ impl CipherSuite {
             _ => None,
         }
     }
+
+    /// AEAD key length the suite's record protection uses (RFC 8446 §7.3):
+    /// 16 for AES-128-GCM, 32 for ChaCha20-Poly1305.
+    pub fn key_len(self) -> usize {
+        match self {
+            Self::TlsAes128GcmSha256 => 16,
+            Self::TlsChacha20Poly1305Sha256 => 32,
+        }
+    }
+
+    /// QUIC header-protection key length (RFC 9001 §5.4): 16 for AES,
+    /// 32 for ChaCha20.
+    pub fn hp_key_len(self) -> usize {
+        match self {
+            Self::TlsAes128GcmSha256 => 16,
+            Self::TlsChacha20Poly1305Sha256 => 32,
+        }
+    }
 }
 
 /// Parsed ClientHello message.

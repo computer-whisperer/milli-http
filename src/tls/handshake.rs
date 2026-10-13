@@ -13,7 +13,7 @@
 //! ```
 
 use crate::buf::{Buf, BufExt};
-use crate::crypto::{Aead, CryptoProvider, Level};
+use crate::crypto::{CryptoProvider, Level};
 use crate::error::Error;
 use crate::tls::extensions::{
     encode_client_hello_extensions, encode_encrypted_extensions_data,
@@ -412,10 +412,12 @@ where
             &mut ext_buf,
         )?;
 
-        let suites = [
-            CipherSuite::TlsAes128GcmSha256,
-            CipherSuite::TlsChacha20Poly1305Sha256,
-        ];
+        // Offer exactly the suites our provider can key, in its preference
+        // order; the server must pick one of them (`process_server_hello`).
+        let suites = C::cipher_suites();
+        if suites.is_empty() {
+            return Err(Error::Tls);
+        }
 
         // QUIC doesn't use the legacy session ID; TCP needs one for middlebox compat
         let session_id: &[u8] = if self.quic_mode {
@@ -428,7 +430,7 @@ where
         let msg_len = encode_client_hello(
             random,
             session_id,
-            &suites,
+            suites,
             &ext_buf[..ext_len],
             &mut msg_buf,
         )?;
@@ -446,11 +448,22 @@ where
         Ok(())
     }
 
+    /// The negotiated cipher suite, once the ServerHello has fixed it.
+    pub fn cipher_suite(&self) -> Option<CipherSuite> {
+        self.cipher_suite
+    }
+
     /// Process a ServerHello message (client side).
     fn process_server_hello(&mut self, msg_body: &[u8]) -> Result<(), Error> {
         let sh = parse_server_hello(msg_body)?;
 
-        // Validate cipher suite
+        // The server must have picked one of the suites we offered, i.e. one
+        // our provider can key. Anything else is a protocol violation, and
+        // keying it would only fail later in the record layer as a bare
+        // `Crypto`.
+        if !C::cipher_suites().contains(&sh.cipher_suite) {
+            return Err(Error::Tls);
+        }
         self.cipher_suite = Some(sh.cipher_suite);
 
         // Parse extensions
@@ -495,6 +508,7 @@ where
         send_secret[..32].copy_from_slice(&self.client_handshake_secret);
         recv_secret[..32].copy_from_slice(&self.server_handshake_secret);
         self.pending_keys = Some(DerivedKeys {
+            cipher_suite: self.cipher_suite.ok_or(Error::Tls)?,
             level: Level::Handshake,
             send_secret,
             recv_secret,
@@ -654,6 +668,7 @@ where
         send_secret[..32].copy_from_slice(&self.client_app_secret);
         recv_secret[..32].copy_from_slice(&self.server_app_secret);
         self.pending_keys = Some(DerivedKeys {
+            cipher_suite: self.cipher_suite.ok_or(Error::Tls)?,
             level: Level::Application,
             send_secret,
             recv_secret,
@@ -711,25 +726,14 @@ where
         // Must have key_share (X25519)
         let client_public_bytes = ext.key_share.ok_or(Error::Tls)?;
 
-        // Select cipher suite that matches our CryptoProvider's AEAD.
-        // The cipher suite must match the AEAD key length to ensure the
-        // QUIC packet encryption uses the correct algorithm.
-        let our_suite = match C::Aead::KEY_LEN {
-            16 => CipherSuite::TlsAes128GcmSha256,
-            32 => CipherSuite::TlsChacha20Poly1305Sha256,
-            _ => return Err(Error::Tls),
-        };
-        let mut client_supports_our_suite = false;
-        for cs_u16 in iter_cipher_suites(ch.cipher_suites) {
-            if cs_u16 == our_suite.to_u16() {
-                client_supports_our_suite = true;
-                break;
-            }
-        }
-        if !client_supports_our_suite {
-            return Err(Error::Tls);
-        }
-        let selected_suite = our_suite;
+        // Select the first suite our provider can key (its preference order)
+        // that the client offered. The suite fixes the key lengths the record
+        // layers derive, so it must be one the provider's `aead` accepts.
+        let selected_suite = C::cipher_suites()
+            .iter()
+            .copied()
+            .find(|ours| iter_cipher_suites(ch.cipher_suites).any(|cs| cs == ours.to_u16()))
+            .ok_or(Error::Tls)?;
         self.cipher_suite = Some(selected_suite);
 
         // ALPN negotiation: select the first protocol the client offers that we support
@@ -823,6 +827,7 @@ where
         send_secret[..32].copy_from_slice(&self.server_handshake_secret);
         recv_secret[..32].copy_from_slice(&self.client_handshake_secret);
         self.pending_keys = Some(DerivedKeys {
+            cipher_suite: self.cipher_suite.ok_or(Error::Tls)?,
             level: Level::Handshake,
             send_secret,
             recv_secret,
@@ -1021,6 +1026,7 @@ where
         send_secret[..32].copy_from_slice(&self.server_app_secret);
         recv_secret[..32].copy_from_slice(&self.client_app_secret);
         self.pending_keys = Some(DerivedKeys {
+            cipher_suite: self.cipher_suite.ok_or(Error::Tls)?,
             level: Level::Application,
             send_secret,
             recv_secret,
@@ -2384,5 +2390,150 @@ mod tests {
 
         let result = server.read_handshake(Level::Initial, &msg[..4 + body_len]);
         assert!(result.is_err());
+    }
+
+    /// The suites a fresh client of provider `C` puts in its ClientHello.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    fn offered_suites<C: CryptoProvider>() -> heapless::Vec<u16, 4>
+    where
+        C::Hkdf: Default,
+    {
+        let mut client = TlsEngine::<C>::new_client(make_client_config(), [0x42; 32], [0; 32]);
+        let mut buf = [0u8; 2048];
+        let (len, _) = client.write_handshake(&mut buf).unwrap();
+        let ch = parse_client_hello(&buf[4..len]).unwrap();
+        iter_cipher_suites(ch.cipher_suites).collect()
+    }
+
+    /// Test: a client offers exactly the suites its provider can key — not
+    /// every suite the crate knows.
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    #[test]
+    fn client_offers_only_the_suites_its_provider_keys() {
+        use crate::crypto::rustcrypto::Aes128GcmProvider;
+
+        assert_eq!(offered_suites::<Aes128GcmProvider>().as_slice(), &[0x1301]);
+    }
+
+    #[cfg(feature = "rustcrypto-chacha")]
+    #[test]
+    fn any_suite_client_offers_both_suites_chacha_first() {
+        use crate::crypto::rustcrypto::AnySuiteProvider;
+
+        assert_eq!(
+            offered_suites::<AnySuiteProvider>().as_slice(),
+            &[0x1303, 0x1301]
+        );
+    }
+
+    /// Drive a client and a server engine to completion over a lossless
+    /// in-memory link (raw handshake messages, no record layer).
+    #[cfg(any(feature = "rustcrypto-chacha", feature = "rustcrypto-aes"))]
+    fn run_to_completion<CC, SC>(client: &mut TlsEngine<CC>, server: &mut TlsEngine<SC>)
+    where
+        CC: CryptoProvider,
+        SC: CryptoProvider,
+        CC::Hkdf: Default,
+        SC::Hkdf: Default,
+    {
+        let mut buf = [0u8; 4096];
+        for _ in 0..8 {
+            loop {
+                let (n, level) = client.write_handshake(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                server.read_handshake(level, &buf[..n]).unwrap();
+            }
+            loop {
+                let (n, level) = server.write_handshake(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                client.read_handshake(level, &buf[..n]).unwrap();
+            }
+            if client.is_complete() && server.is_complete() {
+                return;
+            }
+        }
+        panic!("handshake did not complete");
+    }
+
+    /// Test: the either-suite client ends up on whichever suite the server
+    /// keys — ChaCha20 against a ChaCha20 server, AES against an AES server.
+    #[cfg(feature = "rustcrypto-chacha")]
+    #[test]
+    fn any_suite_client_takes_whichever_suite_the_server_keys() {
+        use crate::crypto::rustcrypto::{Aes128GcmProvider, AnySuiteProvider, ChaCha20Provider};
+
+        let mut client =
+            TlsEngine::<AnySuiteProvider>::new_client(make_client_config(), [0x42; 32], [0; 32]);
+        let mut server =
+            TlsEngine::<ChaCha20Provider>::new_server(make_server_config(), [0xAA; 32], [0xBB; 32]);
+        run_to_completion(&mut client, &mut server);
+        assert_eq!(
+            client.cipher_suite(),
+            Some(CipherSuite::TlsChacha20Poly1305Sha256)
+        );
+        assert_eq!(
+            server.cipher_suite(),
+            Some(CipherSuite::TlsChacha20Poly1305Sha256)
+        );
+
+        let mut client =
+            TlsEngine::<AnySuiteProvider>::new_client(make_client_config(), [0x42; 32], [0; 32]);
+        let mut server = TlsEngine::<Aes128GcmProvider>::new_server(
+            make_server_config(),
+            [0xAA; 32],
+            [0xBB; 32],
+        );
+        run_to_completion(&mut client, &mut server);
+        assert_eq!(client.cipher_suite(), Some(CipherSuite::TlsAes128GcmSha256));
+        assert_eq!(server.cipher_suite(), Some(CipherSuite::TlsAes128GcmSha256));
+    }
+
+    /// Test: a server refuses a ClientHello that offers none of its suites.
+    /// (Before, the AES-only client advertised ChaCha20 too, the server took
+    /// it, and the client failed much later keying a 32-byte key.)
+    #[cfg(feature = "rustcrypto-chacha")]
+    #[test]
+    fn server_refuses_a_client_that_cannot_key_its_suite() {
+        use crate::crypto::rustcrypto::{Aes128GcmProvider, ChaCha20Provider};
+
+        let mut client =
+            TlsEngine::<Aes128GcmProvider>::new_client(make_client_config(), [0x42; 32], [0; 32]);
+        let mut server =
+            TlsEngine::<ChaCha20Provider>::new_server(make_server_config(), [0xAA; 32], [0xBB; 32]);
+        let mut buf = [0u8; 2048];
+        let (n, level) = client.write_handshake(&mut buf).unwrap();
+        assert_eq!(server.read_handshake(level, &buf[..n]), Err(Error::Tls));
+    }
+
+    /// Test: a client refuses a ServerHello naming a suite it did not offer.
+    #[cfg(feature = "rustcrypto-chacha")]
+    #[test]
+    fn client_refuses_a_server_hello_naming_an_unoffered_suite() {
+        use crate::crypto::rustcrypto::{Aes128GcmProvider, AnySuiteProvider, ChaCha20Provider};
+
+        // A genuine ChaCha20 ServerHello, minted for a client that offered it.
+        let mut offerer =
+            TlsEngine::<AnySuiteProvider>::new_client(make_client_config(), [0x42; 32], [0; 32]);
+        let mut server =
+            TlsEngine::<ChaCha20Provider>::new_server(make_server_config(), [0xAA; 32], [0xBB; 32]);
+        let mut ch = [0u8; 2048];
+        let (n, level) = offerer.write_handshake(&mut ch).unwrap();
+        server.read_handshake(level, &ch[..n]).unwrap();
+        let mut sh = [0u8; 2048];
+        let (sh_len, sh_level) = server.write_handshake(&mut sh).unwrap();
+        assert_eq!(sh_level, Level::Initial);
+
+        // Delivered to an AES-only client, which never offered ChaCha20.
+        let mut client =
+            TlsEngine::<Aes128GcmProvider>::new_client(make_client_config(), [0x42; 32], [0; 32]);
+        let _ = client.write_handshake(&mut ch).unwrap();
+        assert_eq!(
+            client.read_handshake(Level::Initial, &sh[..sh_len]),
+            Err(Error::Tls)
+        );
     }
 }
