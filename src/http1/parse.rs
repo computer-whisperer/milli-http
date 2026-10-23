@@ -1,86 +1,57 @@
 //! Zero-copy HTTP/1.1 parser.
 //!
 //! All parsers work on `&[u8]` and return byte-slice references or offsets.
+//!
+//! The parsers avoid slice indexing: every delimiter search goes through an
+//! `Option`-returning split, so no bounds-check panic path survives in the
+//! generated code. Current stable rustc proves the indices in bounds on its
+//! own, but rustc 1.88 (the MSRV) at `opt-level = "z"` does not, and callers
+//! that forbid panics in release builds (link-time checks such as `no-panic`)
+//! need the parser to be free of them.
 
 use crate::error::Error;
 
 /// Find the end of the header section (`\r\n\r\n`).
 /// Returns the offset *past* the `\r\n\r\n` sequence, or `None` if not found.
 pub fn find_end_of_headers(buf: &[u8]) -> Option<usize> {
-    if buf.len() < 4 {
-        return None;
-    }
-    for i in 0..buf.len() - 3 {
-        if buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
-            return Some(i + 4);
-        }
-    }
-    None
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
 }
 
 /// Parse a request line: `METHOD SP PATH SP HTTP/1.x CRLF`.
 ///
 /// Returns `(method, path, consumed)` where consumed includes the trailing CRLF.
 pub fn parse_request_line(buf: &[u8]) -> Result<(&[u8], &[u8], usize), Error> {
-    let line_end = find_crlf(buf).ok_or(Error::WouldBlock)?;
-    let line = buf.get(..line_end).ok_or(Error::InvalidState)?;
+    let (line, consumed) = split_line(buf).ok_or(Error::WouldBlock)?;
 
-    // METHOD SP
-    let sp1 = memchr(b' ', line).ok_or(Error::InvalidState)?;
-    let method = &line[..sp1];
-    if method.is_empty() {
+    let (method, rest) = split_once(line, b' ').ok_or(Error::InvalidState)?;
+    let (path, version) = split_once(rest, b' ').ok_or(Error::InvalidState)?;
+    if method.is_empty() || path.is_empty() || !version.starts_with(b"HTTP/1.") {
         return Err(Error::InvalidState);
     }
 
-    // PATH SP
-    let rest = &line[sp1 + 1..];
-    let sp2 = memchr(b' ', rest).ok_or(Error::InvalidState)?;
-    let path = &rest[..sp2];
-    if path.is_empty() {
-        return Err(Error::InvalidState);
-    }
-
-    // HTTP/1.x
-    let version = &rest[sp2 + 1..];
-    if !version.starts_with(b"HTTP/1.") {
-        return Err(Error::InvalidState);
-    }
-
-    Ok((method, path, line_end + 2)) // +2 for CRLF
+    Ok((method, path, consumed))
 }
 
 /// Parse a status line: `HTTP/1.x SP STATUS SP REASON CRLF`.
 ///
 /// Returns `(status_code, reason, consumed)`.
 pub fn parse_status_line(buf: &[u8]) -> Result<(u16, &[u8], usize), Error> {
-    let line_end = find_crlf(buf).ok_or(Error::WouldBlock)?;
-    let line = buf.get(..line_end).ok_or(Error::InvalidState)?;
+    let (line, consumed) = split_line(buf).ok_or(Error::WouldBlock)?;
 
-    // HTTP/1.x SP
     if !line.starts_with(b"HTTP/1.") {
         return Err(Error::InvalidState);
     }
-    let sp1 = memchr(b' ', line).ok_or(Error::InvalidState)?;
+    let (_version, rest) = split_once(line, b' ').ok_or(Error::InvalidState)?;
 
-    // STATUS SP
-    let rest = &line[sp1 + 1..];
-    if rest.len() < 3 {
-        return Err(Error::InvalidState);
-    }
-    let status_bytes = &rest[..3];
+    // Three-digit STATUS, then an optional SP REASON.
+    let (status_bytes, rest) = rest.split_at_checked(3).ok_or(Error::InvalidState)?;
     let status = parse_decimal_u16(status_bytes).ok_or(Error::InvalidState)?;
     if status < 100 {
         return Err(Error::InvalidState);
     }
+    let reason = rest.strip_prefix(b" ").unwrap_or(b"");
 
-    // REASON (may be empty, or preceded by SP)
-    let reason = if rest.len() > 3 && rest[3] == b' ' {
-        &rest[4..]
-    } else {
-        b""
-    };
-
-    Ok((status, reason, line_end + 2))
+    Ok((status, reason, consumed))
 }
 
 /// Parse a single header line: `Name: Value CRLF`.
@@ -88,16 +59,13 @@ pub fn parse_status_line(buf: &[u8]) -> Result<(u16, &[u8], usize), Error> {
 /// Returns `(name, value, consumed)`. An empty line (just CRLF) returns consumed=2
 /// with empty name and value to signal end of headers.
 pub fn parse_header_line(buf: &[u8]) -> Result<(&[u8], &[u8], usize), Error> {
-    // Check for empty line (end of headers)
-    if buf.len() >= 2 && buf[0] == b'\r' && buf[1] == b'\n' {
+    // Empty line: end of headers.
+    if buf.starts_with(b"\r\n") {
         return Ok((b"", b"", 2));
     }
 
-    let line_end = find_crlf(buf).ok_or(Error::WouldBlock)?;
-    let line = buf.get(..line_end).ok_or(Error::InvalidState)?;
-
-    let colon = memchr(b':', line).ok_or(Error::InvalidState)?;
-    let name = &line[..colon];
+    let (line, consumed) = split_line(buf).ok_or(Error::WouldBlock)?;
+    let (name, value) = split_once(line, b':').ok_or(Error::InvalidState)?;
     if name.is_empty() {
         return Err(Error::InvalidState);
     }
@@ -109,9 +77,7 @@ pub fn parse_header_line(buf: &[u8]) -> Result<(&[u8], &[u8], usize), Error> {
         return Err(Error::InvalidState);
     }
 
-    // Skip optional whitespace after colon
-    let value_start = colon + 1;
-    let value = trim_ows(line.get(value_start..).ok_or(Error::InvalidState)?);
+    let value = trim_ows(value);
 
     // RFC 9110 §5.5: field values must not contain control characters other
     // than HTAB — in particular bare CR/LF/NUL, which enable header injection
@@ -120,7 +86,7 @@ pub fn parse_header_line(buf: &[u8]) -> Result<(&[u8], &[u8], usize), Error> {
         return Err(Error::InvalidState);
     }
 
-    Ok((name, value, line_end + 2))
+    Ok((name, value, consumed))
 }
 
 /// Parse a chunk size line for Transfer-Encoding: chunked.
@@ -128,55 +94,54 @@ pub fn parse_header_line(buf: &[u8]) -> Result<(&[u8], &[u8], usize), Error> {
 /// Format: `HEX_SIZE [; ext] CRLF`
 /// Returns `(chunk_size, consumed)`.
 pub fn parse_chunk_size(buf: &[u8]) -> Result<(usize, usize), Error> {
-    let line_end = find_crlf(buf).ok_or(Error::WouldBlock)?;
-    let line = buf.get(..line_end).ok_or(Error::InvalidState)?;
+    let (line, consumed) = split_line(buf).ok_or(Error::WouldBlock)?;
 
-    // Find end of hex digits (stop at ';' for chunk extensions)
-    let hex_end = line
-        .iter()
-        .position(|&b| b == b';' || b == b' ')
-        .unwrap_or(line.len());
-
-    let hex_str = &line[..hex_end];
-    if hex_str.is_empty() {
-        return Err(Error::InvalidState);
-    }
-
+    // Hex digits end at ';' (chunk extension) or SP; `parse_hex` rejects an
+    // empty run.
+    let hex_str = line
+        .split(|&b| b == b';' || b == b' ')
+        .next()
+        .unwrap_or(b"");
     let size = parse_hex(hex_str).ok_or(Error::InvalidState)?;
-    Ok((size, line_end + 2))
+
+    Ok((size, consumed))
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Find `\r\n` in buffer. Returns offset of `\r`.
-fn find_crlf(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\r\n")
+/// Split the first CRLF-terminated line off `buf`.
+///
+/// Returns `(line, consumed)` where consumed includes the CRLF, or `None` if
+/// no CRLF has arrived yet.
+fn split_line(buf: &[u8]) -> Option<(&[u8], usize)> {
+    let end = buf.windows(2).position(|w| w == b"\r\n")?;
+    Some((buf.get(..end)?, end + 2))
 }
 
-/// Find first occurrence of byte in slice.
-fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
-    haystack.iter().position(|&b| b == needle)
+/// Split `buf` at the first `delim`, dropping the delimiter.
+///
+/// Returns `(before, after)`, or `None` if `delim` does not occur.
+fn split_once(buf: &[u8], delim: u8) -> Option<(&[u8], &[u8])> {
+    let at = buf.iter().position(|&b| b == delim)?;
+    let (before, rest) = buf.split_at_checked(at)?;
+    let (_delim, after) = rest.split_first()?;
+    Some((before, after))
 }
 
 /// Trim optional whitespace (OWS: SP / HTAB) from both ends.
 fn trim_ows(mut buf: &[u8]) -> &[u8] {
-    let mut iter = buf.iter();
-    loop {
-        buf = iter.as_slice();
-        match iter.next() {
-            Some(&b) if b == b' ' || b == b'\t' => {}
-            _ => break,
-        }
+    let ows = |b: u8| b == b' ' || b == b'\t';
+    while let Some((&b, rest)) = buf.split_first()
+        && ows(b)
+    {
+        buf = rest;
     }
-    let mut iter = buf.iter();
-    loop {
-        buf = iter.as_slice();
-        match iter.next_back() {
-            Some(&b) if b == b' ' || b == b'\t' => {}
-            _ => break,
-        }
+    while let Some((&b, rest)) = buf.split_last()
+        && ows(b)
+    {
+        buf = rest;
     }
     buf
 }
@@ -396,5 +361,59 @@ mod tests {
         assert_eq!(trim_ows(b"hello"), b"hello");
         assert_eq!(trim_ows(b"   "), b"");
         assert_eq!(trim_ows(b""), b"");
+    }
+
+    #[test]
+    fn find_end_of_headers_shorter_than_terminator() {
+        assert_eq!(find_end_of_headers(b""), None);
+        assert_eq!(find_end_of_headers(b"\r\n\r"), None);
+    }
+
+    #[test]
+    fn parse_request_line_missing_parts() {
+        assert_eq!(parse_request_line(b"GET\r\n"), Err(Error::InvalidState));
+        assert_eq!(parse_request_line(b"GET /\r\n"), Err(Error::InvalidState));
+        assert_eq!(
+            parse_request_line(b" / HTTP/1.1\r\n"),
+            Err(Error::InvalidState)
+        );
+        assert_eq!(
+            parse_request_line(b"GET  HTTP/1.1\r\n"),
+            Err(Error::InvalidState)
+        );
+    }
+
+    #[test]
+    fn parse_status_line_short_or_bad_status() {
+        assert_eq!(parse_status_line(b"HTTP/1.1\r\n"), Err(Error::InvalidState));
+        assert_eq!(
+            parse_status_line(b"HTTP/1.1 20\r\n"),
+            Err(Error::InvalidState)
+        );
+        assert_eq!(
+            parse_status_line(b"HTTP/1.1 abc\r\n"),
+            Err(Error::InvalidState)
+        );
+        assert_eq!(
+            parse_status_line(b"HTTP/1.1 099 Low\r\n"),
+            Err(Error::InvalidState)
+        );
+    }
+
+    #[test]
+    fn parse_header_line_missing_name_or_colon() {
+        assert_eq!(
+            parse_header_line(b"Host example.com\r\n"),
+            Err(Error::InvalidState)
+        );
+        assert_eq!(parse_header_line(b": value\r\n"), Err(Error::InvalidState));
+    }
+
+    #[test]
+    fn parse_chunk_size_empty_or_bad_hex() {
+        assert_eq!(parse_chunk_size(b";ext\r\n"), Err(Error::InvalidState));
+        assert_eq!(parse_chunk_size(b"\r\n"), Err(Error::InvalidState));
+        assert_eq!(parse_chunk_size(b"zz\r\n"), Err(Error::InvalidState));
+        assert_eq!(parse_chunk_size(b"1a"), Err(Error::WouldBlock));
     }
 }
