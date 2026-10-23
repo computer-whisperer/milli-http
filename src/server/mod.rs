@@ -370,6 +370,28 @@ where
         kit
     }
 
+    /// Build the HTTP connection for a completed handshake from its negotiated
+    /// ALPN. An unsupported ALPN drops `parts` and returns its reclaimed kit for
+    /// the caller to push into `free_kits`.
+    fn http_conn_for_alpn(
+        mut parts: TlsParts<C, BUF>,
+    ) -> Result<(ConnProtocol, Box<dyn HttpServerConn>), Option<crate::tcp_tls::TlsBufKit>> {
+        let alpn = parts.alpn();
+        match alpn {
+            #[cfg(feature = "h2")]
+            Some(b"h2") => Ok((
+                ConnProtocol::H2,
+                Box::new(crate::h2_tls::H2TlsServer::<C, BUF>::from_parts(parts)),
+            )),
+            #[cfg(feature = "http1")]
+            Some(b"http/1.1") | None => Ok((
+                ConnProtocol::Http1,
+                Box::new(crate::https1::Https1Server::<C, BUF>::from_parts(parts)),
+            )),
+            _ => Err(parts.reclaim_buffers()),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // TCP interface
     // -----------------------------------------------------------------------
@@ -528,32 +550,13 @@ where
                     _ => unreachable!(),
                 };
 
-                let alpn = parts.alpn();
-                // `parts` is moved into the building arms below. The reject arm
-                // does not consume it, so reclaim its kit there before dropping.
-                let (protocol, http_conn): (ConnProtocol, Box<dyn HttpServerConn>) = match alpn {
-                    #[cfg(feature = "h2")]
-                    Some(b"h2") => (
-                        ConnProtocol::H2,
-                        Box::new(crate::h2_tls::H2TlsServer::<C, BUF>::from_parts(parts)),
-                    ),
-                    #[cfg(feature = "http1")]
-                    Some(b"http/1.1") => (
-                        ConnProtocol::Http1,
-                        Box::new(crate::https1::Https1Server::<C, BUF>::from_parts(parts)),
-                    ),
-                    #[cfg(feature = "http1")]
-                    None => (
-                        ConnProtocol::Http1,
-                        Box::new(crate::https1::Https1Server::<C, BUF>::from_parts(parts)),
-                    ),
-                    _ => {
-                        // Unknown/unsupported ALPN — reject the connection.
-                        // `conn.state` is already `Closed` (replaced above); the
-                        // kit lives in the still-owned `parts` here.
+                // `conn.state` is already `Closed` (replaced above); an
+                // unsupported ALPN rejects the connection and returns its kit.
+                let (protocol, mut http_conn) = match Self::http_conn_for_alpn(parts) {
+                    Ok(built) => built,
+                    Err(kit) => {
                         let conn_id = conn.id;
-                        let mut parts = parts;
-                        if let Some(kit) = parts.reclaim_buffers() {
+                        if let Some(kit) = kit {
                             self.free_kits.push(kit);
                         }
                         self.note_close_reason(conn_id, CloseReason::UnsupportedAlpn);
@@ -561,7 +564,6 @@ where
                         return Err(Error::InvalidState);
                     }
                 };
-                let mut http_conn = http_conn;
 
                 // Arm the HTTP-level timeouts (idle / first-headers) from the
                 // moment the connection is established.
