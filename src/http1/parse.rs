@@ -23,7 +23,7 @@ pub fn find_end_of_headers(buf: &[u8]) -> Option<usize> {
 /// Returns `(method, path, consumed)` where consumed includes the trailing CRLF.
 pub fn parse_request_line(buf: &[u8]) -> Result<(&[u8], &[u8], usize), Error> {
     let line_end = find_crlf(buf).ok_or(Error::WouldBlock)?;
-    let line = &buf[..line_end];
+    let line = buf.get(..line_end).ok_or(Error::InvalidState)?;
 
     // METHOD SP
     let sp1 = memchr(b' ', line).ok_or(Error::InvalidState)?;
@@ -54,7 +54,7 @@ pub fn parse_request_line(buf: &[u8]) -> Result<(&[u8], &[u8], usize), Error> {
 /// Returns `(status_code, reason, consumed)`.
 pub fn parse_status_line(buf: &[u8]) -> Result<(u16, &[u8], usize), Error> {
     let line_end = find_crlf(buf).ok_or(Error::WouldBlock)?;
-    let line = &buf[..line_end];
+    let line = buf.get(..line_end).ok_or(Error::InvalidState)?;
 
     // HTTP/1.x SP
     if !line.starts_with(b"HTTP/1.") {
@@ -94,7 +94,7 @@ pub fn parse_header_line(buf: &[u8]) -> Result<(&[u8], &[u8], usize), Error> {
     }
 
     let line_end = find_crlf(buf).ok_or(Error::WouldBlock)?;
-    let line = &buf[..line_end];
+    let line = buf.get(..line_end).ok_or(Error::InvalidState)?;
 
     let colon = memchr(b':', line).ok_or(Error::InvalidState)?;
     let name = &line[..colon];
@@ -111,7 +111,7 @@ pub fn parse_header_line(buf: &[u8]) -> Result<(&[u8], &[u8], usize), Error> {
 
     // Skip optional whitespace after colon
     let value_start = colon + 1;
-    let value = trim_ows(&line[value_start..]);
+    let value = trim_ows(line.get(value_start..).ok_or(Error::InvalidState)?);
 
     // RFC 9110 §5.5: field values must not contain control characters other
     // than HTAB — in particular bare CR/LF/NUL, which enable header injection
@@ -129,7 +129,7 @@ pub fn parse_header_line(buf: &[u8]) -> Result<(&[u8], &[u8], usize), Error> {
 /// Returns `(chunk_size, consumed)`.
 pub fn parse_chunk_size(buf: &[u8]) -> Result<(usize, usize), Error> {
     let line_end = find_crlf(buf).ok_or(Error::WouldBlock)?;
-    let line = &buf[..line_end];
+    let line = buf.get(..line_end).ok_or(Error::InvalidState)?;
 
     // Find end of hex digits (stop at ';' for chunk extensions)
     let hex_end = line
@@ -161,17 +161,24 @@ fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
 }
 
 /// Trim optional whitespace (OWS: SP / HTAB) from both ends.
-fn trim_ows(buf: &[u8]) -> &[u8] {
-    let start = buf
-        .iter()
-        .position(|&b| b != b' ' && b != b'\t')
-        .unwrap_or(buf.len());
-    let end = buf
-        .iter()
-        .rposition(|&b| b != b' ' && b != b'\t')
-        .map(|i| i + 1)
-        .unwrap_or(start);
-    &buf[start..end]
+fn trim_ows(mut buf: &[u8]) -> &[u8] {
+    let mut iter = buf.iter();
+    loop {
+        buf = iter.as_slice();
+        match iter.next() {
+            Some(&b) if b == b' ' || b == b'\t' => {}
+            _ => break,
+        }
+    }
+    let mut iter = buf.iter();
+    loop {
+        buf = iter.as_slice();
+        match iter.next_back() {
+            Some(&b) if b == b' ' || b == b'\t' => {}
+            _ => break,
+        }
+    }
+    buf
 }
 
 /// Parse ASCII decimal digits into u16.
